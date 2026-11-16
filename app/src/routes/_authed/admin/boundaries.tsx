@@ -184,9 +184,8 @@ function BoundariesPage() {
           </Item>
           <Separator />
           {/*
-           * Read-only, and only interesting when it is not the default. Allow rules are checked after
-           * the list above and an empty list refuses everything, so a deployment that narrowed them
-           * in configuration needs to see that here rather than wonder why every action is refused.
+           * Editable toggle: allowing everything else sets `allow: ["true"]`; turning it off
+           * sets `allow: []` so every unlisted action is refused.
            */}
           <Item size="sm">
             <ItemContent className="min-w-0">
@@ -201,6 +200,19 @@ function BoundariesPage() {
                     : `Only what these allow: ${policy.allow.join(" · ")}`}
               </ItemDescription>
             </ItemContent>
+            <ItemActions>
+              <Switch
+                aria-label="Allow everything else"
+                checked={allowsEverythingElse}
+                disabled={savePolicy.isPending}
+                onCheckedChange={(checked) =>
+                  savePolicy.mutate({
+                    ...policy,
+                    allow: checked ? ["true"] : [],
+                  })
+                }
+              />
+            </ItemActions>
           </Item>
         </PageRows>
         {savePolicy.error ? (

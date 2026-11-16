@@ -1,0 +1,43 @@
+[package]
+name = "openbot-port-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+embedded-www = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+argon2 = { version = "0.5", features = ["std"] }
+base64 = "0.22"
+getrandom = "0.2"
+futures-util = { version = "0.3", features = ["sink"] }
+if-addrs = "0.13.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+mime_guess = "2"
+percent-encoding = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+
+[target.'cfg(target_vendor = "sie")'.dependencies]
+ps5-rt = { path = "../ps5-rt" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.29"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

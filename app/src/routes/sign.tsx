@@ -3,6 +3,10 @@ import { createFileRoute, redirect } from "@tanstack/react-router";
 import { motion, useReducedMotion } from "motion/react";
 import { useState } from "react";
 import AgentOrb from "@/components/agents/orb/agent-orb";
+import {
+  LocalSignIn,
+  type LocalSignInValues,
+} from "@/components/auth/local-sign-in";
 import { ProviderLogo } from "@/components/auth/provider-logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +17,7 @@ import {
   signInWithEmailDomain,
 } from "@/lib/auth/client";
 import { resumeUrlFor, verifierPathFor } from "@/lib/auth/resume";
+import { localAuthStatusQueryOptions, localSignIn } from "@/lib/auth/local";
 import { appConfig } from "@/lib/generated/application-config";
 import { searchTextEntry } from "@/lib/search-text";
 import {
@@ -80,6 +85,22 @@ function SignScreen() {
   const { data: options } = useQuery(authProvidersQueryOptions());
   const providers = options?.providers ?? [];
   const [email, setEmail] = useState("");
+  const localStatus = useQuery(localAuthStatusQueryOptions());
+  const [localPending, setLocalPending] = useState(false);
+
+  async function handleLocalSignIn(values: LocalSignInValues) {
+    const status = localStatus.data;
+    if (!status?.enabled || (status.setupRequired && !status.setupAvailable))
+      throw new Error("Local sign-in is unavailable");
+    setLocalPending(true);
+    try {
+      await localSignIn(values, status.setupRequired);
+      // Reload to discard pre-login query caches and let the server establish the session.
+      window.location.assign(verifierPathFor(flowId) ?? "/");
+    } finally {
+      setLocalPending(false);
+    }
+  }
 
   /**
    * Sign in through whichever identity provider covers this address.
@@ -209,11 +230,33 @@ function SignScreen() {
           ) : null}
           {providers.length > 0 && !options?.ssoRequired ? (
             providerButtons
-          ) : options?.sso || options?.ssoRequired ? null : (
+          ) : options?.sso ||
+            options?.ssoRequired ||
+            localStatus.data ||
+            localStatus.isPending ? null : (
             <p className="text-center text-sm text-muted-foreground">
               Sign-in isn't set up yet. An admin has to set it up first.
             </p>
           )}
+          {localStatus.data?.enabled &&
+          (!localStatus.data.setupRequired ||
+            localStatus.data.setupAvailable) ? (
+            <div className={providers.length > 0 ? "mt-4" : ""}>
+              <LocalSignIn
+                setup={localStatus.data.setupRequired}
+                requireSetupCode={localStatus.data.setupCodeRequired}
+                pending={localPending}
+                onSubmit={handleLocalSignIn}
+              />
+            </div>
+          ) : null}
+          {localStatus.data?.setupRequired &&
+          !localStatus.data.setupAvailable ? (
+            <p className="text-center text-sm text-muted-foreground">
+              Administrator setup is not available. Ask the person running
+              OpenBot to enable setup.
+            </p>
+          ) : null}
           {/*
            * The way in for a company that runs its own identity provider.
            *

@@ -8,6 +8,7 @@ import {
 import { desktopShell } from "@/lib/desktop/shell";
 import { clearSkin } from "@/skins/store";
 import { authClient } from "./client";
+import { localSignOut, readLocalAuthStatus } from "./local";
 import { authKeys } from "./queries";
 
 const SIGN_OUT_UNFINISHED = "Signing out did not finish. Try again.";
@@ -18,6 +19,10 @@ const SIGN_OUT_UNFINISHED = "Signing out did not finish. Try again.";
  * it (Better Auth, or the organization's sign-in) and whatever kept it from reaching the server.
  */
 async function signOut() {
+  if (await readLocalAuthStatus()) {
+    await localSignOut();
+    return;
+  }
   const answered = await authClient.signOut().catch(() => null);
   if (!answered || answered.error) throw new Error(SIGN_OUT_UNFINISHED);
 }

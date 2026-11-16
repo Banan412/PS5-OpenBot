@@ -14,6 +14,9 @@ import {
   computerStatusQueryOptions,
 } from "@/lib/computers/queries";
 import {
+  type ComputerPageSnapshot,
+  navigateComputerUrl,
+  readComputerPageSnapshot,
   readPageFrame,
   readScreenshot,
   startComputer,
@@ -409,6 +412,13 @@ export function ComputerView({
     : null;
   /** Bumped when a frame arrives, because the store it lands in is not React state. */
   const [, setFrameArrived] = useState(0);
+  const [pageSnap, setPageSnap] = useState<ComputerPageSnapshot | null>(null);
+  const [pageViewMode, setPageViewMode] = useState<
+    "visual" | "reader" | "screen"
+  >("visual");
+  const [navUrlInput, setNavUrlInput] = useState("");
+  const [navPending, setNavPending] = useState(false);
+  const [navError, setNavError] = useState<string | null>(null);
 
   const settled = !active && (finished || Boolean(knownPage));
   const {
@@ -762,7 +772,53 @@ export function ComputerView({
   /** What the Bot asked for the wheel for, when it asked. Never the person's own take. */
   const reason = botsReason(control);
 
-  const polledScreen = showScreen ? (
+  useEffect(() => {
+    if (settled) return;
+    let active = true;
+    const syncPage = async () => {
+      const snap = await readComputerPageSnapshot(computerId);
+      if (!active || !snap) return;
+      setPageSnap((prev) =>
+        prev &&
+        prev.revision === snap.revision &&
+        prev.url === snap.url &&
+        prev.html === snap.html
+          ? prev
+          : snap,
+      );
+      if (snap.url && snap.url !== "about:blank") {
+        setNavUrlInput((cur) => (cur ? cur : snap.url));
+      }
+    };
+    void syncPage();
+    if (!visualVisible) return () => { active = false; };
+    const id = setInterval(() => {
+      void syncPage();
+    }, 2000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [computerId, settled, visualVisible, shot?.url]);
+
+  const hasVisualHtml =
+    !settled &&
+    pageSnap !== null &&
+    pageSnap.mode === "html-preview" &&
+    pageSnap.html.trim().length > 0;
+  const activeVisualView =
+    hasVisualHtml && pageViewMode === "visual";
+  const activeReaderView =
+    !settled && pageSnap !== null && pageViewMode === "reader";
+
+  const polledScreen = activeVisualView ? (
+    <iframe
+      title={pageSnap.title || pageSnap.url || "Web page preview"}
+      sandbox=""
+      srcDoc={pageSnap.html}
+      className="pointer-events-none absolute inset-0 h-full w-full border-0 bg-white opacity-100"
+    />
+  ) : showScreen ? (
     <img
       src={`data:image/png;base64,${drawn.base64}`}
       alt="What the Bot is looking at"
@@ -772,11 +828,14 @@ export function ComputerView({
   ) : null;
 
   /** Where the browser in the picture is, by host: the page drawn now, or the page a finished turn left it on. */
-  const pageUrl = showScreen
-    ? drawn?.url
-    : settled
-      ? knownPage?.url
-      : undefined;
+  const pageUrl =
+    hasVisualHtml && pageSnap?.url
+      ? pageSnap.url
+      : showScreen
+        ? drawn?.url
+        : settled
+          ? knownPage?.url
+          : undefined;
   const address = pageUrl ? addressParts(pageUrl) : null;
 
   /*
@@ -869,7 +928,7 @@ export function ComputerView({
               </span>
             ) : null}
 
-            {showScreen ? null : (
+            {showScreen || activeVisualView ? null : (
               <NothingToSee
                 blankBrowser={blankBrowser}
                 owner={owner}
@@ -1126,6 +1185,81 @@ export function ComputerView({
                 aspectRatio={aspectRatio}
                 onNavigated={() => screen.current?.focus()}
               >
+                {!settled ? (
+                  <div className="flex flex-wrap items-center gap-2 border-b bg-muted/40 px-3 py-2 text-xs">
+                    <form
+                      className="flex min-w-48 flex-1 items-center gap-1.5"
+                      onSubmit={async (e) => {
+                        e.preventDefault();
+                        const raw = navUrlInput.trim();
+                        if (!raw || navPending) return;
+                        const normalized = /^https?:\/\//i.test(raw)
+                          ? raw
+                          : `https://${raw}`;
+                        setNavPending(true);
+                        setNavError(null);
+                        try {
+                          await navigateComputerUrl(computerId, normalized);
+                          const snap =
+                            await readComputerPageSnapshot(computerId);
+                          if (snap) {
+                            setPageSnap(snap);
+                            setNavUrlInput(snap.url);
+                          }
+                        } catch (err) {
+                          setNavError(
+                            err instanceof Error
+                              ? err.message
+                              : "Could not open URL",
+                          );
+                        } finally {
+                          setNavPending(false);
+                        }
+                      }}
+                    >
+                      <input
+                        type="text"
+                        value={navUrlInput}
+                        onChange={(e) => setNavUrlInput(e.target.value)}
+                        placeholder="https://www.google.com"
+                        aria-label="Open web URL on computer"
+                        className="h-7 min-w-0 flex-1 rounded-md border bg-background px-2.5 text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      />
+                      <button
+                        type="submit"
+                        disabled={navPending}
+                        className="h-7 shrink-0 rounded-md border bg-background px-2.5 font-medium hover:bg-muted disabled:opacity-50"
+                      >
+                        {navPending ? "Opening…" : "Go"}
+                      </button>
+                    </form>
+                    <div className="flex items-center gap-1 rounded-md border bg-background p-0.5">
+                      {(
+                        [
+                          { id: "visual", label: "Page" },
+                          { id: "reader", label: "Reader" },
+                          { id: "screen", label: "Screen" },
+                        ] as const
+                      ).map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => setPageViewMode(tab.id)}
+                          className={`rounded px-2 py-1 font-medium transition-colors ${
+                            pageViewMode === tab.id
+                              ? "bg-primary text-primary-foreground"
+                              : "text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+                    {navError ? (
+                      <span className="text-destructive">{navError}</span>
+                    ) : null}
+                  </div>
+                ) : null}
                 {/*
                   Overlay uses the live socket; the inline card keeps low-cost polling. With no page
                   to draw it reserves the same frame and says the same thing the card does — the
@@ -1149,6 +1283,35 @@ export function ComputerView({
                         className="absolute inset-0 h-full w-full object-contain"
                         src={`data:image/png;base64,${drawn.base64}`}
                       />
+                    </div>
+                  ) : activeVisualView && pageSnap ? (
+                    <div
+                      className="relative w-full bg-white"
+                      style={{ aspectRatio }}
+                    >
+                      <iframe
+                        title={pageSnap.title || pageSnap.url}
+                        sandbox=""
+                        srcDoc={pageSnap.html}
+                        className="absolute inset-0 h-full w-full border-0 bg-white"
+                      />
+                    </div>
+                  ) : activeReaderView && pageSnap ? (
+                    <div
+                      className="relative w-full overflow-y-auto bg-background p-5 text-sm"
+                      style={{ aspectRatio }}
+                    >
+                      <div className="mb-3 border-b pb-2">
+                        <div className="font-semibold text-base">
+                          {pageSnap.title || "Untitled page"}
+                        </div>
+                        <div className="break-all text-xs text-muted-foreground">
+                          {pageSnap.url}
+                        </div>
+                      </div>
+                      <pre className="whitespace-pre-wrap font-sans leading-relaxed text-foreground">
+                        {pageSnap.text}
+                      </pre>
                     </div>
                   ) : showLiveScreen ? (
                     <div className="relative w-full" style={{ aspectRatio }}>

@@ -208,7 +208,9 @@ function BotChat({ agentId, name }: { agentId: string; name: string }) {
             </div>
           </div>
           <p className="text-sm text-muted-foreground">
-            Ask it to open a page and watch it work.
+            {noComputers
+              ? "Ask this Bot a question."
+              : "Ask it to open a page and watch it work."}
           </p>
         </header>
         {/*

@@ -12,6 +12,7 @@ import {
   sendConversationMessage,
 } from "@/lib/api/generated/conversations/conversations";
 import type {
+  Attachment,
   ConversationMember,
   ConversationMessage,
 } from "@/lib/api/generated/model";
@@ -48,7 +49,7 @@ async function everyMember(channelId: string): Promise<ConversationMember[]> {
 /** A line as the API answers it, in the names the transcript draws. */
 function groupMessageOf(
   channelId: string,
-  message: ConversationMessage,
+  message: ConversationMessage & { attachments?: Attachment[] },
 ): GroupMessage {
   return {
     id: message.id,
@@ -58,6 +59,9 @@ function groupMessageOf(
     text: message.text,
     status: message.status,
     createdAt: message.createdAt ?? "",
+    ...(Array.isArray(message.attachments) && message.attachments.length > 0
+      ? { attachments: message.attachments }
+      : {}),
     ...(message.reason === undefined ? {} : { reason: message.reason }),
     ...(message.answeredBy === undefined
       ? {}
@@ -76,6 +80,7 @@ export type GroupMessage = {
   text: string;
   status: "queued" | "running" | "waiting" | "completed" | "failed";
   createdAt: string;
+  attachments?: readonly Attachment[];
   /** Why a waiting Bot is waiting, when it is. */
   reason?: string;
   /** For an answer relayed from another Bot through `message_bot`: which Bot answered. */
@@ -131,8 +136,24 @@ export function groupQueryOptions(channelId: string) {
             creator: member.creator ?? false,
           })),
         // The API answers newest first. The transcript reads oldest first.
+        // Drop completed silent passes with no text so unaddressed bots do not leave blank stacked rows.
         messages: newestFirst.messages
-          .map((message) => groupMessageOf(channelId, message))
+          .map((message) =>
+            groupMessageOf(
+              channelId,
+              message as ConversationMessage & { attachments?: Attachment[] },
+            ),
+          )
+          .filter(
+            (message) =>
+              !(
+                message.agentId !== null &&
+                message.status === "completed" &&
+                !message.consent &&
+                !message.text.trim() &&
+                !(message.attachments && message.attachments.length > 0)
+              ),
+          )
           .reverse(),
       };
     },
@@ -168,11 +189,19 @@ export function sendGroupMessageMutationOptions(
       id: string;
       text: string;
       agentId: string | null;
+      attachmentIds?: readonly string[];
     }) => {
       await sendConversationMessage(
         organizationId(),
         channelId,
-        { id: input.id, text: input.text, botId: input.agentId },
+        {
+          id: input.id,
+          text: input.text,
+          botId: input.agentId,
+          ...(input.attachmentIds && input.attachmentIds.length > 0
+            ? { attachmentIds: [...input.attachmentIds] }
+            : {}),
+        } as Parameters<typeof sendConversationMessage>[2],
         once(),
         { fallback: "Your message could not be sent to the group." },
       );

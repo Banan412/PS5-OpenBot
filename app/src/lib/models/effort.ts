@@ -10,6 +10,7 @@ import type { ConversationModel, ModelCatalogue, ModelOption } from "./queries";
 export type ModelPick = { model: string; effort: string | null };
 
 const EFFORT_LABELS: Record<string, string> = {
+  off: "Off",
   none: "None",
   minimal: "Minimal",
   low: "Low",

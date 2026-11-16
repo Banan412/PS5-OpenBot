@@ -681,6 +681,7 @@ const OWN_TOOLS: Record<string, OwnTool> = {
   }),
 
   // The browser. A folded group names these steps in the same words (`browser-activity.ts`).
+  computer_web_fetch: { running: "Opening page", done: "Opened page" },
   computer_navigate: { running: "Opening page", done: "Opened page" },
   computer_read: { running: "Reading page", done: "Read page" },
   computer_snapshot: { running: "Inspecting page", done: "Inspected page" },

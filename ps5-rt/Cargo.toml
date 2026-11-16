@@ -1,0 +1,9 @@
+[package]
+name = "ps5-rt"
+description = "Self-contained PS5 FW 13.40 (FreeBSD 11) runtime compatibility crate for Rust std"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }

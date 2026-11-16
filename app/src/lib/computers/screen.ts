@@ -3,7 +3,7 @@ import {
   getComputerScreenshot,
   wakeComputer,
 } from "@/lib/api/generated/computers/computers";
-import { idempotencyKey, organizationId } from "@/lib/api/request";
+import { apiRequest, idempotencyKey, organizationId } from "@/lib/api/request";
 import { ClientError } from "@/lib/client";
 import type { ComputerState } from "./queries";
 
@@ -181,4 +181,42 @@ export async function readPageFrame(
     // A missing picture is a smaller sentence, not a broken conversation.
     return null;
   }
+}
+
+export type ComputerPageSnapshot = {
+  url: string;
+  title: string;
+  text: string;
+  html: string;
+  revision: number;
+  mode: "bridge" | "html-preview" | "reader";
+};
+
+export async function readComputerPageSnapshot(
+  computerId: string,
+): Promise<ComputerPageSnapshot | null> {
+  try {
+    const body = await apiRequest<ComputerPageSnapshot>(
+      `/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/page`,
+      { method: "GET" },
+    );
+    if (!body || typeof body.url !== "string") return null;
+    return body;
+  } catch {
+    return null;
+  }
+}
+
+export async function navigateComputerUrl(
+  computerId: string,
+  url: string,
+): Promise<void> {
+  await apiRequest<unknown>(
+    `/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/navigate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    },
+  );
 }

@@ -99,8 +99,8 @@ export function modelCatalogueQueryOptions() {
         { view: "offered" },
         { signal, fallback: "Couldn't load models" },
       ),
-    // The server keeps the provider's listing for ten minutes; asking more often learns nothing.
-    staleTime: 5 * 60_000,
+    staleTime: 5_000,
+    refetchOnMount: "always",
   });
 }
 
@@ -114,7 +114,8 @@ export function availableModelsQueryOptions() {
         { view: "all" },
         { signal, fallback: "Couldn't load the models" },
       ),
-    staleTime: 5 * 60_000,
+    staleTime: 5_000,
+    refetchOnMount: "always",
   });
 }
 

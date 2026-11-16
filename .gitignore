@@ -60,3 +60,9 @@ extension/**/*.pem
 
 # The folder scripts/start.sh mounts into the server's container for a model sign-in file.
 .openbot/
+
+# Local tool installation used by PS5 web builds
+.tools/
+.target-ps5/
+*.db
+*.db-journal

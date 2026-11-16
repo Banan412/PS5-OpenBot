@@ -4,7 +4,9 @@ import {
   IconChevronDown,
   IconCpu,
   IconCube,
+  IconRefresh,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useMemo, useRef, useState } from "react";
 import { HarnessMark } from "@/components/agents/harness-mark";
 import { Button } from "@/components/ui/button";
@@ -31,7 +33,11 @@ import {
   switchModel,
   thinks,
 } from "@/lib/models/effort";
-import type { ModelCatalogue, ModelOption } from "@/lib/models/queries";
+import {
+  type ModelCatalogue,
+  modelKeys,
+  type ModelOption,
+} from "@/lib/models/queries";
 import { cn } from "@/lib/utils";
 
 /** The composer's message box around `inside`, if it is in one. */
@@ -140,14 +146,21 @@ export function ModelPicker({
   if (!catalogue?.choosable || !value) return null;
   const selected =
     catalogue.models.find((model) => model.id === value.model) ??
-    catalogue.models.find((model) => model.id === catalogue.default);
+    catalogue.models.find((model) => model.id === catalogue.default) ??
+    catalogue.models[0];
   if (!selected) return null;
+  const effort =
+    value.model === selected.id
+      ? value.effort
+      : value.effort && (selected.efforts ?? []).includes(value.effort)
+        ? value.effort
+        : null;
   return (
     <Picker
       catalogue={catalogue}
       className={className}
       disabled={disabled || saving}
-      effort={value.model === selected.id ? value.effort : null}
+      effort={effort}
       onChange={onChange}
       selected={selected}
     />
@@ -169,11 +182,19 @@ function Picker({
   disabled?: boolean;
   className?: string;
 }) {
+  const queryClient = useQueryClient();
   const { contains } = ComboboxPrimitive.useFilter();
   /** What is typed in the search, to say when no model matches: the efforts always do. */
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
+  const refreshModels = () => {
+    setRefreshing(true);
+    void queryClient
+      .invalidateQueries({ queryKey: modelKeys.all })
+      .finally(() => setRefreshing(false));
+  };
   /** A choice was just picked: the close it asks for puts focus in the message box. */
   const picked = useRef(false);
   /*
@@ -244,6 +265,9 @@ function Picker({
         // Opened or closed: both columns, the next time it shows.
         setEffortStep(false);
         setOpen(next);
+        if (next) {
+          void queryClient.invalidateQueries({ queryKey: modelKeys.catalogue });
+        }
       }}
       onValueChange={(choice) => {
         if (!choice) return;
@@ -307,18 +331,48 @@ function Picker({
         side="top"
         sideOffset={8}
       >
-        <ComboboxInput
-          // On the efforts alone there is no model to search for: it stays only to keep the keys.
+        <div
           className={
             effortsOnly
               ? // Out of the popup's flow, so it takes no row: as `sr-only` it still held one, a
                 // blank band under the last effort.
                 "pointer-events-none absolute! m-0! h-0! w-0! overflow-hidden border-0! opacity-0"
-              : "col-start-1 row-start-1"
+              : "col-start-1 row-start-1 m-2 mb-1 flex items-center gap-1"
           }
-          placeholder="Search models"
-          showTrigger={false}
-        />
+        >
+          <ComboboxInput
+            className="min-w-0 flex-1"
+            placeholder="Search models"
+            showTrigger={false}
+          />
+          {!effortsOnly ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    aria-label="Refresh models"
+                    className="size-8 shrink-0 p-0 text-muted-foreground"
+                    disabled={refreshing}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      refreshModels();
+                    }}
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <IconRefresh
+                      aria-hidden
+                      className={cn("size-4", refreshing && "animate-spin")}
+                    />
+                  </Button>
+                }
+              />
+              <TooltipContent side="top">Refresh loaded models</TooltipContent>
+            </Tooltip>
+          ) : null}
+        </div>
         {noModels && !effortsOnly ? (
           <p className="col-start-1 row-start-2 px-3 py-6 text-center text-muted-foreground text-sm">
             No models match.

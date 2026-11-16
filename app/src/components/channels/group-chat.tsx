@@ -1,3 +1,4 @@
+import { IconDownload, IconFile } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useRef } from "react";
@@ -14,12 +15,16 @@ import {
   Message as MessageRow,
 } from "@/components/ui/message";
 import { agentListQueryOptions } from "@/lib/agents/queries";
+import type { Attachment } from "@/lib/api/generated/model";
 import {
   type ApprovalInboxData,
   answerPersonQuestionMutationOptions,
   approvalInboxOptions,
 } from "@/lib/approvals";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { attachmentUrl } from "@/lib/channels/attachments";
+import { modelCatalogueQueryOptions } from "@/lib/models/queries";
+import { useConversationModel } from "@/lib/models/run-model";
 import {
   type GroupMessage,
   groupKeys,
@@ -35,6 +40,7 @@ import { newId } from "@/lib/new-id";
 import { ChannelAvatar } from "./avatar";
 import { RestoringTranscript } from "./chat-transcript";
 import { Composer, toAgentOptions } from "./composer";
+import { ModelPicker } from "./composer/model-picker";
 import { TeamBotConsentCard } from "./team-bot-consent";
 
 /**
@@ -54,6 +60,8 @@ export function GroupChat({ channelId }: { channelId: string }) {
   const queryClient = useQueryClient();
   const group = useQuery(groupQueryOptions(channelId));
   const me = useQuery(currentUserQueryOptions()).data;
+  const models = useQuery(modelCatalogueQueryOptions());
+  const runModel = useConversationModel(channelId, models.data);
   const send = useMutation(
     sendGroupMessageMutationOptions(queryClient, channelId),
   );
@@ -220,15 +228,45 @@ export function GroupChat({ channelId }: { channelId: string }) {
         ) : null}
         <Composer
           agents={toAgentOptions(bots)}
+          channelId={channelId}
           className="relative mt-auto w-full"
           commands={[]}
           compact
           disabled={bots.length === 0}
-          pending={send.isPending || answer.isPending || working}
+          modelPicker={
+            <ModelPicker
+              catalogue={models.data}
+              disabled={bots.length === 0}
+              onChange={runModel.choose}
+              saving={runModel.saving}
+              value={runModel.value}
+            />
+          }
+          pending={send.isPending || answer.isPending || working || runModel.saving}
+          routine={
+            bots[0]
+              ? { agentId: bots[0].id, channelId }
+              : undefined
+          }
           autoFocus
           onSubmit={async (draft) => {
-            if (!draft.text) return;
-            if (question && (!draft.agentId || draft.agentId === askerId)) {
+            await runModel.beforeSend();
+            const attachmentIds = draft.attachments
+              .map((item) => {
+                const meta = item.metadata as
+                  | { attachmentId?: unknown }
+                  | undefined;
+                return typeof meta?.attachmentId === "string"
+                  ? meta.attachmentId
+                  : null;
+              })
+              .filter((id): id is string => id !== null);
+            if (!draft.text && attachmentIds.length === 0) return;
+            if (
+              question &&
+              attachmentIds.length === 0 &&
+              (!draft.agentId || draft.agentId === askerId)
+            ) {
               await answerTo(draft.text, question);
               return;
             }
@@ -236,6 +274,7 @@ export function GroupChat({ channelId }: { channelId: string }) {
               id: newId(),
               text: draft.text,
               agentId: draft.agentId,
+              ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
             });
           }}
         />
@@ -253,6 +292,50 @@ export function groupQuestion(
   channelId: string,
 ): WaitingQuestion | undefined {
   return inbox?.questions.find((question) => question.channelId === channelId);
+}
+
+function GroupAttachments({
+  attachments,
+}: {
+  attachments: readonly Attachment[] | undefined;
+}) {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div className="mb-2 flex flex-wrap gap-2">
+      {attachments.map((att) => {
+        const url = attachmentUrl(att.id);
+        if (att.mimeType.startsWith("image/")) {
+          return (
+            <a
+              key={att.id}
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="block overflow-hidden rounded-lg border border-border bg-background"
+            >
+              <img
+                src={url}
+                alt={att.name}
+                className="max-h-56 max-w-xs object-contain"
+              />
+            </a>
+          );
+        }
+        return (
+          <a
+            key={att.id}
+            href={url}
+            download={att.name}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-xs hover:bg-muted"
+          >
+            <IconFile className="size-3.5 text-muted-foreground" />
+            <span className="max-w-44 truncate font-medium">{att.name}</span>
+            <IconDownload className="size-3 text-muted-foreground" />
+          </a>
+        );
+      })}
+    </div>
+  );
 }
 
 /** One attributed line: a person's bubble, and a Bot's named reply on the left. */
@@ -278,12 +361,24 @@ function GroupLine({
           )}
           <Bubble align={mine ? "end" : "start"} variant="muted">
             <BubbleContent>
-              <span className="whitespace-pre-wrap">{message.text}</span>
+              <GroupAttachments attachments={message.attachments} />
+              {message.text.trim() ? (
+                <span className="whitespace-pre-wrap">{message.text}</span>
+              ) : null}
             </BubbleContent>
           </Bubble>
         </MessageContent>
       </MessageRow>
     );
+  const trimmed = message.text.trim();
+  const isSilentPass =
+    message.status === "completed" &&
+    !message.consent &&
+    (!trimmed ||
+      trimmed.toUpperCase() === "[PASS]" ||
+      trimmed.toUpperCase() === "[NO_REPLY]") &&
+    (!message.attachments || message.attachments.length === 0);
+  if (isSilentPass) return null;
   return (
     <MessageRow align="start" data-speaker={message.agentId}>
       <div className="shrink-0 pt-0.5">
