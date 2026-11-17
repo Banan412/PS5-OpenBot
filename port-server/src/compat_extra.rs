@@ -3,22 +3,26 @@
 //! API keys, sessions, teams, and bot flags.
 use crate::{
     compat_routes::{
-        authorize, epoch, format_iso_utc, internal, is_admin, parse_empty_list_paging, problem,
-        require_person, respond_json, run_db, valid_non_empty_param,
+        authorize, decode_cursor, encode_cursor, epoch, fingerprint, format_iso_utc,
+        idempotency_key, internal, is_admin, parse_empty_list_paging, parse_limit, problem,
+        replay_idempotency, require_person, respond_json, respond_raw, run_db, store_idempotency,
+        valid_non_empty_param,
     },
     local_auth::{AuthState, Identity},
     storage::StorageError,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 const MAX_BODY_BYTES: usize = 128 * 1024;
 
@@ -48,6 +52,10 @@ pub fn router(state: AuthState) -> Router {
         .route(
             "/api/v2/organizations/{organization}/product-events",
             post(record_product_event),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/app-errors",
+            post(record_app_error),
         )
         .route(
             "/api/v2/organizations/{organization}/people",
@@ -460,6 +468,18 @@ pub fn router(state: AuthState) -> Router {
             get(list_tasks),
         )
         .route(
+            "/api/v2/organizations/{organization}/tasks/{task_id}",
+            get(get_task),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/tasks/{task_id}/turns",
+            get(list_task_turns),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/tasks/{task_id}/stop",
+            post(stop_task),
+        )
+        .route(
             "/api/v2/organizations/{organization}/app-directory",
             get(list_app_directory),
         )
@@ -544,6 +564,28 @@ pub fn router(state: AuthState) -> Router {
         .route(
             "/api/v2/organizations/{organization}/reviewer-guidance/replay",
             get(get_reviewer_guidance_replay).post(replay_reviewer_guidance),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/bot-agents",
+            get(list_bot_agents).post(create_bot_agent),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/bot-agents/{bot_agent_id}",
+            get(get_bot_agent)
+                .patch(update_bot_agent)
+                .delete(delete_bot_agent),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/bot-agents/{bot_agent_id}/issue-callback-token",
+            post(issue_bot_agent_callback_token),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/bot-agents/{bot_agent_id}/revoke-callback-token",
+            post(revoke_bot_agent_callback_token),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/bots/{bot_id}/delegation",
+            get(get_bot_delegation).put(replace_bot_delegation),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -902,6 +944,93 @@ async fn record_product_event(
 ) -> Response {
     if let Err(e) = authorize(&s, &h, &org, true).await {
         return e;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn record_app_error(
+    State(s): State<AuthState>,
+    Path(org): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(e) = authorize(&s, &h, &org, true).await {
+        return e;
+    }
+    if h.contains_key("idempotency-key") {
+        if let Err(e) = idempotency_key(&h) {
+            return e;
+        }
+    }
+    let Some(obj) = body.as_object() else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Expected JSON object.",
+        );
+    };
+    if let Some(src) = obj.get("source") {
+        if !matches!(
+            src.as_str(),
+            Some("error_boundary" | "window_error" | "unhandled_rejection")
+        ) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid app error source.",
+            );
+        }
+    }
+    if let Some(surf) = obj.get("surface") {
+        if !matches!(surf.as_str(), Some("web" | "desktop" | "mobile")) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid app error surface.",
+            );
+        }
+    }
+    if let Some(ty) = obj.get("type") {
+        let ok = ty
+            .as_str()
+            .is_some_and(|v| !v.is_empty() && v.chars().count() <= 128);
+        if !ok {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid app error type.",
+            );
+        }
+    }
+    if let Some(msg) = obj.get("message") {
+        if !msg.as_str().is_some_and(|v| v.chars().count() <= 2048) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid app error message.",
+            );
+        }
+    }
+    if let Some(stack) = obj.get("stack") {
+        if !stack.as_str().is_some_and(|v| v.chars().count() <= 12288) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid app error stack.",
+            );
+        }
+    }
+    if let Some(ver) = obj.get("appVersion") {
+        let ok = ver
+            .as_str()
+            .is_some_and(|v| !v.is_empty() && v.chars().count() <= 32);
+        if !ok {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid appVersion.",
+            );
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3896,13 +4025,358 @@ async fn list_goals(
     empty_org_page(&s, &h, &org, &q, "goals").await
 }
 
+fn normalize_task_json(
+    c: &rusqlite::Connection,
+    org: &str,
+    actor_id: &str,
+    mut task: Value,
+) -> Value {
+    let Some(obj) = task.as_object_mut() else {
+        return task;
+    };
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("ready_for_review")
+        .to_owned();
+    let updated_at = obj
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+
+    for nullable in [
+        "threadId",
+        "why",
+        "suggestionId",
+        "sourceApp",
+        "sourceLink",
+        "originConversationId",
+        "failure",
+        "failedAt",
+        "stoppedAt",
+        "tryingAgainAt",
+        "next",
+        "resolvedAt",
+        "steer",
+    ] {
+        obj.entry(nullable).or_insert(Value::Null);
+    }
+    obj.entry("origin").or_insert_with(|| json!("delegated"));
+    obj.entry("createdAt").or_insert_with(|| json!(updated_at));
+    obj.entry("updatedAt").or_insert_with(|| json!(updated_at));
+    obj.entry("canTryAgain").or_insert_with(|| json!(true));
+    obj.entry("lastActivityAt")
+        .or_insert_with(|| json!(updated_at));
+    if status == "working" {
+        if obj
+            .get("workingSince")
+            .is_none_or(|v| v.is_null())
+        {
+            obj.insert("workingSince".to_owned(), json!(updated_at));
+        }
+    } else {
+        obj.insert("workingSince".to_owned(), Value::Null);
+    }
+
+    let agent_val = match obj.get("agent") {
+        Some(Value::Object(a)) => {
+            let aid = a.get("id").and_then(Value::as_str).unwrap_or("");
+            if aid.is_empty() {
+                Value::Null
+            } else {
+                let resolved_name = resolve_bot_agent_display_name(c, org, actor_id, aid)
+                    .unwrap_or_else(|| {
+                        a.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("OpenBot")
+                            .to_owned()
+                    });
+                json!({ "id": aid, "name": resolved_name })
+            }
+        }
+        _ => {
+            if let Some(aid) = obj.get("agentId").and_then(Value::as_str) {
+                let resolved_name = resolve_bot_agent_display_name(c, org, actor_id, aid)
+                    .unwrap_or_else(|| "OpenBot".to_owned());
+                json!({ "id": aid, "name": resolved_name })
+            } else {
+                Value::Null
+            }
+        }
+    };
+    obj.insert("agent".to_owned(), agent_val);
+    task
+}
+
 async fn list_tasks(
     State(s): State<AuthState>,
     Path(org): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     h: HeaderMap,
 ) -> Response {
-    empty_org_page(&s, &h, &org, &q, "tasks").await
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let limit = match parse_limit(&q) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let scope_tag = format!("tasks:{}:{}", actor.organization, actor.id);
+    let offset = match decode_cursor(&q, &scope_tag) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let org_id = actor.organization.clone();
+    let actor_id = actor.id.clone();
+    let key = format!("tasks:{}:{}", actor.organization, actor.id);
+    let Ok((tasks, has_more)) = run_db(&s, move |c| {
+        let list = load_kv(c, &key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let slice: Vec<Value> = list
+            .into_iter()
+            .skip(offset)
+            .take(limit + 1)
+            .map(|t| normalize_task_json(c, &org_id, &actor_id, t))
+            .collect();
+        let has_more = slice.len() > limit;
+        let page: Vec<Value> = slice.into_iter().take(limit).collect();
+        Ok((page, has_more))
+    })
+    .await
+    else {
+        return internal();
+    };
+    let next_cursor = if has_more {
+        Some(encode_cursor(offset + limit, &scope_tag))
+    } else {
+        None
+    };
+    respond_json(
+        StatusCode::OK,
+        json!({ "tasks": tasks, "nextCursor": next_cursor }),
+    )
+}
+
+async fn get_task(
+    State(s): State<AuthState>,
+    Path((org, task_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&task_id, 256) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid taskId.",
+        );
+    }
+    let org_id = actor.organization.clone();
+    let actor_id = actor.id.clone();
+    let key = format!("tasks:{}:{}", actor.organization, actor.id);
+    let res = run_db(&s, move |c| {
+        let list = load_kv(c, &key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let found = list
+            .into_iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some(&task_id))
+            .map(|t| normalize_task_json(c, &org_id, &actor_id, t));
+        Ok(found)
+    })
+    .await;
+    match res {
+        Ok(Some(task)) => respond_json(StatusCode::OK, json!({ "task": task })),
+        Ok(None) => problem(StatusCode::NOT_FOUND, "NOT_FOUND", "Couldn't find that task."),
+        Err(_) => internal(),
+    }
+}
+
+async fn list_task_turns(
+    State(s): State<AuthState>,
+    Path((org, task_id)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&task_id, 256) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid taskId.",
+        );
+    }
+    let limit = match parse_limit(&q) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let scope_tag = format!("task_turns:{}:{}:{}", actor.organization, actor.id, task_id);
+    let offset = match decode_cursor(&q, &scope_tag) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let tasks_key = format!("tasks:{}:{}", actor.organization, actor.id);
+    let turns_key = format!("task_turns:{}:{}:{}", actor.organization, actor.id, task_id);
+    let res = run_db(&s, move |c| {
+        let tasks = load_kv(c, &tasks_key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if !tasks
+            .iter()
+            .any(|t| t.get("id").and_then(Value::as_str) == Some(&task_id))
+        {
+            return Ok(None);
+        }
+        let turns = load_kv(c, &turns_key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let slice: Vec<Value> = turns.into_iter().skip(offset).take(limit + 1).collect();
+        let has_more = slice.len() > limit;
+        let page: Vec<Value> = slice.into_iter().take(limit).collect();
+        Ok(Some((page, has_more)))
+    })
+    .await;
+    match res {
+        Ok(Some((turns, has_more))) => {
+            let next_cursor = if has_more {
+                Some(encode_cursor(offset + limit, &scope_tag))
+            } else {
+                None
+            };
+            respond_json(
+                StatusCode::OK,
+                json!({ "turns": turns, "nextCursor": next_cursor }),
+            )
+        }
+        Ok(None) => problem(StatusCode::NOT_FOUND, "NOT_FOUND", "Couldn't find that task."),
+        Err(_) => internal(),
+    }
+}
+
+async fn stop_task(
+    State(s): State<AuthState>,
+    Path((org, task_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&task_id, 256) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid taskId.",
+        );
+    }
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let resource = format!(
+        "/api/v2/organizations/{}/tasks/{}/stop",
+        actor.organization, task_id
+    );
+    let fp = fingerprint("POST", &resource, None);
+    let org_id = actor.organization.clone();
+    let actor_id = actor.id.clone();
+    let tasks_key = format!("tasks:{}:{}", actor.organization, actor.id);
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body)) =
+            replay_idempotency(&tx, &org_id, &actor_id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body)));
+        }
+        let mut tasks = load_kv(&tx, &tasks_key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let Some(idx) = tasks
+            .iter()
+            .position(|t| t.get("id").and_then(Value::as_str) == Some(&task_id))
+        else {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "Couldn't find that task.".to_owned(),
+            )));
+        };
+        let status = tasks[idx]
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if status != "working" && status != "needs_input" {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "Only a task that is working or waiting on input can be stopped.".to_owned(),
+            )));
+        }
+        let now_str = format_iso_utc(&tx, Some(now))?
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+        let conv_id = tasks[idx]
+            .get("conversationId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(obj) = tasks[idx].as_object_mut() {
+            obj.insert("status".to_owned(), json!("failed"));
+            obj.insert("stoppedAt".to_owned(), json!(now_str));
+            obj.insert("failedAt".to_owned(), json!(now_str));
+            obj.insert("failure".to_owned(), json!("Stopped by user."));
+            obj.insert("workingSince".to_owned(), Value::Null);
+            obj.insert("tryingAgainAt".to_owned(), Value::Null);
+            obj.entry("canTryAgain").or_insert_with(|| json!(true));
+            obj.insert("updatedAt".to_owned(), json!(now_str));
+            obj.insert("lastActivityAt".to_owned(), json!(now_str));
+        }
+        let updated_task = normalize_task_json(&tx, &org_id, &actor_id, tasks[idx].clone());
+        tasks[idx] = updated_task.clone();
+        save_kv(&tx, &tasks_key, &Value::Array(tasks))?;
+
+        if let Some(cid) = conv_id {
+            let _ = tx.execute(
+                "UPDATE port_runs SET status='failed' WHERE conversation_id=?1 AND owner_id=?2 AND status='running'",
+                params![cid, actor_id],
+            );
+            let _ = tx.execute(
+                "UPDATE port_conversation_messages SET status='failed' WHERE conversation_id=?1 AND status IN ('running', 'queued', 'waiting')",
+                params![cid],
+            );
+        }
+
+        let response_body = json!({ "task": updated_task }).to_string();
+        store_idempotency(&tx, &org_id, &actor_id, &key, &fp, now, 200, &response_body)?;
+        tx.commit()?;
+        Ok(Ok((200, response_body)))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
 }
 
 async fn list_app_directory(
@@ -4533,6 +5007,1743 @@ async fn get_reviewer_guidance_replay(
     respond_json(StatusCode::OK, json!({ "calls": 0, "skippedSafety": 0 }))
 }
 
+// ---------------------------------------------------------------------------
+// Bot Agents & Bot Delegation (OpenBot v1.1 - api/openapi/agents.yaml)
+// ---------------------------------------------------------------------------
+
+const BUILTIN_OPENBOT_AGENT_ID: &str = "bag_0c51d9e3a7f24b18";
+
+fn sha256_hex(input: &str) -> String {
+    let mut d = Sha256::new();
+    d.update(input.as_bytes());
+    d.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn harness_framework(harness: &str) -> Option<&'static str> {
+    match harness {
+        "crewai" => Some("CrewAI"),
+        "llamaindex" => Some("LlamaIndex"),
+        "agno" => Some("Agno"),
+        "langgraph" => Some("LangChain"),
+        "google-adk" => Some("Google ADK"),
+        "antigravity" => Some("Google Antigravity"),
+        "pydantic-ai" => Some("Pydantic AI"),
+        "microsoft-agent-framework" => Some("Microsoft Agent Framework"),
+        "claude-agent-sdk" => Some("Claude Agent SDK"),
+        "strands" => Some("AWS Strands"),
+        "ag2" => Some("AG2"),
+        "langroid" => Some("Langroid"),
+        "mastra" => Some("Mastra"),
+        _ => None,
+    }
+}
+
+fn valid_http_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > 2048
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else {
+        return None;
+    };
+    let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host_part.is_empty() || host_part.starts_with(':') {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn builtin_openbot_agent_record() -> Value {
+    json!({
+        "id": BUILTIN_OPENBOT_AGENT_ID,
+        "ownerId": "",
+        "name": "OpenBot",
+        "description": "OpenBot's own agent, with every app and component the Bot may use.",
+        "kind": "openbot",
+        "visibility": "public",
+        "endpoint": Value::Null,
+        "framework": "OpenBot",
+        "model": Value::Null,
+        "skills": [],
+        "hasAuth": false,
+        "hasCallbackToken": false,
+        "builtIn": true,
+        "createdAtTs": 0,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:00Z"
+    })
+}
+
+fn load_custom_bot_agents(c: &rusqlite::Connection, org: &str) -> Result<Vec<Value>, StorageError> {
+    let key = format!("bot_agents:{org}");
+    Ok(load_kv(c, &key)?
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default())
+}
+
+fn save_custom_bot_agents(
+    c: &rusqlite::Connection,
+    org: &str,
+    agents: &[Value],
+) -> Result<(), StorageError> {
+    let key = format!("bot_agents:{org}");
+    save_kv(c, &key, &Value::Array(agents.to_vec()))
+}
+
+fn load_bot_delegation_raw(
+    c: &rusqlite::Connection,
+    org: &str,
+    bot_id: &str,
+) -> Result<Value, StorageError> {
+    let key = format!("bot_delegation:{org}:{bot_id}");
+    Ok(load_kv(c, &key)?.unwrap_or_else(|| {
+        json!({
+            "mode": "self",
+            "model": Value::Null,
+            "effort": Value::Null,
+            "instructions": "",
+            "agentIds": [BUILTIN_OPENBOT_AGENT_ID]
+        })
+    }))
+}
+
+fn delegation_agent_ids(delegation: &Value) -> Vec<String> {
+    delegation
+        .get("agentIds")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![BUILTIN_OPENBOT_AGENT_ID.to_owned()])
+}
+
+fn count_bot_agent_usage(
+    c: &rusqlite::Connection,
+    org: &str,
+    actor: &Identity,
+    scope_org: bool,
+) -> Result<HashMap<String, usize>, StorageError> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let bot_ids: Vec<String> = if scope_org {
+        let mut stmt = c.prepare("SELECT id FROM port_bots WHERE organization_id=?1")?;
+        let rows = stmt
+            .query_map(params![org], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        let mut stmt =
+            c.prepare("SELECT id FROM port_bots WHERE organization_id=?1 AND owner_id=?2")?;
+        let rows = stmt
+            .query_map(params![org, actor.id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for bid in bot_ids {
+        let del = load_bot_delegation_raw(c, org, &bid)?;
+        let mut seen = HashSet::new();
+        for aid in delegation_agent_ids(&del) {
+            if seen.insert(aid.clone()) {
+                *counts.entry(aid).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn agent_visible_to(record: &Value, actor: &Identity) -> bool {
+    let built_in = record
+        .get("builtIn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if built_in {
+        return true;
+    }
+    let visibility = record
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private");
+    let owner_id = record
+        .get("ownerId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    visibility == "public" || owner_id == actor.id
+}
+
+fn can_manage_agent(record: &Value, actor: &Identity) -> bool {
+    let built_in = record
+        .get("builtIn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if built_in {
+        return false;
+    }
+    let visibility = record
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private");
+    if visibility == "public" {
+        is_admin(actor)
+    } else {
+        record
+            .get("ownerId")
+            .and_then(Value::as_str)
+            .is_some_and(|o| o == actor.id)
+    }
+}
+
+fn format_bot_agent_json(record: &Value, actor: &Identity, bot_count: usize) -> Value {
+    let built_in = record
+        .get("builtIn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let owner_id = record
+        .get("ownerId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mine = !built_in && owner_id == actor.id;
+    let can_manage = can_manage_agent(record, actor);
+    let mut out = json!({
+        "id": record.get("id").cloned().unwrap_or(Value::Null),
+        "name": record.get("name").cloned().unwrap_or_else(|| json!("")),
+        "description": record.get("description").cloned().unwrap_or_else(|| json!("")),
+        "kind": record.get("kind").cloned().unwrap_or_else(|| json!("openbot")),
+        "visibility": record.get("visibility").cloned().unwrap_or_else(|| json!("private")),
+        "endpoint": record.get("endpoint").cloned().unwrap_or(Value::Null),
+        "model": record.get("model").cloned().unwrap_or(Value::Null),
+        "skills": record.get("skills").cloned().unwrap_or_else(|| json!([])),
+        "hasAuth": record.get("hasAuth").and_then(Value::as_bool).unwrap_or(false),
+        "hasCallbackToken": record.get("hasCallbackToken").and_then(Value::as_bool).unwrap_or(false),
+        "builtIn": built_in,
+        "canManage": can_manage,
+        "mine": mine,
+        "botCount": bot_count,
+        "createdAt": record.get("createdAt").cloned().unwrap_or_else(|| json!("2026-01-01T00:00:00Z")),
+        "updatedAt": record.get("updatedAt").cloned().unwrap_or_else(|| json!("2026-01-01T00:00:00Z")),
+    });
+    if let Some(fw) = record.get("framework").and_then(Value::as_str) {
+        if !fw.is_empty() {
+            out["framework"] = json!(fw);
+        }
+    }
+    out
+}
+
+fn resolve_bot_agent_display_name(
+    c: &rusqlite::Connection,
+    org: &str,
+    actor_id: &str,
+    agent_id: &str,
+) -> Option<String> {
+    if agent_id == BUILTIN_OPENBOT_AGENT_ID {
+        return Some("OpenBot".to_owned());
+    }
+    let custom = load_custom_bot_agents(c, org).ok()?;
+    let found = custom
+        .into_iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(agent_id))?;
+    let visibility = found
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private");
+    let owner_id = found
+        .get("ownerId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if visibility == "private" && owner_id != actor_id {
+        Some("Private agent".to_owned())
+    } else {
+        found.get("name").and_then(Value::as_str).map(str::to_owned)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BotAgentSkillInput {
+    name: String,
+    description: String,
+    #[serde(default)]
+    examples: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BotAgentAuthInput {
+    #[serde(default)]
+    header: Option<String>,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateBotAgentInput {
+    name: String,
+    description: String,
+    visibility: String,
+    kind: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    auth: Option<BotAgentAuthInput>,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    skills: Option<Vec<BotAgentSkillInput>>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateBotAgentInput {
+    name: String,
+    description: String,
+    visibility: String,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    endpoint: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    auth: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    model: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    skills: Option<Value>,
+}
+
+fn validate_bot_agent_name(raw: &str) -> Result<String, Response> {
+    let trimmed = raw.trim();
+    if !valid_non_empty_param(trimmed, 80) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Give the agent a name (1 to 80 characters).",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_bot_agent_description(raw: &str) -> Result<String, Response> {
+    let trimmed = raw.trim();
+    if !valid_non_empty_param(trimmed, 1000) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Say what this agent is good at, so your Bots know what to send it.",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_bot_agent_skills(skills: Vec<BotAgentSkillInput>) -> Result<Vec<Value>, Response> {
+    if skills.len() > 20 {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "An agent can have at most 20 skills.",
+        ));
+    }
+    let mut out = Vec::with_capacity(skills.len());
+    for s in skills {
+        let name = s.name.trim();
+        let desc = s.description.trim();
+        if !valid_non_empty_param(name, 80) || !valid_non_empty_param(desc, 500) {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Each skill needs a name (1-80 chars) and description (1-500 chars).",
+            ));
+        }
+        let mut item = json!({
+            "name": name,
+            "description": desc,
+        });
+        if let Some(examples) = s.examples {
+            if examples.len() > 5 {
+                return Err(problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "A skill can have at most 5 examples.",
+                ));
+            }
+            let mut clean_ex = Vec::with_capacity(examples.len());
+            for ex in examples {
+                let ex_t = ex.trim();
+                if !valid_non_empty_param(ex_t, 200) {
+                    return Err(problem(
+                        StatusCode::BAD_REQUEST,
+                        "VALIDATION_ERROR",
+                        "Each skill example must be 1 to 200 characters.",
+                    ));
+                }
+                clean_ex.push(ex_t.to_owned());
+            }
+            item["examples"] = json!(clean_ex);
+        }
+        out.push(item);
+    }
+    Ok(out)
+}
+
+fn validate_bot_agent_auth(
+    auth: BotAgentAuthInput,
+) -> Result<(bool, Option<String>, Option<String>), Response> {
+    if auth.value.chars().count() > 8000 {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Agent key value is too long.",
+        ));
+    }
+    let header_name = match auth.header {
+        Some(h) => {
+            let trimmed = h.trim();
+            if trimmed.chars().count() > 200
+                || !trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                return Err(problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Invalid auth header name.",
+                ));
+            }
+            if trimmed.is_empty() {
+                "Authorization".to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        None => "Authorization".to_owned(),
+    };
+    if auth.value.trim().is_empty() {
+        Ok((false, None, None))
+    } else {
+        Ok((true, Some(header_name), Some(sha256_hex(&auth.value))))
+    }
+}
+
+async fn list_bot_agents(
+    State(s): State<AuthState>,
+    Path(org): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let scope_org = match q.get("scope").map(String::as_str) {
+        None | Some("caller") => false,
+        Some("organization") => {
+            if !is_admin(&actor) {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "PERMISSION_DENIED",
+                    "Only an admin can list all organization agents.",
+                );
+            }
+            true
+        }
+        Some(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "Invalid scope parameter.",
+            );
+        }
+    };
+    let limit = match parse_limit(&q) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let scope_tag = format!(
+        "bot_agents:{}:{}",
+        actor.organization,
+        if scope_org { "organization" } else { "caller" }
+    );
+    let offset = match decode_cursor(&q, &scope_tag) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+    let Ok((agents, has_more)) = run_db(&s, move |c| {
+        let counts = count_bot_agent_usage(c, &org_id, &actor_clone, scope_org)?;
+        let mut all = vec![builtin_openbot_agent_record()];
+        for a in load_custom_bot_agents(c, &org_id)? {
+            if scope_org || agent_visible_to(&a, &actor_clone) {
+                all.push(a);
+            }
+        }
+        all.sort_by(|a, b| {
+            let ta = a.get("createdAtTs").and_then(Value::as_i64).unwrap_or(0);
+            let tb = b.get("createdAtTs").and_then(Value::as_i64).unwrap_or(0);
+            let ia = a.get("id").and_then(Value::as_str).unwrap_or("");
+            let ib = b.get("id").and_then(Value::as_str).unwrap_or("");
+            ta.cmp(&tb).then_with(|| ia.cmp(ib))
+        });
+        let slice: Vec<Value> = all
+            .into_iter()
+            .skip(offset)
+            .take(limit + 1)
+            .map(|rec| {
+                let id = rec.get("id").and_then(Value::as_str).unwrap_or("");
+                let cnt = counts.get(id).copied().unwrap_or(0);
+                format_bot_agent_json(&rec, &actor_clone, cnt)
+            })
+            .collect();
+        let has_more = slice.len() > limit;
+        let page: Vec<Value> = slice.into_iter().take(limit).collect();
+        Ok((page, has_more))
+    })
+    .await
+    else {
+        return internal();
+    };
+    let next_cursor = if has_more {
+        Some(encode_cursor(offset + limit, &scope_tag))
+    } else {
+        None
+    };
+    respond_json(
+        StatusCode::OK,
+        json!({ "agents": agents, "nextCursor": next_cursor }),
+    )
+}
+
+async fn create_bot_agent(
+    State(s): State<AuthState>,
+    Path(org): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let input: CreateBotAgentInput = match serde_json::from_value(body.clone()) {
+        Ok(v) => v,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid create agent request body.",
+            );
+        }
+    };
+    let name = match validate_bot_agent_name(&input.name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let description = match validate_bot_agent_description(&input.description) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !matches!(input.visibility.as_str(), "public" | "private") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "visibility must be public or private.",
+        );
+    }
+    if input.visibility == "public" && !is_admin(&actor) {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "Only an admin can share an agent with everyone. Keep it private to use it with your own Bots.",
+        );
+    }
+    if !matches!(input.kind.as_str(), "openbot" | "address") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "kind must be openbot or address.",
+        );
+    }
+    let endpoint = match input.kind.as_str() {
+        "openbot" => {
+            if input
+                .endpoint
+                .as_deref()
+                .is_some_and(|e| !e.trim().is_empty())
+            {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "endpoint is refused for kind openbot.",
+                );
+            }
+            None
+        }
+        "address" => match input.endpoint.as_deref().and_then(valid_http_url) {
+            Some(u) => Some(u),
+            None => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "A valid http or https endpoint is required for kind address.",
+                );
+            }
+        },
+        _ => unreachable!(),
+    };
+    let (has_auth, auth_header, auth_secret_hash) = match input.auth {
+        Some(a) => match validate_bot_agent_auth(a) {
+            Ok(v) => v,
+            Err(e) => return e,
+        },
+        None => (false, None, None),
+    };
+    let framework: Option<String> = if input.kind == "openbot" {
+        Some("OpenBot".to_owned())
+    } else if let Some(ref raw_h) = input.harness {
+        if raw_h.is_empty() {
+            None
+        } else if let Some(fw) = harness_framework(raw_h) {
+            Some(fw.to_owned())
+        } else {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Unknown agent harness.",
+            );
+        }
+    } else {
+        None
+    };
+    let model = match input.model {
+        Some(m) => {
+            let trimmed = m.trim();
+            if !valid_non_empty_param(trimmed, 500) {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Invalid model.",
+                );
+            }
+            if input.kind == "address" {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        None => None,
+    };
+    let skills = match input.skills {
+        Some(sk) => match validate_bot_agent_skills(sk) {
+            Ok(v) => v,
+            Err(e) => return e,
+        },
+        None => Vec::new(),
+    };
+
+    let resource = format!("/api/v2/organizations/{}/bot-agents", actor.organization);
+    let fp = fingerprint("POST", &resource, Some(&body));
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+    let visibility = input.visibility;
+    let kind = input.kind;
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok((status, body_str));
+        }
+        let id = format!("bag_{}", random_hex(8)?);
+        let now_str = format_iso_utc(&tx, Some(now))?
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+        let record = json!({
+            "id": id,
+            "ownerId": actor_clone.id,
+            "name": name,
+            "description": description,
+            "kind": kind,
+            "visibility": visibility,
+            "endpoint": endpoint,
+            "framework": framework,
+            "model": model,
+            "skills": skills,
+            "hasAuth": has_auth,
+            "authHeader": auth_header,
+            "authSecretHash": auth_secret_hash,
+            "hasCallbackToken": false,
+            "callbackTokenHash": Value::Null,
+            "builtIn": false,
+            "createdAtTs": now,
+            "createdAt": now_str,
+            "updatedAt": now_str,
+        });
+        let mut agents = load_custom_bot_agents(&tx, &org_id)?;
+        agents.push(record.clone());
+        save_custom_bot_agents(&tx, &org_id, &agents)?;
+
+        let out_agent = format_bot_agent_json(&record, &actor_clone, 0);
+        let response_body = json!({ "agent": out_agent }).to_string();
+        store_idempotency(
+            &tx,
+            &org_id,
+            &actor_clone.id,
+            &key,
+            &fp,
+            now,
+            201,
+            &response_body,
+        )?;
+        tx.commit()?;
+        Ok((201, response_body))
+    })
+    .await;
+
+    match res {
+        Ok((409, _)) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok((status, body_str)) => {
+            let mut resp = respond_raw(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body_str.clone(),
+            );
+            if status == 201 {
+                if let Ok(val) = serde_json::from_str::<Value>(&body_str) {
+                    if let Some(id) = val
+                        .get("agent")
+                        .and_then(|a| a.get("id"))
+                        .and_then(Value::as_str)
+                    {
+                        let loc = format!("/api/v2/organizations/{org}/bot-agents/{id}");
+                        if let Ok(hv) = HeaderValue::from_str(&loc) {
+                            resp.headers_mut().insert(header::LOCATION, hv);
+                        }
+                    }
+                }
+            }
+            resp
+        }
+        Err(_) => internal(),
+    }
+}
+
+async fn get_bot_agent(
+    State(s): State<AuthState>,
+    Path((org, bot_agent_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&bot_agent_id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid botAgentId.",
+        );
+    }
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+    let res = run_db(&s, move |c| {
+        let record = if bot_agent_id == BUILTIN_OPENBOT_AGENT_ID {
+            Some(builtin_openbot_agent_record())
+        } else {
+            load_custom_bot_agents(c, &org_id)?
+                .into_iter()
+                .find(|a| {
+                    a.get("id").and_then(Value::as_str) == Some(&bot_agent_id)
+                        && agent_visible_to(a, &actor_clone)
+                })
+        };
+        let Some(rec) = record else {
+            return Ok(None);
+        };
+        let counts = count_bot_agent_usage(c, &org_id, &actor_clone, false)?;
+        let cnt = counts.get(&bot_agent_id).copied().unwrap_or(0);
+        Ok(Some(json!({
+            "agent": format_bot_agent_json(&rec, &actor_clone, cnt)
+        })))
+    })
+    .await;
+    match res {
+        Ok(Some(v)) => respond_json(StatusCode::OK, v),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "BOT_AGENT_NOT_FOUND",
+            "Couldn't find that agent.",
+        ),
+        Err(_) => internal(),
+    }
+}
+
+async fn update_bot_agent(
+    State(s): State<AuthState>,
+    Path((org, bot_agent_id)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&bot_agent_id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid botAgentId.",
+        );
+    }
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let input: UpdateBotAgentInput = match serde_json::from_value(body.clone()) {
+        Ok(v) => v,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid update agent request body.",
+            );
+        }
+    };
+    let name = match validate_bot_agent_name(&input.name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let description = match validate_bot_agent_description(&input.description) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !matches!(input.visibility.as_str(), "public" | "private") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "visibility must be public or private.",
+        );
+    }
+    if input.visibility == "public" && !is_admin(&actor) {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "Only an admin can share an agent with everyone.",
+        );
+    }
+    let parsed_auth = match input.auth {
+        Some(v) => {
+            let parsed: BotAgentAuthInput = match serde_json::from_value(v) {
+                Ok(a) => a,
+                Err(_) => {
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        "VALIDATION_ERROR",
+                        "Invalid auth object.",
+                    );
+                }
+            };
+            match validate_bot_agent_auth(parsed) {
+                Ok(res) => Some(res),
+                Err(e) => return e,
+            }
+        }
+        None => None,
+    };
+    let parsed_skills = match input.skills {
+        Some(v) => {
+            let parsed: Vec<BotAgentSkillInput> = match serde_json::from_value(v) {
+                Ok(sk) => sk,
+                Err(_) => {
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        "VALIDATION_ERROR",
+                        "Invalid skills array.",
+                    );
+                }
+            };
+            match validate_bot_agent_skills(parsed) {
+                Ok(res) => Some(res),
+                Err(e) => return e,
+            }
+        }
+        None => None,
+    };
+    let parsed_model: Option<Option<String>> = match input.model {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(m)) => {
+            let trimmed = m.trim();
+            if !valid_non_empty_param(trimmed, 500) {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Invalid model.",
+                );
+            }
+            Some(Some(trimmed.to_owned()))
+        }
+        Some(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid model.",
+            );
+        }
+    };
+    let endpoint_patch = input.endpoint;
+    let visibility = input.visibility;
+
+    let resource = format!(
+        "/api/v2/organizations/{}/bot-agents/{}",
+        actor.organization, bot_agent_id
+    );
+    let fp = fingerprint("PATCH", &resource, Some(&body));
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body_str)));
+        }
+        if bot_agent_id == BUILTIN_OPENBOT_AGENT_ID {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let mut agents = load_custom_bot_agents(&tx, &org_id)?;
+        let Some(idx) = agents.iter().position(|a| {
+            a.get("id").and_then(Value::as_str) == Some(&bot_agent_id)
+                && agent_visible_to(a, &actor_clone)
+        }) else {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                "BOT_AGENT_NOT_FOUND",
+                "Couldn't find that agent.".to_owned(),
+            )));
+        };
+        if !can_manage_agent(&agents[idx], &actor_clone) {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let kind = agents[idx]
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("openbot")
+            .to_owned();
+        if let Some(ep_val) = endpoint_patch {
+            if kind == "openbot" {
+                if !ep_val.is_null() {
+                    tx.rollback()?;
+                    return Ok(Err((
+                        StatusCode::BAD_REQUEST,
+                        "VALIDATION_ERROR",
+                        "endpoint is refused for kind openbot.".to_owned(),
+                    )));
+                }
+            } else {
+                let valid = ep_val.as_str().and_then(valid_http_url);
+                let Some(u) = valid else {
+                    tx.rollback()?;
+                    return Ok(Err((
+                        StatusCode::BAD_REQUEST,
+                        "VALIDATION_ERROR",
+                        "Invalid endpoint URL.".to_owned(),
+                    )));
+                };
+                agents[idx]["endpoint"] = json!(u);
+            }
+        }
+        let now_str = format_iso_utc(&tx, Some(now))?
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+        agents[idx]["name"] = json!(name);
+        agents[idx]["description"] = json!(description);
+        agents[idx]["visibility"] = json!(visibility);
+        agents[idx]["updatedAt"] = json!(now_str);
+        if let Some((has_auth, auth_hdr, auth_hash)) = parsed_auth {
+            agents[idx]["hasAuth"] = json!(has_auth);
+            agents[idx]["authHeader"] = json!(auth_hdr);
+            agents[idx]["authSecretHash"] = json!(auth_hash);
+        }
+        if let Some(m) = parsed_model {
+            if kind == "address" {
+                agents[idx]["model"] = Value::Null;
+            } else {
+                agents[idx]["model"] = json!(m);
+            }
+        }
+        if let Some(sk) = parsed_skills {
+            agents[idx]["skills"] = json!(sk);
+        }
+
+        let updated = agents[idx].clone();
+        save_custom_bot_agents(&tx, &org_id, &agents)?;
+        let counts = count_bot_agent_usage(&tx, &org_id, &actor_clone, false)?;
+        let cnt = counts.get(&bot_agent_id).copied().unwrap_or(0);
+        let response_body = json!({
+            "agent": format_bot_agent_json(&updated, &actor_clone, cnt)
+        })
+        .to_string();
+        store_idempotency(
+            &tx,
+            &org_id,
+            &actor_clone.id,
+            &key,
+            &fp,
+            now,
+            200,
+            &response_body,
+        )?;
+        tx.commit()?;
+        Ok(Ok((200, response_body)))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
+}
+
+async fn delete_bot_agent(
+    State(s): State<AuthState>,
+    Path((org, bot_agent_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&bot_agent_id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid botAgentId.",
+        );
+    }
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let resource = format!(
+        "/api/v2/organizations/{}/bot-agents/{}",
+        actor.organization, bot_agent_id
+    );
+    let fp = fingerprint("DELETE", &resource, None);
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body_str)));
+        }
+        if bot_agent_id == BUILTIN_OPENBOT_AGENT_ID {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let mut agents = load_custom_bot_agents(&tx, &org_id)?;
+        let Some(idx) = agents.iter().position(|a| {
+            a.get("id").and_then(Value::as_str) == Some(&bot_agent_id)
+                && agent_visible_to(a, &actor_clone)
+        }) else {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                "BOT_AGENT_NOT_FOUND",
+                "Couldn't find that agent.".to_owned(),
+            )));
+        };
+        if !can_manage_agent(&agents[idx], &actor_clone) {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+
+        // Check if any non-deleted Bot in the org uses this agent alone.
+        let bots = {
+            let mut stmt = tx.prepare(
+                "SELECT id, owner_id, name FROM port_bots WHERE organization_id=?1 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![org_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut visible_blocking: Vec<String> = Vec::new();
+        let mut hidden_blocking: usize = 0;
+        let mut bots_to_prune: Vec<(String, Value)> = Vec::new();
+
+        for (bid, owner_id, bname) in bots {
+            let mut del = load_bot_delegation_raw(&tx, &org_id, &bid)?;
+            let aids = delegation_agent_ids(&del);
+            if aids.iter().any(|id| id == &bot_agent_id) {
+                if aids.len() <= 1 {
+                    if owner_id == actor_clone.id {
+                        visible_blocking.push(bname);
+                    } else {
+                        hidden_blocking += 1;
+                    }
+                } else {
+                    let filtered: Vec<String> = aids
+                        .into_iter()
+                        .filter(|id| id != &bot_agent_id)
+                        .collect();
+                    del["agentIds"] = json!(filtered);
+                    bots_to_prune.push((bid, del));
+                }
+            }
+        }
+
+        if !visible_blocking.is_empty() || hidden_blocking > 0 {
+            tx.rollback()?;
+            let detail = match (visible_blocking.first(), visible_blocking.len(), hidden_blocking) {
+                (Some(first), 1, 0) => format!(
+                    "{first} runs on this agent alone. Give it another agent first, then delete this one."
+                ),
+                (Some(first), vis, hid) => {
+                    let rest = (vis - 1) + hid;
+                    format!(
+                        "{first} and {rest} other Bot{} run on this agent alone. Give them another agent first, then delete this one.",
+                        if rest == 1 { "" } else { "s" }
+                    )
+                }
+                (None, _, hid) => format!(
+                    "{hid} Bot{} run on this agent alone. Give them another agent first, then delete this one.",
+                    if hid == 1 { "" } else { "s" }
+                ),
+            };
+            return Ok(Err((StatusCode::CONFLICT, "BOT_AGENT_IN_USE", detail)));
+        }
+
+        for (bid, del) in bots_to_prune {
+            save_kv(&tx, &format!("bot_delegation:{org_id}:{bid}"), &del)?;
+        }
+        agents.remove(idx);
+        save_custom_bot_agents(&tx, &org_id, &agents)?;
+        store_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now, 204, "")?;
+        tx.commit()?;
+        Ok(Ok((204, String::new())))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
+}
+
+async fn issue_bot_agent_callback_token(
+    State(s): State<AuthState>,
+    Path((org, bot_agent_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&bot_agent_id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid botAgentId.",
+        );
+    }
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let resource = format!(
+        "/api/v2/organizations/{}/bot-agents/{}/issue-callback-token",
+        actor.organization, bot_agent_id
+    );
+    let fp = fingerprint("POST", &resource, None);
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body_str)));
+        }
+        if bot_agent_id == BUILTIN_OPENBOT_AGENT_ID {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let mut agents = load_custom_bot_agents(&tx, &org_id)?;
+        let Some(idx) = agents.iter().position(|a| {
+            a.get("id").and_then(Value::as_str) == Some(&bot_agent_id)
+                && agent_visible_to(a, &actor_clone)
+        }) else {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                "BOT_AGENT_NOT_FOUND",
+                "Couldn't find that agent.".to_owned(),
+            )));
+        };
+        if !can_manage_agent(&agents[idx], &actor_clone) {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let kind = agents[idx]
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("openbot");
+        let built_in = agents[idx]
+            .get("builtIn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if kind == "openbot" || built_in {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "An agent that runs inside OpenBot needs no callback token.".to_owned(),
+            )));
+        }
+        let token = format!("obot_agt_{}", random_hex(18)?);
+        let now_str = format_iso_utc(&tx, Some(now))?
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+        agents[idx]["hasCallbackToken"] = json!(true);
+        agents[idx]["callbackTokenHash"] = json!(sha256_hex(&token));
+        agents[idx]["updatedAt"] = json!(now_str);
+        save_custom_bot_agents(&tx, &org_id, &agents)?;
+
+        let response_body = json!({ "token": token }).to_string();
+        store_idempotency(
+            &tx,
+            &org_id,
+            &actor_clone.id,
+            &key,
+            &fp,
+            now,
+            200,
+            &response_body,
+        )?;
+        tx.commit()?;
+        Ok(Ok((200, response_body)))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
+}
+
+async fn revoke_bot_agent_callback_token(
+    State(s): State<AuthState>,
+    Path((org, bot_agent_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&bot_agent_id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid botAgentId.",
+        );
+    }
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let resource = format!(
+        "/api/v2/organizations/{}/bot-agents/{}/revoke-callback-token",
+        actor.organization, bot_agent_id
+    );
+    let fp = fingerprint("POST", &resource, None);
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body_str)));
+        }
+        if bot_agent_id == BUILTIN_OPENBOT_AGENT_ID {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let mut agents = load_custom_bot_agents(&tx, &org_id)?;
+        let Some(idx) = agents.iter().position(|a| {
+            a.get("id").and_then(Value::as_str) == Some(&bot_agent_id)
+                && agent_visible_to(a, &actor_clone)
+        }) else {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                "BOT_AGENT_NOT_FOUND",
+                "Couldn't find that agent.".to_owned(),
+            )));
+        };
+        if !can_manage_agent(&agents[idx], &actor_clone) {
+            tx.rollback()?;
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "You can't manage this agent.".to_owned(),
+            )));
+        }
+        let had_token = agents[idx]
+            .get("hasCallbackToken")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if had_token {
+            let now_str = format_iso_utc(&tx, Some(now))?
+                .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_owned());
+            agents[idx]["hasCallbackToken"] = json!(false);
+            agents[idx]["callbackTokenHash"] = Value::Null;
+            agents[idx]["updatedAt"] = json!(now_str);
+            save_custom_bot_agents(&tx, &org_id, &agents)?;
+        }
+        let counts = count_bot_agent_usage(&tx, &org_id, &actor_clone, false)?;
+        let cnt = counts.get(&bot_agent_id).copied().unwrap_or(0);
+        let response_body = json!({
+            "agent": format_bot_agent_json(&agents[idx], &actor_clone, cnt)
+        })
+        .to_string();
+        store_idempotency(
+            &tx,
+            &org_id,
+            &actor_clone.id,
+            &key,
+            &fp,
+            now,
+            200,
+            &response_body,
+        )?;
+        tx.commit()?;
+        Ok(Ok((200, response_body)))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
+}
+
+fn format_delegation_response(
+    c: &rusqlite::Connection,
+    org: &str,
+    bot_id: &str,
+    bot_owner_id: &str,
+    actor: &Identity,
+    stored: &Value,
+) -> Result<Value, StorageError> {
+    let mode = stored
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("self");
+    let model = stored.get("model").cloned().unwrap_or(Value::Null);
+    let effort = stored.get("effort").cloned().unwrap_or(Value::Null);
+    let can_manage = bot_owner_id == actor.id;
+    let instructions = if can_manage {
+        stored
+            .get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    let custom_agents = load_custom_bot_agents(c, org)?;
+    let builtin = builtin_openbot_agent_record();
+
+    let mut agents_out = Vec::new();
+    for aid in delegation_agent_ids(stored) {
+        let found = if aid == BUILTIN_OPENBOT_AGENT_ID {
+            Some(&builtin)
+        } else {
+            custom_agents
+                .iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(aid.as_str()))
+        };
+        let entry = match found {
+            Some(rec) => {
+                let vis = rec
+                    .get("visibility")
+                    .and_then(Value::as_str)
+                    .unwrap_or("private");
+                let agent_owner = rec
+                    .get("ownerId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let available = vis == "public" || agent_owner == bot_owner_id;
+                let caller_can_read = vis == "public" || agent_owner == actor.id;
+                let mut item = json!({
+                    "id": aid,
+                    "name": if caller_can_read {
+                        rec.get("name").and_then(Value::as_str).unwrap_or("Agent")
+                    } else {
+                        "Private agent"
+                    },
+                    "description": if caller_can_read {
+                        rec.get("description").and_then(Value::as_str).unwrap_or("")
+                    } else {
+                        ""
+                    },
+                    "kind": rec.get("kind").and_then(Value::as_str).unwrap_or("openbot"),
+                    "available": available,
+                });
+                if let Some(fw) = rec.get("framework").and_then(Value::as_str) {
+                    if !fw.is_empty() {
+                        item["framework"] = json!(fw);
+                    }
+                }
+                item
+            }
+            None => json!({
+                "id": aid,
+                "name": "Deleted agent",
+                "description": "",
+                "kind": "openbot",
+                "available": false,
+            }),
+        };
+        agents_out.push(entry);
+    }
+
+    Ok(json!({
+        "botId": bot_id,
+        "mode": mode,
+        "model": model,
+        "effort": effort,
+        "instructions": instructions,
+        "agents": agents_out,
+        "canManage": can_manage,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplaceBotDelegationInput {
+    mode: String,
+    model: Option<String>,
+    effort: Option<String>,
+    instructions: String,
+    agent_ids: Vec<String>,
+}
+
+async fn get_bot_delegation(
+    State(s): State<AuthState>,
+    Path((org, bot_id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match verify_bot_for_actor(&s, &h, &org, &bot_id, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+    let res = run_db(&s, move |c| {
+        let stored = load_bot_delegation_raw(c, &org_id, &bot_id)?;
+        format_delegation_response(c, &org_id, &bot_id, &actor_clone.id, &actor_clone, &stored)
+    })
+    .await;
+    match res {
+        Ok(v) => respond_json(StatusCode::OK, v),
+        Err(_) => internal(),
+    }
+}
+
+async fn replace_bot_delegation(
+    State(s): State<AuthState>,
+    Path((org, bot_id)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match verify_bot_for_actor(&s, &h, &org, &bot_id, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let key = match idempotency_key(&h) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let input: ReplaceBotDelegationInput = match serde_json::from_value(body.clone()) {
+        Ok(v) => v,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid delegation request body.",
+            );
+        }
+    };
+    if !matches!(input.mode.as_str(), "self" | "orchestrate") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "mode must be self or orchestrate.",
+        );
+    }
+    if input.instructions.chars().count() > 4000 {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "instructions must be 4000 characters or fewer.",
+        );
+    }
+    let model = match input.model {
+        Some(m) => {
+            let t = m.trim();
+            if !valid_non_empty_param(t, 500) {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Invalid model.",
+                );
+            }
+            Some(t.to_owned())
+        }
+        None => None,
+    };
+    let effort = match input.effort {
+        Some(e) => {
+            let t = e.trim().to_ascii_lowercase();
+            if !valid_non_empty_param(&t, 40) {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Invalid effort.",
+                );
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    if input.agent_ids.is_empty() || input.agent_ids.len() > 20 {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Choose between 1 and 20 agents.",
+        );
+    }
+    let mut seen_ids = HashSet::new();
+    let mut clean_ids = Vec::with_capacity(input.agent_ids.len());
+    for aid in input.agent_ids {
+        let t = aid.trim();
+        if !valid_non_empty_param(t, 200) || !seen_ids.insert(t.to_owned()) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "agentIds must be unique non-empty agent ids.",
+            );
+        }
+        clean_ids.push(t.to_owned());
+    }
+    if input.mode == "self" && clean_ids.len() != 1 {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "A Bot that works on its own runs on one agent. Turn on handing work to agents to choose more.",
+        );
+    }
+
+    let resource = format!(
+        "/api/v2/organizations/{}/bots/{}/delegation",
+        actor.organization, bot_id
+    );
+    let fp = fingerprint("PUT", &resource, Some(&body));
+    let org_id = actor.organization.clone();
+    let actor_clone = actor.clone();
+    let mode = input.mode;
+    let instructions = input.instructions;
+
+    let res = run_db(&s, move |c| {
+        let now = epoch()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((status, body_str)) =
+            replay_idempotency(&tx, &org_id, &actor_clone.id, &key, &fp, now)?
+        {
+            tx.commit()?;
+            return Ok(Ok((status, body_str)));
+        }
+
+        let current = load_bot_delegation_raw(&tx, &org_id, &bot_id)?;
+        let current_ids: HashSet<String> = delegation_agent_ids(&current).into_iter().collect();
+        let custom_agents = load_custom_bot_agents(&tx, &org_id)?;
+
+        for aid in &clean_ids {
+            let visible = aid == BUILTIN_OPENBOT_AGENT_ID
+                || custom_agents.iter().any(|a| {
+                    a.get("id").and_then(Value::as_str) == Some(aid.as_str())
+                        && agent_visible_to(a, &actor_clone)
+                })
+                || current_ids.contains(aid);
+            if !visible {
+                tx.rollback()?;
+                return Ok(Err((
+                    StatusCode::BAD_REQUEST,
+                    "VALIDATION_ERROR",
+                    "Couldn't find one of those agents. Choose from the agents you can see."
+                        .to_owned(),
+                )));
+            }
+        }
+
+        let stored = json!({
+            "mode": mode,
+            "model": model,
+            "effort": effort,
+            "instructions": instructions,
+            "agentIds": clean_ids,
+        });
+        save_kv(&tx, &format!("bot_delegation:{org_id}:{bot_id}"), &stored)?;
+        let out = format_delegation_response(
+            &tx,
+            &org_id,
+            &bot_id,
+            &actor_clone.id,
+            &actor_clone,
+            &stored,
+        )?;
+        let response_body = out.to_string();
+        store_idempotency(
+            &tx,
+            &org_id,
+            &actor_clone.id,
+            &key,
+            &fp,
+            now,
+            200,
+            &response_body,
+        )?;
+        tx.commit()?;
+        Ok(Ok((200, response_body)))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((409, _))) => problem(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "That Idempotency-Key was used for a different request.",
+        ),
+        Ok(Ok((status, body_str))) => respond_raw(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body_str,
+        ),
+        Ok(Err((status, code, msg))) => problem(status, code, &msg),
+        Err(_) => internal(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4672,6 +6883,540 @@ mod tests {
         let rt = app.clone().oneshot(post_or_patch("POST", &format!("/api/v2/organizations/{org_id}/conversations/route"), &cookie, r#"{"text":"ask @Alpha to check"}"#)).await.unwrap();
         assert_eq!(rt.status(), StatusCode::OK);
         assert_eq!(read_json(rt).await["botId"], "bot-a");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn req_with_idem(
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        idem: &str,
+        body: &str,
+    ) -> Request<Body> {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", cookie);
+        if !idem.is_empty() {
+            b = b.header("idempotency-key", idem);
+        }
+        if !body.is_empty() {
+            b = b.header("content-type", "application/json");
+        }
+        b.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn v1_1_bot_agents_delegation_tasks_and_app_errors() {
+        let mut rand = [0u8; 8];
+        getrandom::getrandom(&mut rand).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "openbot-v11-compat-{:x}.db",
+            u64::from_le_bytes(rand)
+        ));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let state = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let app = crate::local_auth::router(state.clone())
+            .merge(crate::bots::router(state.clone()))
+            .merge(crate::compat_routes::router(state));
+
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/port/auth/setup")
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"a long secure password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::NO_CONTENT);
+        let cookie = setup.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let orgs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/people/me/organizations")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let org_id = read_json(orgs).await["organizations"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Create a bot owned by owner.
+        let bot_res = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bots"),
+                &cookie,
+                "bot-v11",
+                r#"{"name":"Planner","title":"","roleDescription":"Plans work","visibility":"private"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bot_res.status(), StatusCode::CREATED);
+        let bot_id = read_json(bot_res).await["bot"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 1. Built-in OpenBot agent is listed and counts the bot.
+        let list0 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/bot-agents"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(list0.status(), StatusCode::OK);
+        let list0_j = read_json(list0).await;
+        assert_eq!(list0_j["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(list0_j["agents"][0]["id"], BUILTIN_OPENBOT_AGENT_ID);
+        assert_eq!(list0_j["agents"][0]["builtIn"], true);
+        assert_eq!(list0_j["agents"][0]["botCount"], 1);
+
+        // 2. Create an openbot agent and an address agent; verify Location, idempotency, and validation.
+        let create_openbot_body = r#"{"name":"Researcher","description":"Deep research","visibility":"public","kind":"openbot","model":"gpt-5.1"}"#;
+        let c1 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents"),
+                &cookie,
+                "ag-1",
+                create_openbot_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(c1.status(), StatusCode::CREATED);
+        let c1_loc = c1.headers()[header::LOCATION].to_str().unwrap().to_owned();
+        let c1_j = read_json(c1).await;
+        let ag1_id = c1_j["agent"]["id"].as_str().unwrap().to_owned();
+        assert!(c1_loc.ends_with(&ag1_id));
+        assert_eq!(c1_j["agent"]["framework"], "OpenBot");
+        assert_eq!(c1_j["agent"]["model"], "gpt-5.1");
+
+        // Idempotent replay returns same agent + Location; conflict returns 409.
+        let c1_replay = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents"),
+                &cookie,
+                "ag-1",
+                create_openbot_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(c1_replay.status(), StatusCode::CREATED);
+        assert_eq!(c1_replay.headers()[header::LOCATION].to_str().unwrap(), c1_loc);
+        assert_eq!(read_json(c1_replay).await["agent"]["id"], ag1_id);
+
+        let c1_conflict = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents"),
+                &cookie,
+                "ag-1",
+                r#"{"name":"Other","description":"Other","visibility":"private","kind":"openbot"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(c1_conflict.status(), StatusCode::CONFLICT);
+
+        let c2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents"),
+                &cookie,
+                "ag-2",
+                r#"{"name":"Pipeline","description":"Forecasts quarter","visibility":"private","kind":"address","endpoint":"https://agents.example.com/ag-ui","auth":{"header":"Authorization","value":"Bearer secret"},"harness":"langgraph","skills":[{"name":"Forecast","description":"Forecasts deals","examples":["Q4?"]}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(c2.status(), StatusCode::CREATED);
+        let c2_j = read_json(c2).await;
+        let ag2_id = c2_j["agent"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(c2_j["agent"]["framework"], "LangChain");
+        assert_eq!(c2_j["agent"]["hasAuth"], true);
+        assert_eq!(c2_j["agent"]["hasCallbackToken"], false);
+
+        // Pagination works on bot-agents.
+        let p1 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/bot-agents?limit=2"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(p1.status(), StatusCode::OK);
+        let p1_j = read_json(p1).await;
+        assert_eq!(p1_j["agents"].as_array().unwrap().len(), 2);
+        let cursor = p1_j["nextCursor"].as_str().unwrap().to_owned();
+        let p2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/bot-agents?limit=2&cursor={cursor}"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        let p2_j = read_json(p2).await;
+        assert_eq!(p2_j["agents"].as_array().unwrap().len(), 1);
+        assert!(p2_j["nextCursor"].is_null());
+
+        // PATCH updates name & preserves auth when omitted, and clears model when null.
+        let upd2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "PATCH",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag2_id}"),
+                &cookie,
+                "upd-2",
+                r#"{"name":"Pipeline v2","description":"Forecasts quarter","visibility":"private"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(upd2.status(), StatusCode::OK);
+        let upd2_j = read_json(upd2).await;
+        assert_eq!(upd2_j["agent"]["name"], "Pipeline v2");
+        assert_eq!(upd2_j["agent"]["hasAuth"], true);
+
+        let upd1 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "PATCH",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag1_id}"),
+                &cookie,
+                "upd-1",
+                r#"{"name":"Researcher","description":"Deep research","visibility":"public","model":null}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(upd1.status(), StatusCode::OK);
+        assert!(read_json(upd1).await["agent"]["model"].is_null());
+
+        // 3. Issue & revoke callback token: refused on openbot, works on address.
+        let tok_bad = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag1_id}/issue-callback-token"),
+                &cookie,
+                "tok-bad",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tok_bad.status(), StatusCode::BAD_REQUEST);
+
+        let tok_ok = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag2_id}/issue-callback-token"),
+                &cookie,
+                "tok-ok",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tok_ok.status(), StatusCode::OK);
+        assert!(read_json(tok_ok).await["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("obot_agt_"));
+
+        let get2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag2_id}"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_json(get2).await["agent"]["hasCallbackToken"], true);
+
+        let rev2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag2_id}/revoke-callback-token"),
+                &cookie,
+                "rev-2",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rev2.status(), StatusCode::OK);
+        assert_eq!(read_json(rev2).await["agent"]["hasCallbackToken"], false);
+
+        // 4. Bot delegation GET defaults to self on OpenBot; PUT updates to orchestrate / self.
+        let del_def = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/bots/{bot_id}/delegation"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_def.status(), StatusCode::OK);
+        let del_def_j = read_json(del_def).await;
+        assert_eq!(del_def_j["mode"], "self");
+        assert_eq!(del_def_j["agents"][0]["id"], BUILTIN_OPENBOT_AGENT_ID);
+        assert_eq!(del_def_j["canManage"], true);
+
+        let del_bad = app
+            .clone()
+            .oneshot(req_with_idem(
+                "PUT",
+                &format!("/api/v2/organizations/{org_id}/bots/{bot_id}/delegation"),
+                &cookie,
+                "del-bad",
+                &format!(r#"{{"mode":"self","model":null,"effort":null,"instructions":"","agentIds":["{ag1_id}","{ag2_id}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_bad.status(), StatusCode::BAD_REQUEST);
+
+        let del_orch = app
+            .clone()
+            .oneshot(req_with_idem(
+                "PUT",
+                &format!("/api/v2/organizations/{org_id}/bots/{bot_id}/delegation"),
+                &cookie,
+                "del-orch",
+                &format!(r#"{{"mode":"orchestrate","model":"gpt-5.1","effort":"HIGH","instructions":"Delegate wisely.","agentIds":["{ag1_id}","{ag2_id}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_orch.status(), StatusCode::OK);
+        let del_orch_j = read_json(del_orch).await;
+        assert_eq!(del_orch_j["mode"], "orchestrate");
+        assert_eq!(del_orch_j["effort"], "high");
+        assert_eq!(del_orch_j["agents"].as_array().unwrap().len(), 2);
+
+        // Switch bot to run on ag1 alone -> deleting ag1 fails 409 BOT_AGENT_IN_USE; deleting ag2 succeeds 204.
+        let del_self_ag1 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "PUT",
+                &format!("/api/v2/organizations/{org_id}/bots/{bot_id}/delegation"),
+                &cookie,
+                "del-self-ag1",
+                &format!(r#"{{"mode":"self","model":null,"effort":null,"instructions":"","agentIds":["{ag1_id}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_self_ag1.status(), StatusCode::OK);
+
+        let del_in_use = app
+            .clone()
+            .oneshot(req_with_idem(
+                "DELETE",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag1_id}"),
+                &cookie,
+                "rm-ag1",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_in_use.status(), StatusCode::CONFLICT);
+        assert_eq!(read_json(del_in_use).await["code"], "BOT_AGENT_IN_USE");
+
+        let del_ag2 = app
+            .clone()
+            .oneshot(req_with_idem(
+                "DELETE",
+                &format!("/api/v2/organizations/{org_id}/bot-agents/{ag2_id}"),
+                &cookie,
+                "rm-ag2",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_ag2.status(), StatusCode::NO_CONTENT);
+
+        // 5 & 7. Tasks list, task detail, task turns, stop task, and v1.1 Task JSON normalization.
+        db.try_with_connection(|c| {
+            let owner_id: String = c.query_row("SELECT id FROM auth_users LIMIT 1", [], |r| r.get(0))?;
+            save_kv(
+                c,
+                &format!("tasks:{org_id}:{owner_id}"),
+                &json!([{
+                    "id": "task-1",
+                    "botId": bot_id,
+                    "agentId": ag1_id,
+                    "conversationId": "conv-task-1",
+                    "threadId": "thread-task-1",
+                    "title": "Research market",
+                    "why": "Requested by user",
+                    "origin": "delegated",
+                    "suggestionId": null,
+                    "sourceApp": null,
+                    "sourceLink": null,
+                    "originConversationId": "conv-origin",
+                    "status": "working",
+                    "failure": null,
+                    "failedAt": null,
+                    "next": null,
+                    "resolvedAt": null,
+                    "createdAt": "2026-11-16T09:00:00Z",
+                    "updatedAt": "2026-11-16T09:01:00Z"
+                }]),
+            )?;
+            save_kv(
+                c,
+                &format!("task_turns:{org_id}:{owner_id}:task-1"),
+                &json!([{
+                    "askId": "ask-1",
+                    "startedAt": "2026-11-16T09:00:02Z",
+                    "endedAt": "2026-11-16T09:00:54Z",
+                    "workedSeconds": 52,
+                    "runs": 1,
+                    "model": "gpt-5.1"
+                }]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let tasks_res = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/tasks"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tasks_res.status(), StatusCode::OK);
+        let tasks_j = read_json(tasks_res).await;
+        assert_eq!(tasks_j["tasks"][0]["canTryAgain"], true);
+        assert_eq!(tasks_j["tasks"][0]["workingSince"], "2026-11-16T09:01:00Z");
+        assert_eq!(tasks_j["tasks"][0]["agent"]["id"], ag1_id);
+        assert_eq!(tasks_j["tasks"][0]["agent"]["name"], "Researcher");
+        assert!(tasks_j["tasks"][0]["stoppedAt"].is_null());
+
+        let turns_res = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/tasks/task-1/turns"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(turns_res.status(), StatusCode::OK);
+        let turns_j = read_json(turns_res).await;
+        assert_eq!(turns_j["turns"][0]["workedSeconds"], 52);
+        assert!(turns_j["nextCursor"].is_null());
+
+        let turns_missing = app
+            .clone()
+            .oneshot(req_with_idem(
+                "GET",
+                &format!("/api/v2/organizations/{org_id}/tasks/missing/turns"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(turns_missing.status(), StatusCode::NOT_FOUND);
+
+        let stop_res = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/tasks/task-1/stop"),
+                &cookie,
+                "stop-1",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stop_res.status(), StatusCode::OK);
+        let stop_j = read_json(stop_res).await;
+        assert_eq!(stop_j["task"]["status"], "failed");
+        assert!(stop_j["task"]["stoppedAt"].is_string());
+        assert!(stop_j["task"]["workingSince"].is_null());
+
+        // Stopping an already stopped (failed) task with a new key returns 409 CONFLICT.
+        let stop_again = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/tasks/task-1/stop"),
+                &cookie,
+                "stop-2",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stop_again.status(), StatusCode::CONFLICT);
+
+        // 6. POST /app-errors returns 204 cleanly.
+        let app_err = app
+            .clone()
+            .oneshot(req_with_idem(
+                "POST",
+                &format!("/api/v2/organizations/{org_id}/app-errors"),
+                &cookie,
+                "err-1",
+                r#"{"source":"error_boundary","type":"TypeError","message":"boom","surface":"web","appVersion":"1.1.0-rc.2"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(app_err.status(), StatusCode::NO_CONTENT);
 
         let _ = std::fs::remove_file(path);
     }

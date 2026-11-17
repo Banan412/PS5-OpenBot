@@ -107,6 +107,18 @@ export const groupKeys = {
 };
 
 /**
+ * Whether a completed Bot reply in a group transcript is an intentional silent pass
+ * (`[PASS]`, `[NO_REPLY]`, `[SILENT]`, or blank), optionally wrapped in Markdown emphasis/code.
+ */
+const SILENT_GROUP_PASS_RE =
+  /^[*_`]*\[(?:PASS|NO_REPLY|SILENT)\][*_`]*(?:$|[\s:.!\-—])/i;
+
+export function isSilentGroupPass(text: string): boolean {
+  const trimmed = text.trim();
+  return !trimmed || SILENT_GROUP_PASS_RE.test(trimmed);
+}
+
+/**
  * The shared transcript. Bot turns run on the server with nobody's browser attached, so the page
  * polls while a turn is still owed an answer and stops once every Bot has spoken.
  */
@@ -136,7 +148,7 @@ export function groupQueryOptions(channelId: string) {
             creator: member.creator ?? false,
           })),
         // The API answers newest first. The transcript reads oldest first.
-        // Drop completed silent passes with no text so unaddressed bots do not leave blank stacked rows.
+        // Drop completed silent passes so unaddressed bots do not leave blank stacked rows.
         messages: newestFirst.messages
           .map((message) =>
             groupMessageOf(
@@ -150,7 +162,7 @@ export function groupQueryOptions(channelId: string) {
                 message.agentId !== null &&
                 message.status === "completed" &&
                 !message.consent &&
-                !message.text.trim() &&
+                isSilentGroupPass(message.text) &&
                 !(message.attachments && message.attachments.length > 0)
               ),
           )

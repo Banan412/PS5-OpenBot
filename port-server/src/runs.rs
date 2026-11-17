@@ -164,18 +164,33 @@ fn now() -> Result<i64, StorageError> {
         .ok_or(StorageError::InvalidDatabase("clock unavailable"))
 }
 fn is_silent_group_pass(text: &str) -> bool {
-    let t = text.trim();
-    t.is_empty()
-        || t.eq_ignore_ascii_case("[PASS]")
-        || t.eq_ignore_ascii_case("[NO_REPLY]")
-        || t.eq_ignore_ascii_case("[SILENT]")
+    let t = text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`'));
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    for prefix in ["[pass]", "[no_reply]", "[silent]"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let after_fmt = rest.trim_start_matches(|c| matches!(c, '*' | '_' | '`'));
+            if after_fmt.is_empty()
+                || after_fmt.chars().next().is_some_and(|c| {
+                    c.is_whitespace()
+                        || matches!(c, ':' | '.' | '!' | ',' | '-' | '\u{2013}' | '\u{2014}')
+                })
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
-fn contains_phrase_ci(haystack_lower: &str, needle_lower: &str) -> bool {
+fn find_phrase_ci_spans(haystack_lower: &str, needle_lower: &str) -> Vec<(usize, usize)> {
     let needle_lower = needle_lower.trim();
     if needle_lower.len() < 2 {
-        return false;
+        return Vec::new();
     }
+    let mut spans = Vec::new();
     for (idx, _) in haystack_lower.match_indices(needle_lower) {
         let before_ok = haystack_lower[..idx]
             .chars()
@@ -187,27 +202,61 @@ fn contains_phrase_ci(haystack_lower: &str, needle_lower: &str) -> bool {
             .next()
             .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
-            return true;
+            spans.push((idx, after_idx));
         }
     }
-    false
+    spans
 }
 
-fn select_group_turn_bots(
+fn contains_phrase_ci(haystack_lower: &str, needle_lower: &str) -> bool {
+    !find_phrase_ci_spans(haystack_lower, needle_lower).is_empty()
+}
+
+fn select_lead_group_bot(bots: &[String], bot_names: &HashMap<String, String>) -> String {
+    for keyword in ["commander", "coordinator", "lead"] {
+        if let Some(id) = bots.iter().find(|id| {
+            bot_names
+                .get(*id)
+                .is_some_and(|name| name.to_lowercase().contains(keyword))
+        }) {
+            return id.clone();
+        }
+    }
+    bots.first().cloned().unwrap_or_default()
+}
+
+fn is_group_broadcast(text_lower: &str) -> bool {
+    contains_phrase_ci(text_lower, "@all")
+        || contains_phrase_ci(text_lower, "everyone")
+        || contains_phrase_ci(text_lower, "all bots")
+        || contains_phrase_ci(text_lower, "all of you")
+}
+
+struct GroupTurnPlan {
+    bots: Vec<String>,
+    is_broadcast: bool,
+    lead_orchestration: bool,
+}
+
+fn plan_group_turn(
     bots: &[String],
     bot_names: &HashMap<String, String>,
     text: &str,
-) -> Vec<String> {
+) -> GroupTurnPlan {
     if bots.len() <= 1 {
-        return bots.to_vec();
+        return GroupTurnPlan {
+            bots: bots.to_vec(),
+            is_broadcast: false,
+            lead_orchestration: false,
+        };
     }
     let lower = text.to_lowercase();
-    if contains_phrase_ci(&lower, "@all")
-        || contains_phrase_ci(&lower, "everyone")
-        || contains_phrase_ci(&lower, "all bots")
-        || contains_phrase_ci(&lower, "all of you")
-    {
-        return bots.to_vec();
+    if is_group_broadcast(&lower) {
+        return GroupTurnPlan {
+            bots: bots.to_vec(),
+            is_broadcast: true,
+            lead_orchestration: false,
+        };
     }
     let matched: Vec<String> = bots
         .iter()
@@ -219,10 +268,316 @@ fn select_group_turn_bots(
         .cloned()
         .collect();
     if !matched.is_empty() {
-        matched
+        GroupTurnPlan {
+            bots: matched,
+            is_broadcast: false,
+            lead_orchestration: false,
+        }
     } else {
-        bots.to_vec()
+        GroupTurnPlan {
+            bots: vec![select_lead_group_bot(bots, bot_names)],
+            is_broadcast: false,
+            lead_orchestration: true,
+        }
     }
+}
+
+fn select_group_turn_bots(
+    bots: &[String],
+    bot_names: &HashMap<String, String>,
+    text: &str,
+) -> Vec<String> {
+    plan_group_turn(bots, bot_names, text).bots
+}
+
+fn normalize_hws_lower(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            prev_space = false;
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
+fn is_numbered_list_marker_dot(before_dot: &str, after_dot: &str) -> bool {
+    if !after_dot.chars().next().is_some_and(char::is_whitespace) {
+        return false;
+    }
+    let without_digits = before_dot.trim_end_matches(|c: char| c.is_ascii_digit());
+    if without_digits.len() == before_dot.len() {
+        return false;
+    }
+    without_digits.is_empty()
+        || without_digits
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+}
+
+fn starts_with_numbered_list_marker(s: &str) -> bool {
+    let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.len() < s.len()
+        && rest
+            .strip_prefix('.')
+            .is_some_and(|after| after.starts_with(' ') || after.starts_with('\t'))
+}
+
+fn handoff_clause_end(tail: &str) -> usize {
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = tail[i..].chars().next().unwrap();
+        let next_i = i + ch.len_utf8();
+        if matches!(ch, '!' | '?') {
+            return i;
+        }
+        if ch == '.' {
+            let after = &tail[next_i..];
+            if (after.is_empty() || after.chars().next().is_some_and(char::is_whitespace))
+                && !is_numbered_list_marker_dot(&tail[..i], after)
+            {
+                return i;
+            }
+        }
+        if ch == '\n' {
+            let before = tail[..i].trim_end_matches(|c| c == ' ' || c == '\r');
+            let after = tail[next_i..].trim_start_matches(' ');
+            let continues_list = before.ends_with(':')
+                || after.starts_with("- ")
+                || after.starts_with("* ")
+                || after.starts_with("• ")
+                || starts_with_numbered_list_marker(after);
+            if after.is_empty() || after.starts_with('\n') || !continues_list {
+                return i;
+            }
+        }
+        i = next_i;
+    }
+    tail.len()
+}
+
+fn parse_group_handoff(
+    reply: &str,
+    bots: &[String],
+    bot_names: &HashMap<String, String>,
+    lead_bot: &str,
+) -> Vec<String> {
+    if bots.len() <= 1 || reply.trim().is_empty() {
+        return Vec::new();
+    }
+    const PHRASES: &[&str] = &[
+        "pass it off to",
+        "pass this off to",
+        "pass off to",
+        "pass it to",
+        "pass this to",
+        "pass to",
+        "passing it off to",
+        "passing this off to",
+        "passing off to",
+        "passing it to",
+        "passing this to",
+        "passing to",
+        "passed it off to",
+        "passed this off to",
+        "passed off to",
+        "passed it to",
+        "passed this to",
+        "passed to",
+        "hand it off to",
+        "hand this off to",
+        "hand off to",
+        "hand it to",
+        "hand this to",
+        "hand to",
+        "handing it off to",
+        "handing this off to",
+        "handing off to",
+        "handing it to",
+        "handing this to",
+        "handing to",
+        "handed it off to",
+        "handed this off to",
+        "handed off to",
+        "handed it to",
+        "handed this to",
+        "handed to",
+        "delegate it to",
+        "delegate this to",
+        "delegate to",
+        "delegating it to",
+        "delegating this to",
+        "delegating to",
+        "delegated it to",
+        "delegated this to",
+        "delegated to",
+        "route it to",
+        "route this to",
+        "route to",
+        "routing it to",
+        "routing this to",
+        "routing to",
+        "routed it to",
+        "routed this to",
+        "routed to",
+        "assign it to",
+        "assign this to",
+        "assign to",
+        "assigning it to",
+        "assigning this to",
+        "assigning to",
+        "assigned it to",
+        "assigned this to",
+        "assigned to",
+    ];
+    let lower = normalize_hws_lower(reply);
+    let mut directive_spans: Vec<(usize, usize, usize)> = Vec::new();
+    for phrase in PHRASES {
+        for (start, end) in find_phrase_ci_spans(&lower, phrase) {
+            let tail = &lower[end..];
+            let clause_end = end + handoff_clause_end(tail);
+            directive_spans.push((start, end, clause_end));
+        }
+    }
+    directive_spans.sort_by_key(|(start, _, _)| *start);
+
+    let non_lead: Vec<(&str, String)> = bots
+        .iter()
+        .filter(|id| id.as_str() != lead_bot)
+        .filter_map(|id| {
+            bot_names
+                .get(id)
+                .map(|n| (id.as_str(), normalize_hws_lower(n)))
+        })
+        .filter(|(_, name)| name.trim().len() >= 2)
+        .collect();
+
+    let mut targets: Vec<String> = Vec::new();
+    let mut last_directive_end = 0usize;
+    for (dir_start, phrase_end, dir_end) in directive_spans {
+        if dir_start < last_directive_end || dir_end <= phrase_end {
+            continue;
+        }
+        last_directive_end = dir_end;
+        let clause = &lower[phrase_end..dir_end];
+        let mut matches: Vec<(usize, usize, &str)> = Vec::new();
+        for (bot_id, name_lower) in &non_lead {
+            for (m_start, m_end) in find_phrase_ci_spans(clause, name_lower) {
+                matches.push((m_start, m_end, *bot_id));
+            }
+        }
+        matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (b.1 - b.0).cmp(&(a.1 - a.0))));
+        let mut covered_end = 0usize;
+        for (m_start, m_end, bot_id) in matches {
+            if m_start < covered_end {
+                continue;
+            }
+            covered_end = m_end;
+            if !targets.iter().any(|existing| existing == bot_id) {
+                targets.push(bot_id.to_owned());
+            }
+        }
+    }
+    targets
+}
+
+fn build_group_transcript(
+    tx: &rusqlite::Connection,
+    conversation_id: &str,
+    org_id: &str,
+    bot_names: Option<&HashMap<String, String>>,
+    msg_clip: usize,
+    att_recent_clip: usize,
+    att_old_clip: usize,
+) -> rusqlite::Result<String> {
+    let mut st = tx.prepare(
+        "SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR text!='') ORDER BY rowid DESC LIMIT 8",
+    )?;
+    let mut history = st
+        .query_map(params![conversation_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(st);
+    history.reverse();
+    let mut transcript = String::new();
+    let history_len = history.len();
+    for (idx, (mid, role, bid, text)) in history.into_iter().enumerate() {
+        if role != "person" && is_silent_group_pass(&text) {
+            continue;
+        }
+        let is_recent = idx + 2 >= history_len;
+        let spoken = if is_recent {
+            text
+        } else {
+            clip_chars(&text, msg_clip)
+        };
+        if role == "person" {
+            transcript.push_str(&format!("User: {spoken}\n"));
+            if let Ok(mut att_st) = tx.prepare(
+                "SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC",
+            ) {
+                if let Ok(rows) = att_st.query_map(params![conversation_id, mid], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                }) {
+                    for att in rows.flatten() {
+                        transcript.push_str(&format!(
+                            "[Attached file: uploads/{} ({}, {} bytes)]\n",
+                            att.0, att.1, att.2
+                        ));
+                        if let Some(ext) = att.3.filter(|s| !s.trim().is_empty()) {
+                            let clipped = clip_chars(
+                                ext.trim(),
+                                if is_recent { att_recent_clip } else { att_old_clip },
+                            );
+                            transcript.push_str(&format!(
+                                "--- Content of {} ---\n{clipped}\n--- End of {} ---\n",
+                                att.0, att.0
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            let speaker = bid
+                .as_deref()
+                .and_then(|id| {
+                    bot_names
+                        .and_then(|map| map.get(id).cloned())
+                        .or_else(|| {
+                            tx.query_row(
+                                "SELECT name FROM port_bots WHERE id=?1 AND organization_id=?2",
+                                params![id, org_id],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .ok()
+                        })
+                })
+                .unwrap_or_else(|| "Teammate".to_owned());
+            transcript.push_str(&format!("[{speaker}]: {spoken}\n"));
+        }
+    }
+    Ok(transcript)
 }
 
 pub(crate) async fn trigger_scheduled_message(
@@ -330,7 +685,7 @@ pub(crate) async fn trigger_scheduled_message(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(run.clone(), cancel.clone());
-        execute(
+        let _ = execute(
             auth,
             model,
             vc,
@@ -645,18 +1000,23 @@ pub(crate) async fn send_with_run_id(
         let bots:Vec<String>=serde_json::from_str(&bot_json).map_err(|_|StorageError::InvalidDatabase("invalid bot list"))?;
         if bots.is_empty(){return Ok(json!({"result":"missing"}))}
         let mut bot_names: HashMap<String, String> = HashMap::new();
+        let mut bot_roles: HashMap<String, String> = HashMap::new();
         for b in &bots {
-            if let Ok(Some(name)) = tx.query_row(
-                "SELECT name FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",
+            if let Ok(Some((name, role))) = tx.query_row(
+                "SELECT name, role_description FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",
                 params![b, org_id, owner],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             ).optional() {
                 bot_names.insert(b.clone(), name);
+                bot_roles.insert(b.clone(), role);
             }
         }
-        let turn_bots:Vec<String>=match &bot_override {
-            Some(b)=>{if !bots.contains(b){return Ok(json!({"result":"missing"}))} vec![b.clone()]}
-            None=>select_group_turn_bots(&bots, &bot_names, &text),
+        let (turn_bots, is_broadcast, lead_orchestration) = match &bot_override {
+            Some(b)=>{if !bots.contains(b){return Ok(json!({"result":"missing"}))} (vec![b.clone()], false, false)}
+            None=>{
+                let plan = plan_group_turn(&bots, &bot_names, &text);
+                (plan.bots, plan.is_broadcast, plan.lead_orchestration)
+            }
         };
         let bot_id=turn_bots[0].clone();
         let instructions:Option<String>=tx.query_row("SELECT role_description FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",params![bot_id,org_id,owner],|r|r.get(0)).optional()?;
@@ -687,45 +1047,130 @@ pub(crate) async fn send_with_run_id(
         tx.execute("INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','running',?5)",params![reply,conversation_id,owner,bot_id,timestamp])?;
         tx.execute("INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',?9)",params![run,conversation_id,owner,bot_id,message_id,reply,key,fingerprint,timestamp])?;
         tx.execute("UPDATE port_conversations SET last_message_at=?2 WHERE id=?1",params![conversation_id,timestamp])?;
-        let mut st=tx.prepare("SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR (role='bot' AND bot_id=?2 AND text!='')) ORDER BY rowid DESC LIMIT 8")?;
-        let mut history=st.query_map(params![conversation_id,bot_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(st);history.reverse();
-        let sys = if bots.len() > 1 {
+        let messages = if bots.len() > 1 {
             let self_name = bot_names.get(&bot_id).map(String::as_str).unwrap_or(&bot_id);
-            let team = bots.iter().map(|b| bot_names.get(b).map(String::as_str).unwrap_or(b.as_str())).collect::<Vec<_>>().join(", ");
-            format!("You are {self_name} in a group conversation with: {team}.\n{instructions}")
-        } else {
-            instructions
-        };
-        let mut messages=vec![json!({"role":"system","content":sys})];
-        let history_len = history.len();
-        for (idx, (mid, role, _bid, mut msg_text)) in history.into_iter().enumerate() {
-            let is_recent = idx + 2 >= history_len;
-            if !is_recent {
-                msg_text = clip_chars(&msg_text, 900);
-            }
-            if role == "person" {
-                let mut att_st = tx.prepare("SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC")?;
-                let atts = att_st.query_map(params![conversation_id, mid], |r| {
-                    Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,Option<String>>(3)?))
-                })?.collect::<rusqlite::Result<Vec<_>>>()?;
-                drop(att_st);
-                if !atts.is_empty() {
-                    let max_att = if is_recent { 1800 } else { 400 };
-                    let mut note = String::new();
-                    for (fname, mime, sz, ext) in atts {
-                        note.push_str(&format!("\n[Attached file: uploads/{fname} ({mime}, {sz} bytes)]"));
-                        if let Some(t) = ext.filter(|s| !s.trim().is_empty()) {
-                            let clipped = clip_chars(t.trim(), max_att);
-                            note.push_str(&format!("\n--- Content of {fname} ---\n{clipped}\n--- End of {fname} ---"));
-                        }
+            let team = bots
+                .iter()
+                .map(|b| bot_names.get(b).map(String::as_str).unwrap_or(b.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sys = if lead_orchestration {
+                let mut roster = Vec::new();
+                for b in &bots {
+                    if b == &bot_id {
+                        continue;
                     }
-                    msg_text.push_str(&note);
+                    if let Some(name) = bot_names.get(b) {
+                        let desc = bot_roles
+                            .get(b)
+                            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+                            .filter(|s| !s.is_empty())
+                            .map(|s| clip_chars(&s, 160))
+                            .unwrap_or_else(|| "General teammate".to_owned());
+                        roster.push(format!("- {name}: {desc}"));
+                    }
                 }
+                let roster_block = if roster.is_empty() {
+                    "- (no other teammates)".to_owned()
+                } else {
+                    roster.join("\n")
+                };
+                format!(
+                    "You are {self_name}, the team lead in a group conversation with: {team}.\n{instructions}\n\n\
+                     TEAM ROSTER (specialists you can delegate to):\n{roster_block}\n\n\
+                     ROUTING RULES:\n\
+                     - If a specialist (or multiple specialists) in the team owns the request, do NOT answer or solve the task yourself! Output ONLY a short handoff line naming them, e.g.:\n  \
+                       Doing it — passing this to <ExactBotName>.\n  \
+                       or for multiple specialists:\n  \
+                       Passing this to <BotA> and <BotB>.\n  \
+                       Only the teammate(s) you name will handle it.\n\
+                     - Only answer directly yourself if it is a general question/task for {self_name} or no specialist fits (in which case no other bots will be called)."
+                )
+            } else if is_broadcast {
+                format!(
+                    "You are {self_name} in a multi-bot group conversation with: {team}.\n{instructions}\n\n\
+                     IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else."
+                )
+            } else {
+                format!(
+                    "You are {self_name} in a group conversation with: {team}.\n{instructions}\n\n\
+                     You were addressed directly for this turn. Answer directly without outputting [PASS]."
+                )
+            };
+            let transcript = build_group_transcript(
+                &tx,
+                &conversation_id,
+                &org_id,
+                Some(&bot_names),
+                900,
+                1800,
+                400,
+            )?;
+            let user_prompt = if lead_orchestration {
+                format!("{transcript}\nRespond as {self_name} following the routing rules above.")
+            } else if is_broadcast {
+                format!("{transcript}\nRespond as {self_name} if relevant to your role, or reply literally with [PASS].")
+            } else {
+                format!("{transcript}\nRespond directly as {self_name}.")
+            };
+            vec![
+                json!({"role":"system","content":sys}),
+                json!({"role":"user","content":user_prompt}),
+            ]
+        } else {
+            let mut st=tx.prepare("SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR (role='bot' AND bot_id=?2 AND text!='')) ORDER BY rowid DESC LIMIT 8")?;
+            let mut history=st.query_map(params![conversation_id,bot_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(st);history.reverse();
+            let mut messages=vec![json!({"role":"system","content":instructions})];
+            let history_len = history.len();
+            for (idx, (mid, role, _bid, mut msg_text)) in history.into_iter().enumerate() {
+                let is_recent = idx + 2 >= history_len;
+                if !is_recent {
+                    msg_text = clip_chars(&msg_text, 900);
+                }
+                if role == "person" {
+                    let mut att_st = tx.prepare("SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC")?;
+                    let atts = att_st.query_map(params![conversation_id, mid], |r| {
+                        Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,Option<String>>(3)?))
+                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    drop(att_st);
+                    if !atts.is_empty() {
+                        let max_att = if is_recent { 1800 } else { 400 };
+                        let mut note = String::new();
+                        for (fname, mime, sz, ext) in atts {
+                            note.push_str(&format!("\n[Attached file: uploads/{fname} ({mime}, {sz} bytes)]"));
+                            if let Some(t) = ext.filter(|s| !s.trim().is_empty()) {
+                                let clipped = clip_chars(t.trim(), max_att);
+                                note.push_str(&format!("\n--- Content of {fname} ---\n{clipped}\n--- End of {fname} ---"));
+                            }
+                        }
+                        msg_text.push_str(&note);
+                    }
+                }
+                messages.push(json!({"role":if role=="person"{"user"}else{"assistant"},"content":msg_text}));
             }
-            messages.push(json!({"role":if role=="person"{"user"}else{"assistant"},"content":msg_text}));
-        }
+            messages
+        };
+        let stage_bots = if lead_orchestration {
+            bots.clone()
+        } else {
+            turn_bots.clone()
+        };
         tx.commit()?;
-        Ok(json!({"result":"started","thread":thread,"run":run,"reply":reply,"bot":bot_id,"extraBots":turn_bots[1..],"messages":messages,"stagedFiles": attached_files.into_iter().map(|(name, _, _, data, _)| (name, data)).collect::<Vec<_>>()}))
+        Ok(json!({
+            "result":"started",
+            "thread":thread,
+            "run":run,
+            "reply":reply,
+            "bot":bot_id,
+            "extraBots":turn_bots[1..],
+            "groupBots":bots,
+            "botNames":bot_names,
+            "leadOrchestration":lead_orchestration,
+            "isBroadcast":is_broadcast,
+            "stageBots":stage_bots,
+            "messages":messages,
+            "stagedFiles": attached_files.into_iter().map(|(name, _, _, data, _)| (name, data)).collect::<Vec<_>>()
+        }))
     })}).await;
     let data = match result {
         Ok(Ok(v)) => v,
@@ -755,14 +1200,11 @@ pub(crate) async fn send_with_run_id(
         data.get("stagedFiles").and_then(Value::as_array),
     ) {
         if !files.is_empty() {
-            let mut target_bots = vec![data["bot"].as_str().unwrap_or("").to_owned()];
-            if let Some(extra) = data.get("extraBots").and_then(Value::as_array) {
-                for b in extra {
-                    if let Some(s) = b.as_str() {
-                        target_bots.push(s.to_owned());
-                    }
-                }
-            }
+            let target_bots: Vec<String> = data
+                .get("stageBots")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .unwrap_or_else(|| vec![data["bot"].as_str().unwrap_or("").to_owned()]);
             for item in files {
                 if let (Some(fname), Some(bytes_val)) = (item.get(0).and_then(Value::as_str), item.get(1).and_then(Value::as_array)) {
                     let bytes: Vec<u8> = bytes_val.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
@@ -787,6 +1229,20 @@ pub(crate) async fn send_with_run_id(
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
+    let group_bots: Vec<String> = data["groupBots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let bot_names_map: HashMap<String, String> = data["botNames"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let lead_orchestration = data["leadOrchestration"].as_bool().unwrap_or(false);
+    let is_broadcast = data["isBroadcast"].as_bool().unwrap_or(false);
     let model = s.model.clone();
     let model_id = s.model_id.clone();
     let request = json!({"model":model_id.clone(),"messages":data["messages"],"n":1});
@@ -800,14 +1256,14 @@ pub(crate) async fn send_with_run_id(
     drop(registration_guard);
     tokio::spawn(async move {
         let _permit = permit;
-        execute(
+        let outcome = execute(
             s.auth.clone(),
             model.clone(),
             vc.clone(),
             request,
             org_run.clone(),
             owner_run.clone(),
-            bot_run,
+            bot_run.clone(),
             conversation.clone(),
             thread.clone(),
             run.clone(),
@@ -819,24 +1275,99 @@ pub(crate) async fn send_with_run_id(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run);
-        for next_bot in extra_bots {
-            execute_followup_group_bot(
-                &s.auth,
-                &model,
-                &model_id,
-                &vc,
-                &active,
-                &org_run,
-                &owner_run,
-                &next_bot,
-                &conversation,
-                &thread,
-            )
-            .await;
+        if lead_orchestration {
+            if outcome.completed {
+                let targets =
+                    parse_group_handoff(&outcome.text, &group_bots, &bot_names_map, &bot_run);
+                if targets.len() == 1 {
+                    let _ = execute_followup_group_bot(
+                        &s.auth,
+                        &model,
+                        &model_id,
+                        &vc,
+                        &active,
+                        &org_run,
+                        &owner_run,
+                        &targets[0],
+                        &conversation,
+                        &thread,
+                        GroupFollowupMode::Delegated,
+                    )
+                    .await;
+                } else if targets.len() >= 2 {
+                    let mut all_ok = true;
+                    for next_bot in &targets {
+                        if !execute_followup_group_bot(
+                            &s.auth,
+                            &model,
+                            &model_id,
+                            &vc,
+                            &active,
+                            &org_run,
+                            &owner_run,
+                            next_bot,
+                            &conversation,
+                            &thread,
+                            GroupFollowupMode::Delegated,
+                        )
+                        .await
+                        {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if all_ok {
+                        let _ = execute_followup_group_bot(
+                            &s.auth,
+                            &model,
+                            &model_id,
+                            &vc,
+                            &active,
+                            &org_run,
+                            &owner_run,
+                            &bot_run,
+                            &conversation,
+                            &thread,
+                            GroupFollowupMode::LeadClosing,
+                        )
+                        .await;
+                    }
+                }
+            }
+        } else {
+            let mode = if is_broadcast {
+                GroupFollowupMode::Broadcast
+            } else {
+                GroupFollowupMode::Delegated
+            };
+            for next_bot in extra_bots {
+                if !execute_followup_group_bot(
+                    &s.auth,
+                    &model,
+                    &model_id,
+                    &vc,
+                    &active,
+                    &org_run,
+                    &owner_run,
+                    &next_bot,
+                    &conversation,
+                    &thread,
+                    mode,
+                )
+                .await
+                {
+                    break;
+                }
+            }
         }
     });
     accepted(&input.id, true)
 }
+struct RunOutcome {
+    completed: bool,
+    text: String,
+}
+
 async fn execute(
     auth: AuthState,
     model: ModelClient,
@@ -850,7 +1381,7 @@ async fn execute(
     run: String,
     reply: String,
     external_cancel: CancellationToken,
-) {
+) -> RunOutcome {
     let cancel = external_cancel.child_token();
     let mut current_request = request;
     let configured_model = current_request
@@ -916,7 +1447,7 @@ async fn execute(
         .unwrap_or("");
     if configured_model == "auto" || selected_model.is_empty() || selected_model == "auto" {
         if let Err(reason) = resolve_active_model(&model, &mut current_request, &cancel).await {
-            finalize_run(
+            return finalize_run(
                 &auth,
                 &conversation,
                 &thread,
@@ -929,7 +1460,6 @@ async fn execute(
                 Some(&reason),
             )
             .await;
-            return;
         }
     }
 
@@ -979,7 +1509,7 @@ async fn execute(
         if external_cancel.is_cancelled() || terminal.is_none() {
             failed = true;
         }
-        finalize_run(
+        return finalize_run(
             &auth,
             &conversation,
             &thread,
@@ -992,7 +1522,6 @@ async fn execute(
             failure_detail.as_deref(),
         )
         .await;
-        return;
     }
 
     let vc = vc.unwrap();
@@ -1045,7 +1574,7 @@ async fn execute(
         terminal,
         failure_detail.as_deref(),
     )
-    .await;
+    .await
 }
 
 pub(crate) fn clip_chars(text: &str, max_chars: usize) -> String {
@@ -1375,6 +1904,13 @@ async fn execute_tool_rounds(
     (failed, terminal, failure_detail)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupFollowupMode {
+    Broadcast,
+    Delegated,
+    LeadClosing,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_followup_group_bot(
     auth: &AuthState,
@@ -1387,7 +1923,8 @@ async fn execute_followup_group_bot(
     bot_id: &str,
     conversation: &str,
     thread: &str,
-) {
+    mode: GroupFollowupMode,
+) -> bool {
     let db = auth.db.clone();
     let org_c = org.to_owned();
     let own_c = owner.to_owned();
@@ -1419,19 +1956,6 @@ async fn execute_followup_group_bot(
                 "INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',?9)",
                 params![run, conv_c, own_c, bot_c, user_msg_id, reply, req_key, vec![0u8; 32], timestamp],
             )?;
-            let mut st = tx.prepare("SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR text!='') ORDER BY rowid DESC LIMIT 8")?;
-            let mut history = st
-                .query_map(params![conv_c], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(st);
-            history.reverse();
             let bot_name: String = tx
                 .query_row(
                     "SELECT name FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",
@@ -1439,49 +1963,45 @@ async fn execute_followup_group_bot(
                     |r| r.get(0),
                 )
                 .unwrap_or_else(|_| bot_c.clone());
-            let mut transcript = String::new();
-            let history_len = history.len();
-            for (idx, (mid, role, bid, text)) in history.into_iter().enumerate() {
-                let is_recent = idx + 2 >= history_len;
-                let spoken = if is_recent { text } else { clip_chars(&text, 700) };
-                if role == "person" {
-                    transcript.push_str(&format!("User: {spoken}\n"));
-                    if let Ok(mut att_st) = tx.prepare("SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC") {
-                        if let Ok(rows) = att_st.query_map(params![conv_c, mid], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,Option<String>>(3)?))) {
-                            for att in rows.flatten() {
-                                transcript.push_str(&format!("[Attached file: uploads/{} ({}, {} bytes)]\n", att.0, att.1, att.2));
-                                if let Some(ext) = att.3.filter(|s| !s.trim().is_empty()) {
-                                    let clipped = clip_chars(ext.trim(), if is_recent { 1200 } else { 300 });
-                                    transcript.push_str(&format!("{clipped}\n"));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    let speaker = bid
-                        .as_deref()
-                        .and_then(|id| {
-                            tx.query_row(
-                                "SELECT name FROM port_bots WHERE id=?1 AND organization_id=?2",
-                                params![id, org_c],
-                                |r| r.get::<_, String>(0),
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_else(|| "Teammate".to_owned());
-                    transcript.push_str(&format!("[{speaker}]: {spoken}\n"));
-                }
-            }
+            let transcript =
+                build_group_transcript(&tx, &conv_c, &org_c, None, 700, 1200, 300)?;
+            let (sys_content, user_content) = match mode {
+                GroupFollowupMode::Broadcast => (
+                    format!(
+                        "You are {bot_name} participating in a multi-bot group conversation.\n{instructions}\n\n\
+                         IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else."
+                    ),
+                    format!(
+                        "{transcript}\nRespond as {bot_name} if relevant to your role, or reply literally with [PASS]."
+                    ),
+                ),
+                GroupFollowupMode::Delegated => (
+                    format!(
+                        "You are {bot_name} in a multi-bot group conversation.\n{instructions}\n\n\
+                         DELEGATED TASK RULE: You were specifically delegated/requested to handle this request. Answer directly using your specialty without repeating other teammates' work, and do NOT output [PASS]."
+                    ),
+                    format!(
+                        "{transcript}\nThis request was delegated to you. Respond directly as {bot_name} without adding [PASS]."
+                    ),
+                ),
+                GroupFollowupMode::LeadClosing => (
+                    format!(
+                        "You are {bot_name}, the team lead in a multi-bot group conversation.\n{instructions}\n\n\
+                         CLOSING RULE: Your delegated teammates have finished their assigned parts. Briefly confirm that all delegated tasks are done in 1-2 short sentences without repeating their outputs. Do NOT output [PASS] and do NOT delegate again."
+                    ),
+                    format!(
+                        "{transcript}\nYour teammates have finished their assigned parts. Briefly confirm all delegated tasks are done as {bot_name} without repeating their outputs."
+                    ),
+                ),
+            };
             let messages = vec![
                 json!({
                     "role": "system",
-                    "content": format!(
-                        "You are {bot_name} participating in a multi-bot group conversation.\n{instructions}\n\nIMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else."
-                    )
+                    "content": sys_content
                 }),
                 json!({
                     "role": "user",
-                    "content": format!("{transcript}\nRespond as {bot_name} if relevant to your role, or reply literally with [PASS].")
+                    "content": user_content
                 }),
             ];
             tx.commit()?;
@@ -1490,7 +2010,7 @@ async fn execute_followup_group_bot(
     })
     .await;
     let Ok(Ok(Some((run, reply, messages)))) = setup else {
-        return;
+        return false;
     };
     let request = json!({"model": model_id, "messages": messages, "n": 1});
     let cancel = CancellationToken::new();
@@ -1498,7 +2018,7 @@ async fn execute_followup_group_bot(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(run.clone(), cancel.clone());
-    execute(
+    let outcome = execute(
         auth.clone(),
         model.clone(),
         vc.clone(),
@@ -1517,6 +2037,7 @@ async fn execute_followup_group_bot(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&run);
+    outcome.completed
 }
 
 /// Resumes a paused conversation turn after the person approves or denies a pending tool call.
@@ -1831,7 +2352,7 @@ async fn finalize_run(
     external_cancel: &CancellationToken,
     terminal: Option<Value>,
     failure_detail: Option<&str>,
-) {
+) -> RunOutcome {
     // Persist the final transcript, run state and terminal event in one transaction.
     // Retry transient in-process lock contention for a bounded period.
     for _ in 0..40 {
@@ -1855,6 +2376,7 @@ async fn finalize_run(
         } else {
             answer.to_owned()
         };
+        let result_body = body.clone();
         let thread_id = thread.to_owned();
         let terminal_ref = terminal.clone();
         let event = if external_cancel.is_cancelled() {
@@ -1900,11 +2422,12 @@ async fn finalize_run(
                 };
                 if fits { tx.execute("INSERT INTO port_run_events(conversation_id,sequence,event_json,bytes) VALUES(?1,?2,?3,?4)",params![id,next,encoded,encoded.len() as i64])?; }
                 else { tx.execute("INSERT INTO port_metadata(key,value) VALUES(?1,'terminal event missing because journal is full') ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![format!("conversation_replay_gap:{id}")])?; }
-                tx.commit()?; Ok(notify_meta)
+                tx.commit()?;
+                Ok((notify_meta, final_status == "completed" && !is_interrupt))
             })
         }).await;
         match result {
-            Ok(Ok(notify_meta)) => {
+            Ok(Ok((notify_meta, completed_ok))) => {
                 crate::event_journal::notify_journal_change();
                 if let Some((org_id, owner_id, bot_id, iso)) = notify_meta {
                     let first_line = answer.lines().next().unwrap_or("").trim().to_owned();
@@ -1921,7 +2444,10 @@ async fn finalize_run(
                         }),
                     );
                 }
-                return;
+                return RunOutcome {
+                    completed: completed_ok && !external_cancel.is_cancelled(),
+                    text: result_body,
+                };
             }
             Ok(Err(StorageError::Busy)) => tokio::time::sleep(Duration::from_millis(50)).await,
             _ => {
@@ -1929,7 +2455,10 @@ async fn finalize_run(
                     &mut std::io::stderr(),
                     b"Could not finalize model run; it will be marked failed on restart\n",
                 );
-                return;
+                return RunOutcome {
+                    completed: false,
+                    text: String::new(),
+                };
             }
         }
     }
@@ -1937,6 +2466,10 @@ async fn finalize_run(
         &mut std::io::stderr(),
         b"Could not finalize model run because storage remained busy; it will be marked failed on restart\n",
     );
+    RunOutcome {
+        completed: false,
+        text: String::new(),
+    }
 }
 
 async fn append_event(
@@ -2619,5 +3152,624 @@ mod stop_tests {
         assert!(err.contains("No model is currently loaded"), "unexpected err: {err}");
 
         mock.await.unwrap();
+    }
+
+    #[test]
+    fn silent_group_pass_handles_prefixes_formatting_and_explanations() {
+        assert!(is_silent_group_pass(""));
+        assert!(is_silent_group_pass("   \n\t  "));
+        assert!(is_silent_group_pass("[PASS]"));
+        assert!(is_silent_group_pass("[pass]"));
+        assert!(is_silent_group_pass("**[PASS]**"));
+        assert!(is_silent_group_pass("`[Pass]`"));
+        assert!(is_silent_group_pass("_[SILENT]_"));
+        assert!(is_silent_group_pass("[PASS]\nBecause Commander already answered."));
+        assert!(is_silent_group_pass("**[PASS]**\nNothing to add here."));
+        assert!(is_silent_group_pass("[Pass]: already handled"));
+        assert!(is_silent_group_pass("[PASS] - skipping"));
+        assert!(is_silent_group_pass("[PASS]—skip"));
+        assert!(is_silent_group_pass("[PASS]!"));
+        assert!(is_silent_group_pass("[PASS]."));
+        assert!(is_silent_group_pass("[NO_REPLY]\nNot my area."));
+        assert!(is_silent_group_pass("[SILENT]: ok"));
+
+        assert!(!is_silent_group_pass("[PASSING] all tests"));
+        assert!(!is_silent_group_pass("[PASS]word"));
+        assert!(!is_silent_group_pass("Here is the fix. Do not output [PASS]."));
+        assert!(!is_silent_group_pass("Passing this to Programmer."));
+    }
+
+    #[test]
+    fn lead_selection_and_turn_routing_eliminate_unneeded_bots() {
+        let bots = vec![
+            "b_prog".to_owned(),
+            "b_des".to_owned(),
+            "b_cmd".to_owned(),
+        ];
+        let mut names = HashMap::new();
+        names.insert("b_prog".to_owned(), "Programmer".to_owned());
+        names.insert("b_des".to_owned(), "UI Designer".to_owned());
+        names.insert("b_cmd".to_owned(), "Commander".to_owned());
+
+        assert_eq!(select_lead_group_bot(&bots, &names), "b_cmd");
+
+        let mut coord_names = names.clone();
+        coord_names.insert("b_cmd".to_owned(), "Team Coordinator".to_owned());
+        assert_eq!(select_lead_group_bot(&bots, &coord_names), "b_cmd");
+
+        let mut lead_names = names.clone();
+        lead_names.insert("b_des".to_owned(), "Design Lead".to_owned());
+        lead_names.insert("b_cmd".to_owned(), "Reviewer".to_owned());
+        assert_eq!(select_lead_group_bot(&bots, &lead_names), "b_des");
+
+        let mut plain_names = HashMap::new();
+        plain_names.insert("b_prog".to_owned(), "Programmer".to_owned());
+        plain_names.insert("b_des".to_owned(), "Designer".to_owned());
+        assert_eq!(
+            select_lead_group_bot(&["b_prog".to_owned(), "b_des".to_owned()], &plain_names),
+            "b_prog"
+        );
+
+        // Unaddressed user message -> ONLY lead bot
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "Build a login endpoint"),
+            vec!["b_cmd"]
+        );
+        // Explicit name mention -> ONLY mentioned bot(s)
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "Hey Programmer, refactor this"),
+            vec!["b_prog"]
+        );
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "Programmer and UI Designer please align"),
+            vec!["b_prog", "b_des"]
+        );
+        // Explicit broadcast -> all bots in order
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "@all please introduce yourselves"),
+            bots
+        );
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "Hey everyone, status check"),
+            bots
+        );
+        assert_eq!(
+            select_group_turn_bots(&bots, &names, "All bots chime in"),
+            bots
+        );
+        // Single bot group -> returns that single bot
+        assert_eq!(
+            select_group_turn_bots(&["b_prog".to_owned()], &names, "Hello"),
+            vec!["b_prog"]
+        );
+    }
+
+    #[test]
+    fn parse_group_handoff_detects_zero_one_and_multiple_targets_without_false_positives() {
+        let bots = vec![
+            "b_cmd".to_owned(),
+            "b_dev".to_owned(),
+            "b_bdev".to_owned(),
+            "b_des".to_owned(),
+            "b_qa".to_owned(),
+        ];
+        let mut names = HashMap::new();
+        names.insert("b_cmd".to_owned(), "Commander".to_owned());
+        names.insert("b_dev".to_owned(), "Dev".to_owned());
+        names.insert("b_bdev".to_owned(), "Backend Dev".to_owned());
+        names.insert("b_des".to_owned(), "Designer".to_owned());
+        names.insert("b_qa".to_owned(), "QA".to_owned());
+
+        // 0 targets: direct answers & non-handoff mentions
+        assert!(parse_group_handoff("The capital of France is Paris.", &bots, &names, "b_cmd").is_empty());
+        assert!(parse_group_handoff(
+            "Here is the answer. Note that Backend Dev does not need to run.",
+            &bots,
+            &names,
+            "b_cmd"
+        ).is_empty());
+        assert!(parse_group_handoff(
+            "Avoid routing this to the wrong port. Also Designer already knows.",
+            &bots,
+            &names,
+            "b_cmd"
+        ).is_empty());
+        assert!(parse_group_handoff(
+            "Passing this to Commander directly.",
+            &bots,
+            &names,
+            "b_cmd"
+        ).is_empty());
+
+        // 1 target (and longest-match prevents "Backend Dev" from also matching "Dev")
+        assert_eq!(
+            parse_group_handoff(
+                "Doing it — passing this to Backend Dev.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff("Handing it off to @Designer!", &bots, &names, "b_cmd"),
+            vec!["b_des"]
+        );
+
+        // 2+ targets in mention order, deduped, across multiple directive variants
+        assert_eq!(
+            parse_group_handoff(
+                "Passing this to Designer and Backend Dev.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_des", "b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff(
+                "Delegating to QA, Backend Dev, and QA.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_qa", "b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff(
+                "Routing this to:\n- Designer\n- Dev",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_des", "b_dev"]
+        );
+        assert_eq!(
+            parse_group_handoff(
+                "Assigning this to Backend Dev. Handing off to QA.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_bdev", "b_qa"]
+        );
+    }
+
+    #[test]
+    fn parse_group_handoff_supports_non_ing_verbs_and_numbered_lists() {
+        let bots = vec![
+            "b_cmd".to_owned(),
+            "b_prog".to_owned(),
+            "b_des".to_owned(),
+            "b_bdev".to_owned(),
+            "b_ideas".to_owned(),
+            "b_prompt".to_owned(),
+        ];
+        let mut names = HashMap::new();
+        names.insert("b_cmd".to_owned(), "Commander".to_owned());
+        names.insert("b_prog".to_owned(), "Programmer Home".to_owned());
+        names.insert("b_des".to_owned(), "Designer".to_owned());
+        names.insert("b_bdev".to_owned(), "Backend Dev".to_owned());
+        names.insert("b_ideas".to_owned(), "Ideas Home".to_owned());
+        names.insert("b_prompt".to_owned(), "Prompter Home".to_owned());
+
+        // Non-ing (base & past) verb forms
+        assert_eq!(
+            parse_group_handoff(
+                "I'll pass this to Programmer Home.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_prog"]
+        );
+        assert_eq!(
+            parse_group_handoff("Pass it to Designer.", &bots, &names, "b_cmd"),
+            vec!["b_des"]
+        );
+        assert_eq!(
+            parse_group_handoff("Passed to Backend Dev.", &bots, &names, "b_cmd"),
+            vec!["b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff("Hand this off to Designer.", &bots, &names, "b_cmd"),
+            vec!["b_des"]
+        );
+        assert_eq!(
+            parse_group_handoff("Handed off to Backend Dev.", &bots, &names, "b_cmd"),
+            vec!["b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff("Delegate to Ideas Home.", &bots, &names, "b_cmd"),
+            vec!["b_ideas"]
+        );
+        assert_eq!(
+            parse_group_handoff("Delegated this to Prompter Home.", &bots, &names, "b_cmd"),
+            vec!["b_prompt"]
+        );
+        assert_eq!(
+            parse_group_handoff("Route to Backend Dev.", &bots, &names, "b_cmd"),
+            vec!["b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff("Routed it to Designer.", &bots, &names, "b_cmd"),
+            vec!["b_des"]
+        );
+        assert_eq!(
+            parse_group_handoff("Assign to Programmer Home.", &bots, &names, "b_cmd"),
+            vec!["b_prog"]
+        );
+        assert_eq!(
+            parse_group_handoff("Assigned this to Ideas Home.", &bots, &names, "b_cmd"),
+            vec!["b_ideas"]
+        );
+
+        // Numbered lists (with and without trailing commentary)
+        assert_eq!(
+            parse_group_handoff(
+                "Passing this to:\n1. Designer\n2. Backend Dev",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_des", "b_bdev"]
+        );
+        assert_eq!(
+            parse_group_handoff(
+                "Passing this to:\n1. Ideas Home\n2. Prompter Home\n\nDesigner does not need to reply.",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_ideas", "b_prompt"]
+        );
+        assert_eq!(
+            parse_group_handoff(
+                "Delegate to\n1. Designer\n2. Backend Dev",
+                &bots,
+                &names,
+                "b_cmd"
+            ),
+            vec!["b_des", "b_bdev"]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_orchestration_end_to_end_direct_single_multi_mention_and_broadcast() {
+        use crate::{bots, conversations};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_http_body(socket: &mut tokio::net::TcpStream) -> String {
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers_str = String::from_utf8_lossy(&raw[..pos]);
+                        for line in headers_str.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(h_end) = header_end {
+                    if raw.len() >= h_end + content_len {
+                        let body = &raw[h_end..h_end + content_len];
+                        return String::from_utf8_lossy(body).into_owned();
+                    }
+                }
+            }
+            String::new()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_ref = captured_requests.clone();
+        let mock = tokio::spawn(async move {
+            // Expected total model calls across the 5 scenarios:
+            // 1. Direct answer (Commander): 1 call
+            // 2. Single delegation (Commander -> Programmer): 2 calls
+            // 3. Multi delegation (Commander -> Programmer -> Designer -> Commander closing): 4 calls
+            // 4. Explicit mention ("Programmer, ..."): 1 call
+            // 5. @all broadcast (4 bots): 4 calls
+            // Total: 12 calls
+            let replies = [
+                "Direct Commander answer: 42.",
+                "Doing it — passing this to Programmer.",
+                "Implemented the Rust handler.",
+                "Passing this to Programmer and Designer.",
+                "Backend API done.",
+                "UI mockup done.",
+                "All delegated tasks are complete.",
+                "Programmer direct reply with context.",
+                "Commander broadcast reply.",
+                "[PASS]\nBecause Commander already answered.",
+                "Designer broadcast reply.",
+                "[NO_REPLY]\nNot needed.",
+            ];
+            for answer in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body_str = read_http_body(&mut socket).await;
+                let req_json: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
+                captured_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(req_json);
+                let sse = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                    json!(answer)
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-group-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let run = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap();
+        let app = local_auth::router(auth.clone())
+            .merge(bots::router(auth.clone()))
+            .merge(conversations::router(auth))
+            .merge(router(run));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let setup_res = app.clone().oneshot(setup).await.unwrap();
+        assert_eq!(setup_res.status(), StatusCode::NO_CONTENT);
+        let cookie = setup_res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let make_req = |method: &str, uri: &str, key: &str, body: String| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("cookie", &cookie)
+                .header("host", "example.test")
+                .header("origin", "http://example.test")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let mut bot_ids = Vec::new();
+        for (idx, (name, role)) in [
+            ("Programmer", "Writes Rust backend code"),
+            ("Commander", "Leads the team and routes tasks"),
+            ("Designer", "Designs UI and UX"),
+            ("QA", "Tests edge cases"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let res = app
+                .clone()
+                .oneshot(make_req(
+                    "POST",
+                    "/api/v2/organizations/default/bots",
+                    &format!("bot-{idx}"),
+                    json!({"name": name, "title": "", "roleDescription": role, "visibility": "private"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+            let v: Value =
+                serde_json::from_slice(&to_bytes(res.into_body(), 16384).await.unwrap()).unwrap();
+            bot_ids.push(v["bot"]["id"].as_str().unwrap().to_owned());
+        }
+        let (prog_id, cmd_id, des_id, _qa_id) = (
+            bot_ids[0].clone(),
+            bot_ids[1].clone(),
+            bot_ids[2].clone(),
+            bot_ids[3].clone(),
+        );
+
+        let conv_res = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                "/api/v2/organizations/default/conversations",
+                "conv-grp",
+                json!({"botIds": bot_ids, "group": true}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conv_res.status(), StatusCode::CREATED);
+        let conv_v: Value =
+            serde_json::from_slice(&to_bytes(conv_res.into_body(), 16384).await.unwrap()).unwrap();
+        let conv_id = conv_v["conversation"]["id"].as_str().unwrap().to_owned();
+        let messages_uri = format!("/api/v2/organizations/default/conversations/{conv_id}/messages");
+
+        let wait_idle = |expected_runs: i64| {
+            let db = db.clone();
+            let conv_id = conv_id.clone();
+            async move {
+                for _ in 0..200 {
+                    let (running, total) = db
+                        .try_with_connection(|c| {
+                            let running: i64 = c.query_row(
+                                "SELECT COUNT(*) FROM port_runs WHERE conversation_id=?1 AND status='running'",
+                                params![conv_id],
+                                |r| r.get(0),
+                            )?;
+                            let total: i64 = c.query_row(
+                                "SELECT COUNT(*) FROM port_runs WHERE conversation_id=?1",
+                                params![conv_id],
+                                |r| r.get(0),
+                            )?;
+                            Ok((running, total))
+                        })
+                        .unwrap();
+                    if running == 0 && total >= expected_runs {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                panic!("timed out waiting for {expected_runs} completed runs");
+            }
+        };
+
+        // 1. Direct answer by Commander (0 targets) -> 1 run total
+        let r1 = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                &messages_uri,
+                "k1",
+                json!({"id":"m1","text":"What is the meaning of life?"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::ACCEPTED);
+        wait_idle(1).await;
+
+        // 2. Single-agent delegation (Commander -> Programmer, NO closing turn) -> +2 = 3 runs total
+        let r2 = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                &messages_uri,
+                "k2",
+                json!({"id":"m2","text":"Write a Rust function"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::ACCEPTED);
+        wait_idle(3).await;
+
+        // 3. Multi-agent delegation (Commander -> Programmer -> Designer -> Commander closing) -> +4 = 7 runs total
+        let r3 = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                &messages_uri,
+                "k3",
+                json!({"id":"m3","text":"Build the backend and UI"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::ACCEPTED);
+        wait_idle(7).await;
+
+        // 4. Explicit name mention ("Programmer, ...") -> +1 = 8 runs total
+        let r4 = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                &messages_uri,
+                "k4",
+                json!({"id":"m4","text":"Programmer, summarize your API"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r4.status(), StatusCode::ACCEPTED);
+        wait_idle(8).await;
+
+        // 5. Explicit @all broadcast -> +4 = 12 runs total (2 bots emit [PASS]/[NO_REPLY] with explanations)
+        let r5 = app
+            .clone()
+            .oneshot(make_req(
+                "POST",
+                &messages_uri,
+                "k5",
+                json!({"id":"m5","text":"@all quick status?"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r5.status(), StatusCode::ACCEPTED);
+        wait_idle(12).await;
+
+        // Small pause so the final spawned task drops/finishes before asserting
+        mock.await.unwrap();
+
+        // Verify exact sequence of bot_ids executed in port_runs
+        let run_bots: Vec<String> = db
+            .try_with_connection(|c| {
+                let mut st = c.prepare("SELECT bot_id FROM port_runs WHERE conversation_id=?1 ORDER BY rowid ASC")?;
+                let rows = st.query_map(params![conv_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            run_bots,
+            vec![
+                cmd_id.clone(), // 1. Direct Commander
+                cmd_id.clone(), prog_id.clone(), // 2. Single delegation
+                cmd_id.clone(), prog_id.clone(), des_id.clone(), cmd_id.clone(), // 3. Multi delegation + closing
+                prog_id.clone(), // 4. Explicit mention
+                prog_id.clone(), cmd_id.clone(), des_id.clone(), _qa_id.clone(), // 5. @all broadcast in bots order
+            ]
+        );
+
+        // Verify Commander's initial prompt included team roster and routing rules,
+        // and Programmer's explicit mention turn received shared group transcript ([Designer]: UI mockup done.)
+        let reqs = captured_requests.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(reqs.len(), 12);
+        let cmd_sys = reqs[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(cmd_sys.contains("TEAM ROSTER"));
+        assert!(cmd_sys.contains("Programmer: Writes Rust backend code"));
+        let prog_mention_user = reqs[7]["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            prog_mention_user.contains("[Designer]: UI mockup done.")
+                && prog_mention_user.contains("[Commander]: All delegated tasks are complete."),
+            "shared group transcript missing teammate turns: {prog_mention_user}"
+        );
+
+        // Verify GET /messages excludes [PASS]\n... and [NO_REPLY]\n... leaks
+        let listed = app
+            .oneshot(make_req("GET", &messages_uri, "", String::new()))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_v: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), 32768).await.unwrap()).unwrap();
+        let texts: Vec<&str> = listed_v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+        assert!(!texts.iter().any(|t| t.contains("[PASS]") || t.contains("[NO_REPLY]")));
+        assert!(texts.contains(&"Direct Commander answer: 42."));
+        assert!(texts.contains(&"Implemented the Rust handler."));
+        assert!(texts.contains(&"All delegated tasks are complete."));
+        assert!(texts.contains(&"Programmer direct reply with context."));
+        assert!(texts.contains(&"Designer broadcast reply."));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 }

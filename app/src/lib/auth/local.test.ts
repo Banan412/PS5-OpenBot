@@ -43,6 +43,7 @@ test("local sign-in is enabled only by an explicit valid status", async () => {
     enabled: true,
     setupRequired: true,
     setupAvailable: false,
+    setupCodeRequired: true,
   });
   globalThis.fetch = (async () =>
     Response.json({
@@ -54,6 +55,7 @@ test("local sign-in is enabled only by an explicit valid status", async () => {
     enabled: true,
     setupRequired: true,
     setupAvailable: true,
+    setupCodeRequired: true,
   });
 });
 

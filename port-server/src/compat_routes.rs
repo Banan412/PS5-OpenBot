@@ -148,7 +148,7 @@ pub(crate) fn respond_json(status: StatusCode, value: Value) -> Response {
     r
 }
 
-fn respond_raw(status: StatusCode, body: String) -> Response {
+pub(crate) fn respond_raw(status: StatusCode, body: String) -> Response {
     let mut r = if status == StatusCode::NO_CONTENT {
         status.into_response()
     } else {
@@ -220,7 +220,7 @@ pub(crate) fn require_person(actor: &Identity, person: &str) -> Result<(), Respo
     }
 }
 
-fn idempotency_key(h: &HeaderMap) -> Result<String, Response> {
+pub(crate) fn idempotency_key(h: &HeaderMap) -> Result<String, Response> {
     let mut keys = h.get_all("idempotency-key").iter();
     match (keys.next(), keys.next()) {
         (Some(k), None) => match k.to_str() {
@@ -249,7 +249,7 @@ pub(crate) fn epoch() -> Result<i64, StorageError> {
         .ok_or(StorageError::InvalidDatabase("clock unavailable"))
 }
 
-fn parse_limit(q: &HashMap<String, String>) -> Result<usize, Response> {
+pub(crate) fn parse_limit(q: &HashMap<String, String>) -> Result<usize, Response> {
     match q.get("limit") {
         None => Ok(50),
         Some(s) => s
@@ -279,11 +279,11 @@ pub(crate) fn parse_empty_list_paging(q: &HashMap<String, String>) -> Result<usi
     Ok(limit)
 }
 
-fn encode_cursor(offset: usize, scope_tag: &str) -> String {
+pub(crate) fn encode_cursor(offset: usize, scope_tag: &str) -> String {
     URL_SAFE_NO_PAD.encode(format!("{offset}\n{scope_tag}"))
 }
 
-fn decode_cursor(q: &HashMap<String, String>, expected_scope_tag: &str) -> Result<usize, Response> {
+pub(crate) fn decode_cursor(q: &HashMap<String, String>, expected_scope_tag: &str) -> Result<usize, Response> {
     let Some(c) = q.get("cursor") else {
         return Ok(0);
     };
@@ -362,7 +362,7 @@ where
     .map_err(|_| internal())
 }
 
-fn fingerprint(method: &str, resource: &str, body: Option<&Value>) -> Vec<u8> {
+pub(crate) fn fingerprint(method: &str, resource: &str, body: Option<&Value>) -> Vec<u8> {
     let mut d = Sha256::new();
     d.update(method.as_bytes());
     d.update([0]);
@@ -374,7 +374,7 @@ fn fingerprint(method: &str, resource: &str, body: Option<&Value>) -> Vec<u8> {
     d.finalize().to_vec()
 }
 
-fn replay_idempotency(
+pub(crate) fn replay_idempotency(
     tx: &rusqlite::Connection,
     org: &str,
     actor_id: &str,
@@ -402,7 +402,7 @@ fn replay_idempotency(
     }))
 }
 
-fn store_idempotency(
+pub(crate) fn store_idempotency(
     tx: &rusqlite::Connection,
     org: &str,
     actor_id: &str,

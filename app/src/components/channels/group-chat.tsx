@@ -28,6 +28,7 @@ import {
   type GroupMessage,
   groupKeys,
   groupQueryOptions,
+  isSilentGroupPass,
   sendGroupMessageMutationOptions,
 } from "@/lib/groups";
 import {
@@ -173,8 +174,9 @@ export function GroupChat({ channelId }: { channelId: string }) {
         >
           {messages.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              Say something to {bots.map((bot) => bot.name).join(" and ")}.
-              Every Bot answers in turn; start with @Name to ask just one.
+              Say something to {bots.map((bot) => bot.name).join(" and ")}.{" "}
+              Start with @Name to message one Bot directly, or send a message for
+              the group lead to handle or delegate.
             </p>
           ) : null}
           {messages.map((message) => (
@@ -370,13 +372,10 @@ function GroupLine({
         </MessageContent>
       </MessageRow>
     );
-  const trimmed = message.text.trim();
   const isSilentPass =
     message.status === "completed" &&
     !message.consent &&
-    (!trimmed ||
-      trimmed.toUpperCase() === "[PASS]" ||
-      trimmed.toUpperCase() === "[NO_REPLY]") &&
+    isSilentGroupPass(message.text) &&
     (!message.attachments || message.attachments.length === 0);
   if (isSilentPass) return null;
   return (

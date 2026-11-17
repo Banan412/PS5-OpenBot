@@ -1,5 +1,10 @@
 import { IconSettings } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { z } from "zod";
@@ -20,7 +25,11 @@ import { agentListQueryOptions } from "@/lib/agents/queries";
 import { updateConversation } from "@/lib/api/generated/conversations/conversations";
 import { idempotencyKey, organizationId } from "@/lib/api/request";
 import { useMarkOpenChannelRead } from "@/lib/channels/mark-read";
-import { channelKeys, channelQueryOptions } from "@/lib/channels/queries";
+import {
+  channelKeys,
+  channelListQueryOptions,
+  channelQueryOptions,
+} from "@/lib/channels/queries";
 import { useOpenComputerOnRequest } from "@/lib/computers/panel-view";
 import { useNoBotComputers } from "@/lib/deployment/queries";
 import { groupQueryOptions } from "@/lib/groups";
@@ -191,6 +200,13 @@ function RouteComponent() {
   const { settings, watch, bot } = Route.useSearch();
   const navigate = Route.useNavigate();
   const channel = useQuery(channelQueryOptions(channelId));
+  const listed = useInfiniteQuery({
+    ...channelListQueryOptions(),
+    select: (data) =>
+      data.pages
+        .flatMap((page) => page.channels)
+        .find((candidate) => candidate.id === channelId),
+  }).data;
   const group = useQuery(groupQueryOptions(channelId));
   const allAgents = useQuery(agentListQueryOptions()).data;
   const noComputers = useNoBotComputers() === true;
@@ -261,7 +277,7 @@ function RouteComponent() {
         ) : (
           <GroupSettingsDetail
             channelId={channelId}
-            initialTitle={channel.data?.summary ?? channel.data?.name ?? ""}
+            initialTitle={listed?.summary ?? channel.data?.name ?? ""}
             bots={groupBots}
             selectedBotId={selectedBotId}
             onSelectBot={(id) => show("settings", id)}
@@ -278,7 +294,7 @@ function RouteComponent() {
           <SidebarToggle />
           <ChannelAvatar participantIds={agentIds} size={22} />
           <span className="min-w-0 truncate text-sm tracking-tight">
-            {channel.data?.summary || channel.data?.name || "Group"}
+            {listed?.summary || channel.data?.name || "Group"}
           </span>
           <div className="ml-auto flex flex-row items-center gap-1.5">
             <GroupPeopleButton channelId={channelId} />

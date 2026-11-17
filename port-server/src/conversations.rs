@@ -501,7 +501,7 @@ async fn messages(
     {
         return problem(StatusCode::BAD_REQUEST, "Invalid bot");
     }
-    match db(&s,move|c|{if row(c,&i.organization,&i.id,&id,false)?.is_none(){return Ok(json!({"notFound":true}));}let mut st=c.prepare("SELECT id,role,person_id,bot_id,text,status,strftime('%Y-%m-%dT%H:%M:%SZ',created_at,'unixepoch') FROM port_conversation_messages WHERE conversation_id=?1 AND (?2 IS NULL OR bot_id IS NULL OR bot_id=?2) AND NOT (role='bot' AND status='completed' AND trim(text)='') ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4")?;let mut items=st.query_map(params![id,bot,(limit+1) as i64,offset as i64],|r|{let mid:String=r.get(0)?;Ok((mid.clone(),json!({"id":mid,"role":r.get::<_,String>(1)?,"personId":r.get::<_,Option<String>>(2)?,"botId":r.get::<_,Option<String>>(3)?,"text":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"createdAt":r.get::<_,Option<String>>(6)?})))})?.collect::<Result<Vec<_>,_>>()?;drop(st);let more=items.len()>limit;items.truncate(limit);let mut out=Vec::with_capacity(items.len());let mut att_st=c.prepare("SELECT id,filename,mime_type,size_bytes FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC")?;for(mid,mut msg) in items{let atts=att_st.query_map(params![id,mid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mimeType":r.get::<_,String>(2)?,"sizeBytes":r.get::<_,i64>(3)?})))?.collect::<Result<Vec<_>,_>>()?;if !atts.is_empty(){if let Some(obj)=msg.as_object_mut(){obj.insert("attachments".into(),Value::Array(atts));}}out.push(msg);}Ok(json!({"messages":out,"nextCursor":if more{Some(URL_SAFE_NO_PAD.encode((offset+limit).to_string()))}else{None}}))}).await {Ok(v) if v.get("notFound").is_some()=>problem(StatusCode::NOT_FOUND,"Conversation not found"),Ok(v)=>output(StatusCode::OK,v,None),Err(e)=>e}
+    match db(&s,move|c|{if row(c,&i.organization,&i.id,&id,false)?.is_none(){return Ok(json!({"notFound":true}));}let mut st=c.prepare("SELECT id,role,person_id,bot_id,text,status,strftime('%Y-%m-%dT%H:%M:%SZ',created_at,'unixepoch') FROM port_conversation_messages WHERE conversation_id=?1 AND (?2 IS NULL OR bot_id IS NULL OR bot_id=?2) AND NOT (role='bot' AND status='completed' AND (trim(text, char(9, 10, 13, 32))='' OR (substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),1,6)='[PASS]' AND substr(ltrim(substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),7),'*_`'),1,1) IN ('',' ',char(9),char(10),char(13),':','.','!',',','-',char(8211),char(8212))) OR (substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),1,8)='[SILENT]' AND substr(ltrim(substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),9),'*_`'),1,1) IN ('',' ',char(9),char(10),char(13),':','.','!',',','-',char(8211),char(8212))) OR (substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),1,10)='[NO_REPLY]' AND substr(ltrim(substr(upper(ltrim(text,'*_`'||char(9,10,13,32))),11),'*_`'),1,1) IN ('',' ',char(9),char(10),char(13),':','.','!',',','-',char(8211),char(8212))))) ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4")?;let mut items=st.query_map(params![id,bot,(limit+1) as i64,offset as i64],|r|{let mid:String=r.get(0)?;Ok((mid.clone(),json!({"id":mid,"role":r.get::<_,String>(1)?,"personId":r.get::<_,Option<String>>(2)?,"botId":r.get::<_,Option<String>>(3)?,"text":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"createdAt":r.get::<_,Option<String>>(6)?})))})?.collect::<Result<Vec<_>,_>>()?;drop(st);let more=items.len()>limit;items.truncate(limit);let mut out=Vec::with_capacity(items.len());let mut att_st=c.prepare("SELECT id,filename,mime_type,size_bytes FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC")?;for(mid,mut msg) in items{let atts=att_st.query_map(params![id,mid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mimeType":r.get::<_,String>(2)?,"sizeBytes":r.get::<_,i64>(3)?})))?.collect::<Result<Vec<_>,_>>()?;if !atts.is_empty(){if let Some(obj)=msg.as_object_mut(){obj.insert("attachments".into(),Value::Array(atts));}}out.push(msg);}Ok(json!({"messages":out,"nextCursor":if more{Some(URL_SAFE_NO_PAD.encode((offset+limit).to_string()))}else{None}}))}).await {Ok(v) if v.get("notFound").is_some()=>problem(StatusCode::NOT_FOUND,"Conversation not found"),Ok(v)=>output(StatusCode::OK,v,None),Err(e)=>e}
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1184,6 +1184,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(g1.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(g1_v["conversation"]["botIds"], json!(["bot-1", "bot-2"]));
         let g2 = routes
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1202,6 +1203,49 @@ mod tests {
         let g2_v: Value =
             serde_json::from_slice(&to_bytes(g2.into_body(), 4096).await.unwrap()).unwrap();
         assert_ne!(g1_v["conversation"]["id"], g2_v["conversation"]["id"]);
+
+        let g1_id = g1_v["conversation"]["id"].as_str().unwrap().to_owned();
+        db.try_with_connection(|c| {
+            let mut stmt = c.prepare("INSERT INTO port_conversation_messages(id,conversation_id,role,bot_id,text,status,created_at) VALUES (?1,?2,'bot','bot-2',?3,'completed',?4)")?;
+            stmt.execute(params!["sp-1", g1_id, "[PASS]", 10])?;
+            stmt.execute(params!["sp-2", g1_id, "[PASS]\nBecause Commander already answered.", 11])?;
+            stmt.execute(params!["sp-3", g1_id, "  **[Pass]**: skipping", 12])?;
+            stmt.execute(params!["sp-4", g1_id, "[NO_REPLY]\nNothing to add", 13])?;
+            stmt.execute(params!["sp-5", g1_id, "[SILENT]!", 14])?;
+            stmt.execute(params!["sp-6", g1_id, "   ", 15])?;
+            stmt.execute(params!["sp-7", g1_id, "\n\t  \r\n", 15])?;
+            stmt.execute(params!["sp-8", g1_id, "\n\t[PASS]\nBecause Commander already handled this.", 15])?;
+            stmt.execute(params!["sp-9", g1_id, "\r\n\t**[SILENT]**\n", 15])?;
+            stmt.execute(params!["sp-10", g1_id, "\t\n[NO_REPLY] ", 15])?;
+            stmt.execute(params!["keep-1", g1_id, "[PASSING] all tests now", 16])?;
+            stmt.execute(params!["keep-2", g1_id, "[PASS]word should not match", 17])?;
+            stmt.execute(params!["keep-3", g1_id, "Implemented the fix.", 18])?;
+            Ok(())
+        })
+        .unwrap();
+        let listed = routes
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v2/organizations/default/conversations/{g1_id}/messages"))
+                    .header("cookie", &cookie)
+                    .header("origin", "http://example.test")
+                    .header("host", "example.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_v: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), 8192).await.unwrap()).unwrap();
+        let ids: Vec<&str> = listed_v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["keep-3", "keep-2", "keep-1"]);
 
         drop(db);
         let _ = std::fs::remove_file(path);
