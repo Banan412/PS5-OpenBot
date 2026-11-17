@@ -43,7 +43,7 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 512;
 const MAX_FETCH_BYTES: usize = 384 * 1024;
-const MAX_PROXY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROXY_BYTES: usize = 12 * 1024 * 1024;
 const MAX_PAGE_TEXT_CHARS: usize = 8 * 1024;
 const MAX_PREVIEW_HTML_BYTES: usize = 24 * 1024;
 const MAX_TOOL_OUTPUT_CHARS: usize = 3072;
@@ -82,6 +82,8 @@ struct VirtualComputerInner {
     idempotency: Mutex<VecDeque<IdempotencyRecord>>,
     sockets: Arc<Semaphore>,
     dns_jobs: Arc<Semaphore>,
+    dns_cache: Mutex<HashMap<(String, u16, bool), (Vec<SocketAddr>, Instant)>>,
+    http_clients: Mutex<HashMap<(String, u16, bool, bool), (reqwest::Client, Instant)>>,
     viewer_seq: AtomicU64,
 }
 
@@ -285,9 +287,93 @@ impl VirtualComputerState {
                 idempotency: Mutex::new(VecDeque::new()),
                 sockets: Arc::new(Semaphore::new(MAX_SOCKETS)),
                 dns_jobs: Arc::new(Semaphore::new(8)),
+                dns_cache: Mutex::new(HashMap::new()),
+                http_clients: Mutex::new(HashMap::new()),
                 viewer_seq: AtomicU64::new(1),
             }),
         }
+    }
+
+    async fn pooled_client_for_url(
+        &self,
+        url: &reqwest::Url,
+        allow_private: bool,
+        long_timeout: bool,
+    ) -> Result<reqwest::Client, String> {
+        let host = url
+            .host_str()
+            .unwrap_or("")
+            .trim_matches(['[', ']'])
+            .to_ascii_lowercase();
+        let port = url.port_or_known_default().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        let client_key = (host.clone(), port, allow_private, long_timeout);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(300);
+
+        if let Ok(mut clients) = self.inner.http_clients.lock() {
+            if let Some((cached, ts)) = clients.get(&client_key) {
+                if now.duration_since(*ts) < ttl {
+                    return Ok(cached.clone());
+                }
+            }
+            if clients.len() >= 128 {
+                clients.retain(|_, (_, ts)| now.duration_since(*ts) < ttl);
+                if clients.len() >= 128 {
+                    clients.clear();
+                }
+            }
+        }
+
+        let dns_key = (host.clone(), port, allow_private);
+        let cached_addrs = if let Ok(dns) = self.inner.dns_cache.lock() {
+            if let Some((addrs, ts)) = dns.get(&dns_key) {
+                if now.duration_since(*ts) < ttl {
+                    Some(addrs.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let pinned_addrs = match cached_addrs {
+            Some(a) => a,
+            None => {
+                let resolved = resolve_validated_addrs(url, &self.inner.dns_jobs, allow_private).await?;
+                if let Ok(mut dns) = self.inner.dns_cache.lock() {
+                    if dns.len() >= 256 {
+                        dns.retain(|_, (_, ts)| now.duration_since(*ts) < ttl);
+                        if dns.len() >= 256 {
+                            dns.clear();
+                        }
+                    }
+                    dns.insert(dns_key, (resolved.clone(), now));
+                }
+                resolved
+            }
+        };
+
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(if long_timeout { 60 } else { 20 }))
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_nodelay(true)
+            .redirect(Policy::none())
+            .no_proxy();
+        if host.parse::<IpAddr>().is_err() {
+            builder = builder.resolve_to_addrs(&host, &pinned_addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+        if let Ok(mut clients) = self.inner.http_clients.lock() {
+            clients.insert(client_key, (client.clone(), now));
+        }
+        Ok(client)
     }
 
     fn bot_handle(&self, bot_id: &str) -> Result<Arc<Mutex<BotComputer>>, String> {
@@ -314,6 +400,14 @@ impl VirtualComputerState {
         let created = Arc::new(Mutex::new(BotComputer::new(bot_id.to_owned())));
         map.insert(bot_id.to_owned(), created.clone());
         Ok(created)
+    }
+
+    pub(crate) fn proxy_url_for(&self, bot_id: &str, raw_url: &str) -> Option<String> {
+        let parsed = validate_fetch_url_with_policy(raw_url.trim(), true).ok()?;
+        let handle = self.bot_handle(bot_id).ok()?;
+        let mut guard = handle.lock().ok()?;
+        guard.allow_all_web_pages = true;
+        build_proxy_url(bot_id, &guard.proxy_token, parsed.as_str())
     }
 
     fn workspace_for_verified_bot(&self, bot_id: &str) -> Result<WorkspaceEngine, String> {
@@ -2497,7 +2591,8 @@ pub(crate) async fn web_fetch_ssrf_safe_with_policy(
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(8)
+            .tcp_nodelay(true)
             .redirect(Policy::none())
             .no_proxy();
         if host.parse::<IpAddr>().is_err() {
@@ -2511,7 +2606,6 @@ pub(crate) async fn web_fetch_ssrf_safe_with_policy(
             .get(url.clone())
             .header(reqwest::header::USER_AGENT, CHROME_USER_AGENT)
             .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(|e| format!("fetch failed: {e}"))?;
@@ -2758,9 +2852,18 @@ fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w.eq_ignore_ascii_case(needle))
+    let first_low = needle[0].to_ascii_lowercase();
+    let first_up = needle[0].to_ascii_uppercase();
+    let limit = haystack.len() - needle.len() + 1;
+    let mut i = 0;
+    while i < limit {
+        let b = haystack[i];
+        if (b == first_low || b == first_up) && haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn escape_html(s: &str) -> String {
@@ -4090,6 +4193,10 @@ pub fn router(state: VirtualComputerState) -> Router {
             any(proxy_web_root),
         )
         .route(
+            "/browse/{botId}/{token}/{scheme}/{host}/",
+            any(proxy_web_root),
+        )
+        .route(
             "/browse/{botId}/{token}/{scheme}/{host}/{*rest}",
             any(proxy_web_rest),
         )
@@ -4409,6 +4516,15 @@ fn build_proxy_shim_script(proxy_prefix: &str, base: &reqwest::Url, bot_id: &str
     format!(
         "<script data-openbot-proxy=\"1\">(function(){{\
 var P={p_lit},S={s_lit},H={h_lit},curReal={r_lit},BID={b_lit};\
+try{{void document.cookie;}}catch(_){{\
+var _ck=Object.create(null);\
+function _getC(){{return Object.keys(_ck).map(function(k){{return k+\"=\"+_ck[k];}}).join(\"; \");}}\
+function _setC(v){{var s=String(v||\"\").split(\";\")[0],i=s.indexOf(\"=\");if(i>0){{var k=s.slice(0,i).trim(),val=s.slice(i+1).trim();if(/max-age\\s*=\\s*0/i.test(String(v)))delete _ck[k];else _ck[k]=val;}}}}\
+try{{Object.defineProperty(document,\"cookie\",{{configurable:true,get:_getC,set:_setC}});}}catch(_2){{}}\
+try{{Object.defineProperty(Document.prototype,\"cookie\",{{configurable:true,get:_getC,set:_setC}});}}catch(_3){{}}\
+}}\
+function _mkStore(){{var d=Object.create(null);return{{get length(){{return Object.keys(d).length;}},clear:function(){{d=Object.create(null);}},getItem:function(k){{k=String(k);return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;}},key:function(i){{return Object.keys(d)[i]||null;}},removeItem:function(k){{delete d[String(k)];}},setItem:function(k,v){{d[String(k)]=String(v);}}}};}}\
+[\"localStorage\",\"sessionStorage\"].forEach(function(sn){{try{{var st=window[sn];if(st)st.getItem(\"__ob_t\");}}catch(_){{try{{Object.defineProperty(window,sn,{{configurable:true,value:_mkStore()}});}}catch(_2){{}}}}}});\
 function toReal(u){{if(!u||typeof u!==\"string\")return curReal;\
 if(u.indexOf(P+\"/\")===0){{var r=u.slice(P.length+1),i=r.indexOf(\"/\");if(i>0)return r.slice(0,i)+\"://\"+r.slice(i+1);}}\
 try{{if(location.origin&&u.indexOf(location.origin+P+\"/\")===0){{var r2=u.slice((location.origin+P).length+1),j=r2.indexOf(\"/\");if(j>0)return r2.slice(0,j)+\"://\"+r2.slice(j+1);}}\
@@ -4421,9 +4537,12 @@ return P+\"/\"+a.protocol.slice(0,-1)+\"/\"+a.host+a.pathname+a.search+a.hash;}}
 function notify(u){{if(u)curReal=toReal(u);\
 try{{window.parent.postMessage({{type:\"openbot:browser-nav\",botId:BID,url:curReal,title:document.title||\"\"}},\"*\");}}catch(_){{}}}}\
 var of=window.fetch;if(of){{window.fetch=function(inp,ini){{\
-if(typeof inp===\"string\")return of.call(this,toProxy(inp),ini);\
-if(inp&&typeof inp===\"object\"&&inp.url){{var px=toProxy(inp.url);if(px!==inp.url){{try{{inp=new Request(px,inp);}}catch(_){{}}}}}}\
-return of.call(this,inp,ini);}};}}\
+var oini=ini?Object.assign({{}},ini):undefined;\
+if(oini&&oini.credentials===\"include\")oini.credentials=\"omit\";\
+if(typeof inp===\"string\")return of.call(this,toProxy(inp),oini);\
+if(inp&&typeof inp===\"object\"&&inp.url){{var px=toProxy(inp.url);if(px!==inp.url||inp.credentials===\"include\"){{try{{var ri={{method:inp.method,headers:inp.headers,mode:inp.mode===\"navigate\"?\"cors\":inp.mode,credentials:\"omit\",redirect:inp.redirect,referrerPolicy:inp.referrerPolicy}};if(inp.body&&inp.method!==\"GET\"&&inp.method!==\"HEAD\"){{ri.body=inp.body;ri.duplex=\"half\";}}inp=new Request(px,ri);}}catch(_){{}}}}}}\
+return of.call(this,inp,oini);}};}}\
+try{{Object.defineProperty(XMLHttpRequest.prototype,\"withCredentials\",{{configurable:true,get:function(){{return false;}},set:function(){{}}}});}}catch(_){{}}\
 var ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){{\
 var a=Array.prototype.slice.call(arguments);if(typeof u===\"string\")a[1]=toProxy(u);return ox.apply(this,a);}};\
 if(navigator.sendBeacon){{var ob=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){{return ob(toProxy(u),d);}};}}\
@@ -4447,6 +4566,10 @@ wp(typeof HTMLFormElement!==\"undefined\"&&HTMLFormElement.prototype,\"action\")
 wp(typeof HTMLMediaElement!==\"undefined\"&&HTMLMediaElement.prototype,\"src\");\
 wp(typeof HTMLSourceElement!==\"undefined\"&&HTMLSourceElement.prototype,\"src\");\
 wp(typeof HTMLIFrameElement!==\"undefined\"&&HTMLIFrameElement.prototype,\"src\");\
+try{{var cwd=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,\"contentWindow\");\
+if(cwd&&cwd.get){{Object.defineProperty(HTMLIFrameElement.prototype,\"contentWindow\",{{configurable:true,get:function(){{var cw=cwd.get.call(this);if(!cw)return cw;try{{void cw.history;return cw;}}catch(_){{return new Proxy({{}},{{get:function(_t,p){{if(p===\"history\")return window.history;if(p===\"location\")return window.location;if(p===\"top\")return window.top;if(p===\"parent\")return window;if(p===\"self\"||p===\"window\"||p===\"frames\")return cw;if(p===\"postMessage\")return function(m,o,tr){{return cw.postMessage(m,o,tr);}};try{{var v=cw[p];return typeof v===\"function\"?v.bind(cw):v;}}catch(_e){{return window[p];}}}},has:function(_t,p){{return p===\"history\"||p===\"location\"||(p in window);}}}});}}}}}});}}\
+var cdd=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,\"contentDocument\");\
+if(cdd&&cdd.get){{Object.defineProperty(HTMLIFrameElement.prototype,\"contentDocument\",{{configurable:true,get:function(){{try{{return cdd.get.call(this);}}catch(_){{return null;}}}}}});}}}}catch(_){{}}\
 document.addEventListener(\"click\",function(e){{var a=e.target&&e.target.closest?e.target.closest(\"a[href]\"):null;if(!a)return;\
 var h=a.getAttribute(\"href\");if(h)a.setAttribute(\"href\",h);var t=a.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\")a.setAttribute(\"target\",\"_self\");}},true);\
 document.addEventListener(\"submit\",function(e){{var f=e.target;if(!f||f.tagName!==\"FORM\")return;\
@@ -4577,8 +4700,8 @@ fn rewrite_html_for_proxy(
             continue;
         }
 
+        let attrs = parse_html_tag_attrs(attr_str);
         if tag_name == "meta" {
-            let attrs = parse_html_tag_attrs(attr_str);
             let is_csp_or_xfo = attrs.iter().any(|(k, v)| {
                 k == "http-equiv"
                     && v.as_deref().is_some_and(|hv| {
@@ -4592,9 +4715,20 @@ fn rewrite_html_for_proxy(
                 pos = gt + 1;
                 continue;
             }
+        } else if tag_name == "link" {
+            let is_shared_dict = attrs.iter().any(|(k, v)| {
+                k == "rel"
+                    && v.as_deref().is_some_and(|rv| {
+                        rv.split_ascii_whitespace()
+                            .any(|tok| tok.eq_ignore_ascii_case("compression-dictionary"))
+                    })
+            });
+            if is_shared_dict {
+                pos = gt + 1;
+                continue;
+            }
         }
 
-        let attrs = parse_html_tag_attrs(attr_str);
         let is_refresh = tag_name == "meta"
             && attrs.iter().any(|(k, v)| {
                 k == "http-equiv"
@@ -4624,7 +4758,17 @@ fn rewrite_html_for_proxy(
                         } else {
                             v
                         }
-                    } else if matches!(k.as_str(), "href" | "src" | "action" | "poster" | "data-src" | "data") {
+                    } else if matches!(
+                        k.as_str(),
+                        "href"
+                            | "src"
+                            | "action"
+                            | "poster"
+                            | "data-src"
+                            | "data"
+                            | "formaction"
+                            | "background"
+                    ) {
                         rewrite_proxy_url(&v, &base_url, proxy_prefix).unwrap_or(v)
                     } else if k == "srcset" {
                         rewrite_srcset_value(&v, &base_url, proxy_prefix)
@@ -4745,6 +4889,22 @@ async fn handle_proxy_web(
     host: String,
     req: Request,
 ) -> Response {
+    let mut r = handle_proxy_web_inner(s, bot_id, token, scheme, host, req).await;
+    if !r.headers().contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+        r.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    }
+    r
+}
+
+async fn handle_proxy_web_inner(
+    s: VirtualComputerState,
+    bot_id: String,
+    token: String,
+    scheme: String,
+    host: String,
+    req: Request,
+) -> Response {
     if validate_bot_id(&bot_id).is_err() || (scheme != "http" && scheme != "https") {
         return problem(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "Invalid proxy target.");
     }
@@ -4768,16 +4928,25 @@ async fn handle_proxy_web(
     }
 
     if req.method() == Method::OPTIONS {
+        let req_hdrs = req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .unwrap_or("*");
         let mut r = Response::new(Body::empty());
         *r.status_mut() = StatusCode::NO_CONTENT;
         r.headers_mut()
             .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
         r.headers_mut().insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD, OPTIONS"),
+            HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS"),
         );
+        if let Ok(hv) = HeaderValue::from_str(req_hdrs) {
+            r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, hv);
+        }
         r.headers_mut()
-            .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+            .insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
         return r;
     }
 
@@ -4797,28 +4966,9 @@ async fn handle_proxy_web(
         Ok(u) => u,
         Err(msg) => return problem(StatusCode::BAD_REQUEST, "INVALID_URL", &msg),
     };
-    let target_host = url
-        .host_str()
-        .unwrap_or("")
-        .trim_matches(['[', ']'])
-        .to_owned();
-    let pinned_addrs = match resolve_validated_addrs(&url, &s.inner.dns_jobs, allow_private).await {
-        Ok(a) => a,
-        Err(msg) => return problem(StatusCode::BAD_GATEWAY, "UPSTREAM_RESOLUTION_FAILED", &msg),
-    };
-
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(6))
-        .timeout(Duration::from_secs(20))
-        .pool_max_idle_per_host(0)
-        .redirect(Policy::none())
-        .no_proxy();
-    if target_host.parse::<IpAddr>().is_err() {
-        builder = builder.resolve_to_addrs(&target_host, &pinned_addrs);
-    }
-    let client = match builder.build() {
+    let client = match s.pooled_client_for_url(&url, allow_private, true).await {
         Ok(c) => c,
-        Err(e) => return problem(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", &format!("{e}")),
+        Err(msg) => return problem(StatusCode::BAD_GATEWAY, "UPSTREAM_RESOLUTION_FAILED", &msg),
     };
 
     let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
@@ -4844,7 +4994,6 @@ async fn handle_proxy_web(
         .request(method, url.clone())
         .header(reqwest::header::USER_AGENT, CHROME_USER_AGENT)
         .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(
             reqwest::header::REFERER,
             format!("{scheme}://{host}/"),
@@ -4887,6 +5036,12 @@ async fn handle_proxy_web(
                         if let Ok(hv) = HeaderValue::from_str(&rewritten_loc) {
                             r.headers_mut().insert(header::LOCATION, hv);
                         }
+                        r.headers_mut()
+                            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+                        r.headers_mut()
+                            .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+                        r.headers_mut()
+                            .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
                         r.headers_mut().insert(
                             header::CACHE_CONTROL,
                             HeaderValue::from_static("private, no-store"),
@@ -4912,40 +5067,105 @@ async fn handle_proxy_web(
     let is_html = mime == "text/html" || mime == "application/xhtml+xml";
     let is_css = mime == "text/css";
 
-    let mut raw = Vec::with_capacity(16 * 1024);
-    while let Ok(Some(chunk)) = resp.chunk().await {
-        let avail = MAX_PROXY_BYTES.saturating_sub(raw.len());
-        if avail == 0 {
-            break;
+    let mut r = if is_html || is_css {
+        let mut raw = Vec::with_capacity(16 * 1024);
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            let avail = MAX_PROXY_BYTES.saturating_sub(raw.len());
+            if avail == 0 {
+                break;
+            }
+            let take = chunk.len().min(avail);
+            raw.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                break;
+            }
         }
-        let take = chunk.len().min(avail);
-        raw.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            break;
-        }
-    }
-
-    let final_body: Vec<u8> = if is_html {
-        let text = String::from_utf8_lossy(&raw);
-        rewrite_html_for_proxy(&text, &url, &proxy_prefix, &bot_id).into_bytes()
-    } else if is_css {
-        let text = String::from_utf8_lossy(&raw);
-        rewrite_css_urls(&text, &url, &proxy_prefix).into_bytes()
+        let final_body: Vec<u8> = if is_html {
+            let text = String::from_utf8_lossy(&raw);
+            rewrite_html_for_proxy(&text, &url, &proxy_prefix, &bot_id).into_bytes()
+        } else {
+            let text = String::from_utf8_lossy(&raw);
+            rewrite_css_urls(&text, &url, &proxy_prefix).into_bytes()
+        };
+        Response::new(Body::from(final_body))
     } else {
-        raw
+        // Stream scripts, media, and large bundles directly without truncation or RAM buffering.
+        Response::new(Body::from_stream(resp.bytes_stream()))
     };
-
-    let mut r = Response::new(Body::from(final_body));
     *r.status_mut() = status;
 
+    apply_proxy_response_headers(
+        &mut r,
+        &resp_headers,
+        &proxy_prefix,
+        &scheme,
+        &host,
+        is_html,
+        &content_type,
+    );
+    r
+}
+
+fn apply_proxy_response_headers(
+    r: &mut Response,
+    resp_headers: &reqwest::header::HeaderMap,
+    proxy_prefix: &str,
+    scheme: &str,
+    host: &str,
+    is_html: bool,
+    content_type: &str,
+) {
     if is_html {
         r.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
         );
     } else if !content_type.is_empty() {
-        if let Ok(hv) = HeaderValue::from_str(&content_type) {
+        if let Ok(hv) = HeaderValue::from_str(content_type) {
             r.headers_mut().insert(header::CONTENT_TYPE, hv);
+        }
+    }
+
+    let mut exposed_names: Vec<String> = vec![
+        "x-sg-cs".to_owned(),
+        "x-sorry-redirect".to_owned(),
+    ];
+    for (name, val) in resp_headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "set-cookie"
+                | "set-cookie2"
+                | "content-security-policy"
+                | "content-security-policy-report-only"
+                | "x-frame-options"
+                | "cross-origin-embedder-policy"
+                | "cross-origin-opener-policy"
+                | "cross-origin-resource-policy"
+                | "link"
+                | "use-as-dictionary"
+                | "available-dictionary"
+                | "dictionary-id"
+                | "content-length"
+                | "transfer-encoding"
+                | "content-encoding"
+                | "connection"
+                | "keep-alive"
+                | "access-control-allow-origin"
+                | "access-control-expose-headers"
+        ) {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            if lower != "content-type" && lower != "cache-control" {
+                r.headers_mut().append(hn, hv);
+            }
+            if !exposed_names.iter().any(|existing| existing == &lower) {
+                exposed_names.push(lower);
+            }
         }
     }
 
@@ -4989,8 +5209,18 @@ async fn handle_proxy_web(
         .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
     r.headers_mut()
         .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    r.headers_mut()
-        .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+    if !exposed_names.is_empty() {
+        exposed_names.push("*".to_owned());
+        if let Ok(hv) = HeaderValue::from_str(&exposed_names.join(", ")) {
+            r.headers_mut().insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, hv);
+        } else {
+            r.headers_mut()
+                .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+        }
+    } else {
+        r.headers_mut()
+            .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+    }
     r.headers_mut()
         .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     if is_html {
@@ -4999,7 +5229,6 @@ async fn handle_proxy_web(
             HeaderValue::from_static("private, no-store"),
         );
     }
-    r
 }
 
 async fn authorize_computer(
@@ -7389,12 +7618,24 @@ mod tests {
     async fn live_web_proxy_rewrites_html_strips_framing_headers_and_protects_session() {
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream = Router::new().route(
-            "/home",
-            get(|| async {
+        let upstream = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, "/home")
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/home",
+                get(|| async {
                 let html = concat!(
                     "<!doctype html><html><head>",
                     "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\">",
+                    "<link rel=\"compression-dictionary\" href=\"/shared_dict/test.dict\">",
                     "<style>body{background:url(/bg.png)}</style>",
                     "<link rel=\"stylesheet\" href=\"/app.css\" integrity=\"sha256-abc\">",
                     "<script src=\"/app.js\" integrity=\"sha256-xyz\">if(1<2){}</script>",
@@ -7423,6 +7664,20 @@ mod tests {
                 r.headers_mut().append(
                     header::SET_COOKIE,
                     HeaderValue::from_static("pref=dark; Domain=.example.com; Path=/; Secure"),
+                );
+                r.headers_mut()
+                    .insert("x-sg-cs", HeaderValue::from_static("ok-header"));
+                r
+            }),
+        )
+        .route(
+            "/big.js",
+            get(|| async {
+                let mut r = Response::new(Body::from(vec![b'a'; 5 * 1024 * 1024]));
+                *r.status_mut() = StatusCode::OK;
+                r.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/javascript"),
                 );
                 r
             }),
@@ -7512,11 +7767,23 @@ mod tests {
         assert!(!set_cookies.iter().any(|c| c.contains("openbot_session")));
         assert!(set_cookies.iter().any(|c| c.contains("pref=dark") && !c.contains("Secure")));
 
+        let expose_hdr = proxied_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        assert!(expose_hdr.contains("x-sg-cs"), "missing x-sg-cs in {expose_hdr}");
+
         let html = String::from_utf8(
             to_bytes(proxied_resp.into_body(), 64 * 1024).await.unwrap().to_vec(),
         )
         .unwrap();
         assert!(html.contains("data-openbot-proxy=\"1\""));
+        assert!(html.contains("localStorage"));
+        assert!(html.contains("withCredentials"));
+        assert!(html.contains("contentWindow"));
+        assert!(!html.contains("/shared_dict/test.dict"));
         assert!(html.contains(&format!("/http/{upstream_addr}/search?q=1\"")));
         assert!(html.contains(&format!("/http/{upstream_addr}/submit\"")));
         assert!(html.contains(&format!("/http/{upstream_addr}/bg.png\"")));
@@ -7539,6 +7806,34 @@ mod tests {
         let entry_resp = app.clone().oneshot(entry_req).await.unwrap();
         assert_eq!(entry_resp.status(), StatusCode::FOUND);
         assert_eq!(entry_resp.headers().get(header::LOCATION).unwrap(), proxy_url.as_str());
+
+        // Root proxy path WITH trailing slash (`/browse/.../{host}/`) and without trailing slash (`/browse/.../{host}`)
+        let browse_prefix = proxy_url.strip_suffix("/home").unwrap();
+        for root_uri in [format!("{browse_prefix}/"), browse_prefix.to_string()] {
+            let root_resp = app
+                .clone()
+                .oneshot(Request::builder().uri(&root_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(root_resp.status(), StatusCode::FOUND, "root proxy route failed for {root_uri}");
+            assert_eq!(root_resp.headers().get(header::LOCATION).unwrap(), proxy_url.as_str());
+            assert_eq!(root_resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+        }
+
+        // Verify >4MB JS bundles stream completely without truncation.
+        let big_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("{browse_prefix}/big.js"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(big_resp.status(), StatusCode::OK);
+        let big_bytes = to_bytes(big_resp.into_body(), 6 * 1024 * 1024).await.unwrap();
+        assert_eq!(big_bytes.len(), 5 * 1024 * 1024);
 
         upstream_srv.abort();
         drop(db);

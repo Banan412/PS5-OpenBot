@@ -1847,7 +1847,11 @@ fn ensure_default_person_tab(state: &mut PersonBrowserStored) {
     }
 }
 
-pub(crate) fn person_browser_api_json(raw: Option<&Value>, user_id: &str) -> Value {
+pub(crate) fn person_browser_api_json_with_vc(
+    raw: Option<&Value>,
+    user_id: &str,
+    vc: Option<&crate::virtual_computer::VirtualComputerState>,
+) -> Value {
     let stored: PersonBrowserStored = raw
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
@@ -1856,12 +1860,19 @@ pub(crate) fn person_browser_api_json(raw: Option<&Value>, user_id: &str) -> Val
             .tabs
             .iter()
             .map(|t| {
-                json!({
+                let mut tab_obj = json!({
                     "id": t.id,
                     "url": t.url,
                     "title": t.title,
                     "active": t.active,
-                })
+                });
+                if let Some(pu) = vc.and_then(|v| v.proxy_url_for("ps5-virtual", &t.url)) {
+                    tab_obj
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("proxyUrl".to_owned(), json!(pu));
+                }
+                tab_obj
             })
             .collect()
     } else {
@@ -1976,6 +1987,7 @@ struct PersonBrowserTabsInput {
 async fn person_browser_tabs(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
+    vc: Option<axum::Extension<crate::virtual_computer::VirtualComputerState>>,
     h: HeaderMap,
     Json(input): Json<PersonBrowserTabsInput>,
 ) -> Response {
@@ -2042,11 +2054,14 @@ async fn person_browser_tabs(
         }
         let val = serde_json::to_value(&st).unwrap_or(Value::Null);
         save_kv(c, &key, &val)?;
-        Ok(person_browser_api_json(Some(&val), &user_id))
+        Ok(val)
     })
     .await
     {
-        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Ok(val) => respond_json(
+            StatusCode::OK,
+            person_browser_api_json_with_vc(Some(&val), &user_id, vc.as_ref().map(|e| &e.0)),
+        ),
         Err(_) => internal(),
     }
 }
@@ -2060,6 +2075,7 @@ struct PersonBrowserNavigateInput {
 async fn person_browser_navigate(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
+    vc: Option<axum::Extension<crate::virtual_computer::VirtualComputerState>>,
     h: HeaderMap,
     Json(input): Json<PersonBrowserNavigateInput>,
 ) -> Response {
@@ -2123,11 +2139,14 @@ async fn person_browser_navigate(
         }
         let val = serde_json::to_value(&st).unwrap_or(Value::Null);
         save_kv(c, &key, &val)?;
-        Ok(person_browser_api_json(Some(&val), &user_id))
+        Ok(val)
     })
     .await
     {
-        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Ok(val) => respond_json(
+            StatusCode::OK,
+            person_browser_api_json_with_vc(Some(&val), &user_id, vc.as_ref().map(|e| &e.0)),
+        ),
         Err(_) => internal(),
     }
 }
@@ -2141,6 +2160,7 @@ struct PersonBrowserRecordingInput {
 async fn person_browser_recording(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
+    vc: Option<axum::Extension<crate::virtual_computer::VirtualComputerState>>,
     h: HeaderMap,
     Json(input): Json<PersonBrowserRecordingInput>,
 ) -> Response {
@@ -2203,6 +2223,7 @@ async fn person_browser_recording(
                 let mut recs: Vec<Value> = load_kv(c, &rec_key)?
                     .and_then(|v| v.as_array().cloned())
                     .unwrap_or_default();
+                let recorded_iso = now_iso(c)?;
                 recs.insert(
                     0,
                     json!({
@@ -2210,7 +2231,8 @@ async fn person_browser_recording(
                         "recordingId": rid,
                         "title": title,
                         "url": active_url,
-                        "createdAt": now_iso(c)?,
+                        "recordedAt": recorded_iso,
+                        "createdAt": recorded_iso,
                         "stoppedAt": now_ms,
                         "actions": 1,
                         "phrases": 0,
@@ -2223,11 +2245,14 @@ async fn person_browser_recording(
         }
         let val = serde_json::to_value(&st).unwrap_or(Value::Null);
         save_kv(c, &key, &val)?;
-        Ok(person_browser_api_json(Some(&val), &user_id))
+        Ok(val)
     })
     .await
     {
-        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Ok(val) => respond_json(
+            StatusCode::OK,
+            person_browser_api_json_with_vc(Some(&val), &user_id, vc.as_ref().map(|e| &e.0)),
+        ),
         Err(_) => internal(),
     }
 }
@@ -2235,6 +2260,7 @@ async fn person_browser_recording(
 async fn person_browser_clear(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
+    vc: Option<axum::Extension<crate::virtual_computer::VirtualComputerState>>,
     h: HeaderMap,
 ) -> Response {
     let actor = match authorize(&s, &h, &org, true).await {
@@ -2254,11 +2280,14 @@ async fn person_browser_clear(
         ensure_default_person_tab(&mut st);
         let val = serde_json::to_value(&st).unwrap_or(Value::Null);
         save_kv(c, &key, &val)?;
-        Ok(person_browser_api_json(Some(&val), &user_id))
+        Ok(val)
     })
     .await
     {
-        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Ok(val) => respond_json(
+            StatusCode::OK,
+            person_browser_api_json_with_vc(Some(&val), &user_id, vc.as_ref().map(|e| &e.0)),
+        ),
         Err(_) => internal(),
     }
 }
@@ -2339,13 +2368,25 @@ async fn list_recordings(
         return e;
     }
     let key = person_recordings_kv_key(&actor);
-    let recs: Vec<Value> = run_db(&s, move |c| {
+    let mut recs: Vec<Value> = run_db(&s, move |c| {
         Ok(load_kv(c, &key)?
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default())
     })
     .await
     .unwrap_or_default();
+    for item in &mut recs {
+        if let Some(obj) = item.as_object_mut() {
+            if !obj.get("recordedAt").is_some_and(|v| v.is_string()) {
+                let fallback = obj
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("2026-11-17T00:00:00Z")
+                    .to_owned();
+                obj.insert("recordedAt".to_owned(), json!(fallback));
+            }
+        }
+    }
     respond_json(
         StatusCode::OK,
         json!({ "recordings": recs, "nextCursor": Value::Null }),

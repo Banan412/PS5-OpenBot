@@ -69,6 +69,7 @@ fn app(
     };
     let router = Router::new()
         .route("/healthz", get(|| async { "OpenBot server running" }))
+        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .fallback(static_handler)
         .with_state(AppState {
             root: Arc::new(root),
@@ -99,12 +100,13 @@ fn app(
                 .merge(compat_routes::router_with_context(state.clone(), context_mgr))
                 .merge(routines::router(state.clone(), runs.clone()))
                 .merge(approvals_api::router_with_runs(state.clone(), runs.clone()))
-                .merge(virtual_computer::router(vc_state))
+                .merge(virtual_computer::router(vc_state.clone()))
                 .merge(realtime::router(realtime::Gateway::new(
                     state.clone(),
                     runs.clone(),
                 )))
                 .merge(local_auth::router(state))
+                .layer(axum::Extension(vc_state))
         }
         None => router,
     };

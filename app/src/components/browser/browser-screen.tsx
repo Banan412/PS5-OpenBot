@@ -100,6 +100,8 @@ export function ScreenBrowser({
 	const clear = useMutation(clearBrowserMutationOptions(queryClient));
 	const clearing = useClearBrowserData(clear);
 	const active = state.tabs.find((tab) => tab.active);
+	const activeProxyUrl = (active as { proxyUrl?: string } | undefined)
+		?.proxyUrl;
 	const newTab = useOpenedTab(active?.id);
 	const ids = useId();
 	const screen = useRef<LiveScreenHandle>(null);
@@ -203,6 +205,7 @@ export function ScreenBrowser({
 								</p>
 							) : null}
 							<Screen
+								activeProxyUrl={activeProxyUrl}
 								activeTitle={active?.title}
 								activeUrl={shownAddress(active)}
 								blank={!shownAddress(active)}
@@ -374,6 +377,7 @@ export function OpeningBrowser({
  * (`useFittedWidth`), so the page fills the window with nothing blank under or beside it.
  */
 function Screen({
+	activeProxyUrl,
 	activeTitle,
 	activeUrl,
 	blank,
@@ -385,6 +389,7 @@ function Screen({
 	reopening,
 	screen,
 }: {
+	activeProxyUrl?: string;
 	activeTitle?: string;
 	activeUrl?: string;
 	/** The tab that shows is empty: the page offers somewhere to go rather than a white rectangle. */
@@ -423,7 +428,7 @@ function Screen({
 				<iframe
 					title={activeTitle || activeUrl}
 					sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
-					src={computerProxyEntryUrl(computerId, activeUrl)}
+					src={activeProxyUrl ?? computerProxyEntryUrl(computerId, activeUrl)}
 					className="absolute inset-0 z-10 h-full w-full border-0 bg-white"
 				/>
 			) : null}

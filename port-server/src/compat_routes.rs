@@ -1373,6 +1373,7 @@ async fn bot_attention(
 async fn person_browser(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
+    vc: Option<axum::Extension<crate::virtual_computer::VirtualComputerState>>,
     h: HeaderMap,
 ) -> Response {
     let actor = match authorize(&s, &h, &org, false).await {
@@ -1390,7 +1391,11 @@ async fn person_browser(
     if let Some(val) = stored {
         return respond_json(
             StatusCode::OK,
-            crate::compat_extra::person_browser_api_json(Some(&val), &actor.id),
+            crate::compat_extra::person_browser_api_json_with_vc(
+                Some(&val),
+                &actor.id,
+                vc.as_ref().map(|e| &e.0),
+            ),
         );
     }
     respond_json(
