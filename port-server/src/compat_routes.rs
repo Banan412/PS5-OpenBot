@@ -1382,6 +1382,17 @@ async fn person_browser(
     if let Err(e) = require_person(&actor, &person) {
         return e;
     }
+    let key = format!("person_browser:{}:{}", actor.organization, actor.id);
+    let stored = run_db(&s, move |c| crate::compat_extra::load_kv(c, &key))
+        .await
+        .ok()
+        .flatten();
+    if let Some(val) = stored {
+        return respond_json(
+            StatusCode::OK,
+            crate::compat_extra::person_browser_api_json(Some(&val), &actor.id),
+        );
+    }
     respond_json(
         StatusCode::OK,
         json!({
@@ -1392,7 +1403,7 @@ async fn person_browser(
             "window": "screen",
             "shows": "screen",
             "narration": "own",
-            "note": "In-process PS5 virtual workspace & HTTP reader (Chromium automation requires remote bridge)"
+            "note": "In-process PS5 interactive web proxy & virtual browser"
         }),
     )
 }
@@ -2248,7 +2259,7 @@ mod tests {
             .unwrap();
         assert_eq!(other_att.status(), StatusCode::FORBIDDEN);
 
-        // Person browser & Bot browser.
+        // Person browser lifecycle: closed initially, then open -> navigate -> tabs -> recording -> clear.
         let pb = app
             .clone()
             .oneshot(req(
@@ -2265,6 +2276,98 @@ mod tests {
         assert_eq!(pb_json["open"], false);
         assert_eq!(pb_json["available"], true);
         assert_eq!(pb_json["computerId"], "ps5-virtual");
+
+        let pb_open = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/people/me/browser/open",
+                &cookie,
+                "k-open-1",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_open.status(), StatusCode::OK);
+        let pb_open_json = read_json(pb_open).await;
+        assert_eq!(pb_open_json["computerId"], "ps5-virtual");
+        assert_eq!(pb_open_json["window"], "screen");
+
+        let pb_opened_state = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/api/v2/organizations/default/people/me/browser",
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_opened_state.status(), StatusCode::OK);
+        let pb_state_json = read_json(pb_opened_state).await;
+        assert_eq!(pb_state_json["open"], true);
+        assert_eq!(pb_state_json["tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(pb_state_json["recorder"]["phase"], "idle");
+
+        let pb_nav = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/people/me/browser/navigate",
+                &cookie,
+                "k-nav-1",
+                r#"{"url":"https://www.google.com/"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_nav.status(), StatusCode::OK);
+        let pb_nav_json = read_json(pb_nav).await;
+        assert_eq!(pb_nav_json["tabs"][0]["url"], "https://www.google.com/");
+
+        let pb_rec_start = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/people/me/browser/recording",
+                &cookie,
+                "k-rec-start",
+                r#"{"action":"start","title":"Search task"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_rec_start.status(), StatusCode::OK);
+        assert_eq!(read_json(pb_rec_start).await["recorder"]["phase"], "recording");
+
+        let pb_rec_stop = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/people/me/browser/recording",
+                &cookie,
+                "k-rec-stop",
+                r#"{"action":"stop"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_rec_stop.status(), StatusCode::OK);
+        let pb_rec_stop_json = read_json(pb_rec_stop).await;
+        assert_eq!(pb_rec_stop_json["recorder"]["phase"], "idle");
+        assert_eq!(pb_rec_stop_json["recorder"]["lastStopped"]["title"], "Search task");
+
+        let pb_clear = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/people/me/browser/clear",
+                &cookie,
+                "k-clear",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pb_clear.status(), StatusCode::OK);
+        assert_eq!(read_json(pb_clear).await["tabs"][0]["url"], "about:blank");
 
         let bb = app
             .clone()

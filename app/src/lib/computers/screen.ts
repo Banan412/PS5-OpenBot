@@ -1,7 +1,7 @@
 import {
-  getComputerPageFrame,
-  getComputerScreenshot,
-  wakeComputer,
+	getComputerPageFrame,
+	getComputerScreenshot,
+	wakeComputer,
 } from "@/lib/api/generated/computers/computers";
 import { apiRequest, idempotencyKey, organizationId } from "@/lib/api/request";
 import { ClientError } from "@/lib/client";
@@ -15,12 +15,12 @@ import type { ComputerState } from "./queries";
  * since moved.
  */
 export type Screenshot = {
-  base64: string;
-  width: number;
-  height: number;
-  capturedAt: string;
-  /** `about:blank` when the browser has not been sent anywhere yet. Absent on older computers. */
-  url?: string;
+	base64: string;
+	width: number;
+	height: number;
+	capturedAt: string;
+	/** `about:blank` when the browser has not been sent anywhere yet. Absent on older computers. */
+	url?: string;
 };
 
 /**
@@ -31,16 +31,16 @@ export type Screenshot = {
  * calmly and keeps polling. `error` is a screenshot that was attempted and failed.
  */
 export type ScreenshotRead = {
-  frame?: Screenshot;
-  error?: string;
-  notReady?: { state: ComputerState; reason?: string };
+	frame?: Screenshot;
+	error?: string;
+	notReady?: { state: ComputerState; reason?: string };
 };
 
 const COMPUTER_STATES: readonly ComputerState[] = [
-  "absent",
-  "starting",
-  "ready",
-  "unreachable",
+	"absent",
+	"starting",
+	"ready",
+	"unreachable",
 ];
 
 /**
@@ -51,24 +51,24 @@ const COMPUTER_STATES: readonly ComputerState[] = [
  * whether to keep polling.
  */
 export async function readScreenshot(
-  computerId: string,
+	computerId: string,
 ): Promise<ScreenshotRead> {
-  const unavailable = "The screen is not available right now.";
-  try {
-    const body: unknown = await getComputerScreenshot(
-      organizationId(),
-      computerId,
-      { fallback: unavailable },
-    );
-    const notReady = notReadyOf(body);
-    if (notReady) return { notReady };
-    return parseScreenshot(body);
-  } catch (error) {
-    // The server's own sentence when it said why; otherwise the screen is simply not there.
-    return {
-      error: error instanceof ClientError ? error.message : unavailable,
-    };
-  }
+	const unavailable = "The screen is not available right now.";
+	try {
+		const body: unknown = await getComputerScreenshot(
+			organizationId(),
+			computerId,
+			{ fallback: unavailable },
+		);
+		const notReady = notReadyOf(body);
+		if (notReady) return { notReady };
+		return parseScreenshot(body);
+	} catch (error) {
+		// The server's own sentence when it said why; otherwise the screen is simply not there.
+		return {
+			error: error instanceof ClientError ? error.message : unavailable,
+		};
+	}
 }
 
 /**
@@ -83,69 +83,69 @@ export async function readScreenshot(
  * says the computer is off, which it is.
  */
 export async function startComputer(
-  computerId: string,
+	computerId: string,
 ): Promise<ComputerState | null> {
-  try {
-    const body: { state?: unknown } = await wakeComputer(
-      organizationId(),
-      computerId,
-      { "Idempotency-Key": idempotencyKey() },
-    );
-    return COMPUTER_STATES.includes(body?.state as ComputerState)
-      ? (body?.state as ComputerState)
-      : null;
-  } catch {
-    return null;
-  }
+	try {
+		const body: { state?: unknown } = await wakeComputer(
+			organizationId(),
+			computerId,
+			{ "Idempotency-Key": idempotencyKey() },
+		);
+		return COMPUTER_STATES.includes(body?.state as ComputerState)
+			? (body?.state as ComputerState)
+			: null;
+	} catch {
+		return null;
+	}
 }
 
 /** The server's "not ready yet" answer, or nothing when the body is something else. */
 function notReadyOf(body: unknown): ScreenshotRead["notReady"] {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return;
-  const { ready, state, reason } = body as {
-    ready?: unknown;
-    state?: unknown;
-    reason?: unknown;
-  };
-  if (ready !== false) return;
-  if (!COMPUTER_STATES.includes(state as ComputerState)) return;
-  return {
-    state: state as ComputerState,
-    ...(typeof reason === "string" ? { reason } : {}),
-  };
+	if (!body || typeof body !== "object" || Array.isArray(body)) return;
+	const { ready, state, reason } = body as {
+		ready?: unknown;
+		state?: unknown;
+		reason?: unknown;
+	};
+	if (ready !== false) return;
+	if (!COMPUTER_STATES.includes(state as ComputerState)) return;
+	return {
+		state: state as ComputerState,
+		...(typeof reason === "string" ? { reason } : {}),
+	};
 }
 
 function parseScreenshot(body: unknown): {
-  frame?: Screenshot;
-  error?: string;
+	frame?: Screenshot;
+	error?: string;
 } {
-  const unavailable = "The screen is not available right now.";
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return { error: unavailable };
-  }
-  const frame = (body as { frame?: unknown }).frame ?? body;
-  if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
-    return { error: unavailable };
-  }
-  const { base64, width, height } = frame as {
-    base64?: unknown;
-    width?: unknown;
-    height?: unknown;
-  };
-  // A mistyped frame used to reach `atob` in the viewer and throw there. Refused here instead.
-  if (
-    typeof base64 !== "string" ||
-    !base64 ||
-    typeof width !== "number" ||
-    !Number.isFinite(width) ||
-    width <= 0 ||
-    typeof height !== "number" ||
-    !Number.isFinite(height) ||
-    height <= 0
-  ) {
-    return { error: unavailable };
-  }
-  return { frame: frame as Screenshot };
+	const unavailable = "The screen is not available right now.";
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		return { error: unavailable };
+	}
+	const frame = (body as { frame?: unknown }).frame ?? body;
+	if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+		return { error: unavailable };
+	}
+	const { base64, width, height } = frame as {
+		base64?: unknown;
+		width?: unknown;
+		height?: unknown;
+	};
+	// A mistyped frame used to reach `atob` in the viewer and throw there. Refused here instead.
+	if (
+		typeof base64 !== "string" ||
+		!base64 ||
+		typeof width !== "number" ||
+		!Number.isFinite(width) ||
+		width <= 0 ||
+		typeof height !== "number" ||
+		!Number.isFinite(height) ||
+		height <= 0
+	) {
+		return { error: unavailable };
+	}
+	return { frame: frame as Screenshot };
 }
 
 /** The frame a page was showing when a Bot opened it. */
@@ -160,63 +160,68 @@ export type PageFrame = { url: string; title: string | null; frame: string };
  * and filing whatever it happened to show.
  */
 export async function readPageFrame(
-  computerId: string,
-  toolCallId: string,
+	computerId: string,
+	toolCallId: string,
 ): Promise<PageFrame | null> {
-  try {
-    const body: unknown = await getComputerPageFrame(
-      organizationId(),
-      computerId,
-      toolCallId,
-    );
-    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-    const frame = (body as { frame?: unknown }).frame;
-    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
-      return null;
-    }
-    const { frame: image } = frame as { frame?: unknown };
-    if (typeof image !== "string" || !image) return null;
-    return frame as PageFrame;
-  } catch {
-    // A missing picture is a smaller sentence, not a broken conversation.
-    return null;
-  }
+	try {
+		const body: unknown = await getComputerPageFrame(
+			organizationId(),
+			computerId,
+			toolCallId,
+		);
+		if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+		const frame = (body as { frame?: unknown }).frame;
+		if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+			return null;
+		}
+		const { frame: image } = frame as { frame?: unknown };
+		if (typeof image !== "string" || !image) return null;
+		return frame as PageFrame;
+	} catch {
+		// A missing picture is a smaller sentence, not a broken conversation.
+		return null;
+	}
 }
 
 export type ComputerPageSnapshot = {
-  url: string;
-  title: string;
-  text: string;
-  html: string;
-  revision: number;
-  mode: "bridge" | "html-preview" | "reader";
+	url: string;
+	title: string;
+	text: string;
+	html: string;
+	revision: number;
+	mode: "bridge" | "html-preview" | "reader";
+	proxyUrl?: string;
 };
 
+export function computerProxyEntryUrl(computerId: string, url: string): string {
+	return `/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/proxy?url=${encodeURIComponent(url)}`;
+}
+
 export async function readComputerPageSnapshot(
-  computerId: string,
+	computerId: string,
 ): Promise<ComputerPageSnapshot | null> {
-  try {
-    const body = await apiRequest<ComputerPageSnapshot>(
-      `/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/page`,
-      { method: "GET" },
-    );
-    if (!body || typeof body.url !== "string") return null;
-    return body;
-  } catch {
-    return null;
-  }
+	try {
+		const body = await apiRequest<ComputerPageSnapshot>(
+			`/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/page`,
+			{ method: "GET" },
+		);
+		if (!body || typeof body.url !== "string") return null;
+		return body;
+	} catch {
+		return null;
+	}
 }
 
 export async function navigateComputerUrl(
-  computerId: string,
-  url: string,
+	computerId: string,
+	url: string,
 ): Promise<void> {
-  await apiRequest<unknown>(
-    `/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/navigate`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    },
-  );
+	await apiRequest<unknown>(
+		`/api/v2/organizations/${encodeURIComponent(organizationId())}/computers/${encodeURIComponent(computerId)}/navigate`,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ url }),
+		},
+	);
 }

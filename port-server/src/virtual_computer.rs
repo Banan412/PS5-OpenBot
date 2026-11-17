@@ -5,13 +5,14 @@
 use crate::local_auth::{self, AuthState, Identity};
 use crate::origin;
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Path, Query, State,
+        DefaultBodyLimit, Path, Query, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -32,6 +33,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::{Notify, Semaphore};
 
 pub const SCREEN_WIDTH: u32 = 640;
@@ -41,6 +43,7 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 512;
 const MAX_FETCH_BYTES: usize = 384 * 1024;
+const MAX_PROXY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGE_TEXT_CHARS: usize = 8 * 1024;
 const MAX_PREVIEW_HTML_BYTES: usize = 24 * 1024;
 const MAX_TOOL_OUTPUT_CHARS: usize = 3072;
@@ -50,6 +53,18 @@ const MAX_SHELL_STATEMENTS: usize = 32;
 const MAX_TERMINAL_HISTORY: usize = 32;
 const MAX_IDEMPOTENCY_ENTRIES: usize = 128;
 const MAX_SOCKETS: usize = 16;
+const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+fn generate_proxy_token() -> String {
+    let mut bytes = [0u8; 16];
+    let _ = getrandom::getrandom(&mut bytes);
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Public State & Dispatcher
@@ -110,6 +125,8 @@ struct ControlRequestState {
 
 struct BotComputer {
     bot_id: String,
+    proxy_token: String,
+    allow_all_web_pages: bool,
     cwd: String,
     holder: ControlHolder,
     held_by: Option<String>,
@@ -132,6 +149,7 @@ struct BotComputer {
 #[derive(Clone)]
 struct ScreenSnapshot {
     bot_id: String,
+    proxy_token: String,
     holder: ControlHolder,
     current_url: String,
     page_title: String,
@@ -151,6 +169,8 @@ impl BotComputer {
         terminal_lines.push_back("OpenBot-PS5 Virtual Computer ready.".to_owned());
         Self {
             bot_id,
+            proxy_token: generate_proxy_token(),
+            allow_all_web_pages: allow_all_web_pages_from_env(),
             cwd: String::new(),
             holder: ControlHolder::Bot,
             held_by: None,
@@ -174,6 +194,7 @@ impl BotComputer {
     fn snapshot(&self) -> ScreenSnapshot {
         ScreenSnapshot {
             bot_id: self.bot_id.clone(),
+            proxy_token: self.proxy_token.clone(),
             holder: self.holder,
             current_url: self.current_url.clone(),
             page_title: self.page_title.clone(),
@@ -335,6 +356,9 @@ impl VirtualComputerState {
     ) -> Result<bool, StatusCode> {
         if validate_bot_id(bot_id).is_err() {
             return Ok(false);
+        }
+        if bot_id == "ps5-virtual" {
+            return Ok(true);
         }
         let permit = self
             .inner
@@ -503,6 +527,7 @@ impl VirtualComputerState {
             guard.page_text = fetched.text.clone();
             guard.page_html = fetched.html.clone();
             guard.bridge_png = fetched.bridge_png.clone();
+            guard.allow_all_web_pages = allow_all_web_pages || allow_all_web_pages_from_env();
             guard.screen_revision = guard.screen_revision.saturating_add(1);
             guard.push_terminal_line(&format!("web_fetch {} -> {}", fetched.status, fetched.url));
             guard.screen_notify.notify_waiters();
@@ -2367,6 +2392,93 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
     web_fetch_ssrf_safe_with_policy(raw_url, dns_jobs, allow_all_web_pages_from_env()).await
 }
 
+async fn resolve_validated_addrs(
+    url: &reqwest::Url,
+    dns_jobs: &Arc<Semaphore>,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "missing host".to_owned())?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "unknown port".to_owned())?;
+
+    let permit = dns_jobs
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "too many concurrent DNS lookups".to_owned())?;
+    let resolve_host = host.clone();
+    enum LookupOutcome {
+        Literal(Vec<SocketAddr>),
+        NeedsResolution {
+            local_ips: Vec<Ipv4Addr>,
+            os_result: Result<Vec<SocketAddr>, String>,
+        },
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let local_ips = if allow_private {
+                Vec::new()
+            } else {
+                origin::system_ipv4().map_err(|_| {
+                    "local interface enumeration unavailable; failing closed".to_owned()
+                })?
+            };
+
+            if let Ok(ip) = resolve_host.parse::<IpAddr>() {
+                let forbidden = if allow_private {
+                    is_unspecified_or_sinkhole_ip(ip)
+                } else {
+                    is_forbidden_ip(ip, &local_ips)
+                };
+                if forbidden {
+                    return Err(format!(
+                        "target IP address {ip} for host '{resolve_host}' is forbidden by SSRF policy"
+                    ));
+                }
+                return Ok(LookupOutcome::Literal(vec![SocketAddr::new(ip, port)]));
+            }
+
+            let os_result = (resolve_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>())
+                .map_err(|e| format!("DNS resolution failed for host '{resolve_host}': {e}"));
+            Ok(LookupOutcome::NeedsResolution {
+                local_ips,
+                os_result,
+            })
+        }),
+    )
+    .await
+    .map_err(|_| "DNS resolution timed out".to_owned())?
+    .map_err(|_| "DNS resolution task failed".to_owned())??;
+
+    match outcome {
+        LookupOutcome::Literal(addrs) => Ok(addrs),
+        LookupOutcome::NeedsResolution {
+            local_ips,
+            os_result,
+        } => {
+            let doh_host = host.clone();
+            resolve_host_addrs_with_fallback(
+                &host,
+                os_result,
+                &local_ips,
+                allow_private,
+                move || async move {
+                    resolve_via_doh_endpoints(DOH_ENDPOINTS, &doh_host, port).await
+                },
+            )
+            .await
+        }
+    }
+}
+
 pub(crate) async fn web_fetch_ssrf_safe_with_policy(
     raw_url: &str,
     dns_jobs: Arc<Semaphore>,
@@ -2380,81 +2492,7 @@ pub(crate) async fn web_fetch_ssrf_safe_with_policy(
             .ok_or_else(|| "missing host".to_owned())?
             .trim_matches(['[', ']'])
             .to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| "unknown port".to_owned())?;
-
-        let permit = dns_jobs
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "too many concurrent DNS lookups".to_owned())?;
-        let resolve_host = host.clone();
-        enum LookupOutcome {
-            Literal(Vec<SocketAddr>),
-            NeedsResolution {
-                local_ips: Vec<Ipv4Addr>,
-                os_result: Result<Vec<SocketAddr>, String>,
-            },
-        }
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let local_ips = if allow_private {
-                    Vec::new()
-                } else {
-                    origin::system_ipv4().map_err(|_| {
-                        "local interface enumeration unavailable; failing closed".to_owned()
-                    })?
-                };
-
-                if let Ok(ip) = resolve_host.parse::<IpAddr>() {
-                    let forbidden = if allow_private {
-                        is_unspecified_or_sinkhole_ip(ip)
-                    } else {
-                        is_forbidden_ip(ip, &local_ips)
-                    };
-                    if forbidden {
-                        return Err(format!(
-                            "target IP address {ip} for host '{resolve_host}' is forbidden by SSRF policy"
-                        ));
-                    }
-                    return Ok(LookupOutcome::Literal(vec![SocketAddr::new(ip, port)]));
-                }
-
-                let os_result = (resolve_host.as_str(), port)
-                    .to_socket_addrs()
-                    .map(|iter| iter.collect::<Vec<_>>())
-                    .map_err(|e| format!("DNS resolution failed for host '{resolve_host}': {e}"));
-                Ok(LookupOutcome::NeedsResolution {
-                    local_ips,
-                    os_result,
-                })
-            }),
-        )
-        .await
-        .map_err(|_| "DNS resolution timed out".to_owned())?
-        .map_err(|_| "DNS resolution task failed".to_owned())??;
-
-        let pinned_addrs = match outcome {
-            LookupOutcome::Literal(addrs) => addrs,
-            LookupOutcome::NeedsResolution {
-                local_ips,
-                os_result,
-            } => {
-                let doh_host = host.clone();
-                resolve_host_addrs_with_fallback(
-                    &host,
-                    os_result,
-                    &local_ips,
-                    allow_private,
-                    move || async move {
-                        resolve_via_doh_endpoints(DOH_ENDPOINTS, &doh_host, port).await
-                    },
-                )
-                .await?
-            }
-        };
+        let pinned_addrs = resolve_validated_addrs(&url, &dns_jobs, allow_private).await?;
 
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -2471,7 +2509,9 @@ pub(crate) async fn web_fetch_ssrf_safe_with_policy(
 
         let resp = client
             .get(url.clone())
-            .header(reqwest::header::USER_AGENT, "OpenBot-PS5/1.0")
+            .header(reqwest::header::USER_AGENT, CHROME_USER_AGENT)
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(|e| format!("fetch failed: {e}"))?;
@@ -4042,6 +4082,18 @@ pub fn router(state: VirtualComputerState) -> Router {
             get(get_page_html),
         )
         .route(
+            "/api/v2/organizations/{organization}/computers/{botId}/proxy",
+            get(proxy_entry_redirect),
+        )
+        .route(
+            "/browse/{botId}/{token}/{scheme}/{host}",
+            any(proxy_web_root),
+        )
+        .route(
+            "/browse/{botId}/{token}/{scheme}/{host}/{*rest}",
+            any(proxy_web_rest),
+        )
+        .route(
             "/api/v2/organizations/{organization}/computers/{botId}/files/list",
             post(rest_files_list),
         )
@@ -4140,6 +4192,813 @@ fn json_ok(status: StatusCode, body: String) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    r
+}
+
+fn format_url_authority(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn build_proxy_url(bot_id: &str, token: &str, raw_url: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(raw_url.trim()).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = format_url_authority(&parsed)?;
+    let path = parsed.path();
+    let query = parsed
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let frag = parsed
+        .fragment()
+        .map(|f| format!("#{f}"))
+        .unwrap_or_default();
+    Some(format!(
+        "/browse/{bot_id}/{token}/{scheme}/{authority}{path}{query}{frag}"
+    ))
+}
+
+fn rewrite_proxy_url(raw: &str, base: &reqwest::Url, proxy_prefix: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.starts_with('#') || t.starts_with("/browse/") {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+        || lower.starts_with("about:")
+    {
+        return None;
+    }
+    let resolved = base.join(t).ok()?;
+    let scheme = resolved.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = format_url_authority(&resolved)?;
+    let query = resolved
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let frag = resolved
+        .fragment()
+        .map(|f| format!("#{f}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{proxy_prefix}/{scheme}/{authority}{}{query}{frag}",
+        resolved.path()
+    ))
+}
+
+fn rewrite_srcset_value(raw: &str, base: &reqwest::Url, proxy_prefix: &str) -> String {
+    let mut parts = Vec::new();
+    for item in raw.split(',') {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut ws_split = trimmed.splitn(2, char::is_whitespace);
+        let url_part = ws_split.next().unwrap_or("");
+        let desc_part = ws_split.next().map(str::trim).unwrap_or("");
+        let rewritten = rewrite_proxy_url(url_part, base, proxy_prefix)
+            .unwrap_or_else(|| url_part.to_owned());
+        if desc_part.is_empty() {
+            parts.push(rewritten);
+        } else {
+            parts.push(format!("{rewritten} {desc_part}"));
+        }
+    }
+    parts.join(", ")
+}
+
+fn rewrite_css_urls(css: &str, base: &reqwest::Url, proxy_prefix: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 4 <= bytes.len() && bytes[i..i + 4].eq_ignore_ascii_case(b"url(") {
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if prev_ok {
+                if let Some(close_rel) = bytes[i + 4..].iter().position(|&b| b == b')') {
+                    let close_idx = i + 4 + close_rel;
+                    let inner = css[i + 4..close_idx].trim();
+                    let unquoted = inner
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                        .unwrap_or(inner)
+                        .trim();
+                    if let Some(rewritten) = rewrite_proxy_url(unquoted, base, proxy_prefix) {
+                        out.push_str("url(\"");
+                        out.push_str(&rewritten);
+                        out.push_str("\")");
+                    } else {
+                        out.push_str(&css[i..=close_idx]);
+                    }
+                    i = close_idx + 1;
+                    continue;
+                }
+            }
+        }
+        if let Some(ch) = css[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn escape_attr_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn parse_html_tag_attrs(attr_str: &str) -> Vec<(String, Option<String>)> {
+    let mut attrs = Vec::new();
+    let bytes = attr_str.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+    while pos < len {
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+        let name_start = pos;
+        while pos < len && !bytes[pos].is_ascii_whitespace() && bytes[pos] != b'=' {
+            pos += 1;
+        }
+        let name = attr_str[name_start..pos].to_ascii_lowercase();
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let val = if pos < len && bytes[pos] == b'=' {
+            pos += 1;
+            while pos < len && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= len {
+                Some(String::new())
+            } else if bytes[pos] == b'"' || bytes[pos] == b'\'' {
+                let q = bytes[pos];
+                pos += 1;
+                let v_start = pos;
+                while pos < len && bytes[pos] != q {
+                    pos += 1;
+                }
+                let raw = decode_entities(&attr_str[v_start..pos]);
+                if pos < len {
+                    pos += 1;
+                }
+                Some(raw)
+            } else {
+                let v_start = pos;
+                while pos < len && !bytes[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+                Some(decode_entities(&attr_str[v_start..pos]))
+            }
+        } else {
+            None
+        };
+        if !name.is_empty() && name != "/" {
+            attrs.push((name, val));
+        }
+    }
+    attrs
+}
+
+fn build_proxy_shim_script(proxy_prefix: &str, base: &reqwest::Url, bot_id: &str) -> String {
+    let scheme = base.scheme();
+    let authority = format_url_authority(base).unwrap_or_default();
+    let real_url = base.as_str();
+    let js_lit = |v: &str| {
+        serde_json::to_string(v)
+            .unwrap_or_else(|_| "\"\"".to_owned())
+            .replace("</", "<\\/")
+    };
+    let p_lit = js_lit(proxy_prefix);
+    let s_lit = js_lit(scheme);
+    let h_lit = js_lit(&authority);
+    let r_lit = js_lit(real_url);
+    let b_lit = js_lit(bot_id);
+    format!(
+        "<script data-openbot-proxy=\"1\">(function(){{\
+var P={p_lit},S={s_lit},H={h_lit},curReal={r_lit},BID={b_lit};\
+function toReal(u){{if(!u||typeof u!==\"string\")return curReal;\
+if(u.indexOf(P+\"/\")===0){{var r=u.slice(P.length+1),i=r.indexOf(\"/\");if(i>0)return r.slice(0,i)+\"://\"+r.slice(i+1);}}\
+try{{if(location.origin&&u.indexOf(location.origin+P+\"/\")===0){{var r2=u.slice((location.origin+P).length+1),j=r2.indexOf(\"/\");if(j>0)return r2.slice(0,j)+\"://\"+r2.slice(j+1);}}\
+return new URL(u,curReal).href;}}catch(_){{return curReal;}}}}\
+function toProxy(u){{if(typeof u!==\"string\")return u;var t=u.trim();\
+if(!t||t[0]===\"#\"||/^(?:data:|blob:|javascript:|mailto:|tel:|about:)/i.test(t)||t.indexOf(P+\"/\")===0)return u;\
+try{{if(location.origin&&t.indexOf(location.origin+P+\"/\")===0)return t.slice(location.origin.length);\
+var a=new URL(t,curReal);if(a.protocol!==\"http:\"&&a.protocol!==\"https:\")return u;\
+return P+\"/\"+a.protocol.slice(0,-1)+\"/\"+a.host+a.pathname+a.search+a.hash;}}catch(_){{return u;}}}}\
+function notify(u){{if(u)curReal=toReal(u);\
+try{{window.parent.postMessage({{type:\"openbot:browser-nav\",botId:BID,url:curReal,title:document.title||\"\"}},\"*\");}}catch(_){{}}}}\
+var of=window.fetch;if(of){{window.fetch=function(inp,ini){{\
+if(typeof inp===\"string\")return of.call(this,toProxy(inp),ini);\
+if(inp&&typeof inp===\"object\"&&inp.url){{var px=toProxy(inp.url);if(px!==inp.url){{try{{inp=new Request(px,inp);}}catch(_){{}}}}}}\
+return of.call(this,inp,ini);}};}}\
+var ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){{\
+var a=Array.prototype.slice.call(arguments);if(typeof u===\"string\")a[1]=toProxy(u);return ox.apply(this,a);}};\
+if(navigator.sendBeacon){{var ob=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){{return ob(toProxy(u),d);}};}}\
+var oo=window.open;window.open=function(u,tg,ft){{var px=typeof u===\"string\"?toProxy(u):u;if(!tg||tg===\"_top\"||tg===\"_parent\")tg=\"_self\";return oo?oo.call(this,px,tg,ft):null;}};\
+try{{var hp=history.pushState,hr=history.replaceState;\
+history.pushState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return hp.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};\
+history.replaceState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return hr.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};\
+}}catch(_){{}}\
+var osa=Element.prototype.setAttribute;Element.prototype.setAttribute=function(k,v){{\
+var kl=String(k).toLowerCase();\
+if((kl===\"src\"||kl===\"href\"||kl===\"action\"||kl===\"poster\")&&typeof v===\"string\")v=toProxy(v);\
+else if(kl===\"target\"&&(v===\"_top\"||v===\"_parent\"))v=\"_self\";\
+return osa.call(this,k,v);}};\
+function wp(Pr,pr){{try{{var d=Pr&&Object.getOwnPropertyDescriptor(Pr,pr);\
+if(d&&d.set&&d.get){{Object.defineProperty(Pr,pr,{{configurable:true,enumerable:true,get:function(){{return d.get.call(this);}},set:function(v){{return d.set.call(this,typeof v===\"string\"?toProxy(v):v);}}}});}}}}catch(_){{}}}}\
+wp(typeof HTMLScriptElement!==\"undefined\"&&HTMLScriptElement.prototype,\"src\");\
+wp(typeof HTMLImageElement!==\"undefined\"&&HTMLImageElement.prototype,\"src\");\
+wp(typeof HTMLLinkElement!==\"undefined\"&&HTMLLinkElement.prototype,\"href\");\
+wp(typeof HTMLAnchorElement!==\"undefined\"&&HTMLAnchorElement.prototype,\"href\");\
+wp(typeof HTMLFormElement!==\"undefined\"&&HTMLFormElement.prototype,\"action\");\
+wp(typeof HTMLMediaElement!==\"undefined\"&&HTMLMediaElement.prototype,\"src\");\
+wp(typeof HTMLSourceElement!==\"undefined\"&&HTMLSourceElement.prototype,\"src\");\
+wp(typeof HTMLIFrameElement!==\"undefined\"&&HTMLIFrameElement.prototype,\"src\");\
+document.addEventListener(\"click\",function(e){{var a=e.target&&e.target.closest?e.target.closest(\"a[href]\"):null;if(!a)return;\
+var h=a.getAttribute(\"href\");if(h)a.setAttribute(\"href\",h);var t=a.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\")a.setAttribute(\"target\",\"_self\");}},true);\
+document.addEventListener(\"submit\",function(e){{var f=e.target;if(!f||f.tagName!==\"FORM\")return;\
+var ac=f.getAttribute(\"action\")||curReal;f.setAttribute(\"action\",ac);var t=f.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\")f.setAttribute(\"target\",\"_self\");}},true);\
+window.addEventListener(\"DOMContentLoaded\",function(){{notify(curReal);}});\
+window.addEventListener(\"load\",function(){{notify(curReal);}});\
+window.addEventListener(\"popstate\",function(){{notify(location.href);}});\
+window.addEventListener(\"hashchange\",function(){{notify(location.href);}});\
+}})();</script>"
+    )
+}
+
+fn find_tag_close_quote_aware(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'>' {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_ascii_ci_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if start >= hay.len() {
+        return None;
+    }
+    find_ascii_ci(&hay[start..], needle).map(|rel| start + rel)
+}
+
+fn rewrite_html_for_proxy(
+    html: &str,
+    initial_base: &reqwest::Url,
+    proxy_prefix: &str,
+    bot_id: &str,
+) -> String {
+    let mut base_url = initial_base.clone();
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(html.len() + 4096);
+    let mut shim_injected = false;
+    let mut pos = 0usize;
+
+    while pos < len {
+        let Some(rel_lt) = bytes[pos..].iter().position(|&b| b == b'<') else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let lt = pos + rel_lt;
+        if lt > pos {
+            out.push_str(&html[pos..lt]);
+        }
+        if lt + 1 >= len {
+            out.push_str(&html[lt..]);
+            break;
+        }
+        let after = &bytes[lt + 1..];
+        if after.starts_with(b"!--") {
+            if let Some(end_rel) = html[lt + 4..].find("-->") {
+                let end = lt + 4 + end_rel + 3;
+                out.push_str(&html[lt..end]);
+                pos = end;
+            } else {
+                out.push_str(&html[lt..]);
+                break;
+            }
+            continue;
+        }
+        if after[0] == b'!' || after[0] == b'?' {
+            if let Some(gt) = find_tag_close_quote_aware(bytes, lt + 1) {
+                out.push_str(&html[lt..=gt]);
+                pos = gt + 1;
+            } else {
+                out.push_str(&html[lt..]);
+                break;
+            }
+            continue;
+        }
+        let Some(gt) = find_tag_close_quote_aware(bytes, lt + 1) else {
+            out.push_str(&html[lt..]);
+            break;
+        };
+        let raw_inside = &html[lt + 1..gt];
+        let trimmed_inside = raw_inside.trim();
+        if trimmed_inside.starts_with('/') {
+            out.push_str(&html[lt..=gt]);
+            pos = gt + 1;
+            continue;
+        }
+        let self_closing = trimmed_inside.ends_with('/');
+        let without_slash = if self_closing {
+            trimmed_inside[..trimmed_inside.len() - 1].trim_end()
+        } else {
+            trimmed_inside
+        };
+        let name_end = without_slash
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(without_slash.len());
+        let tag_name = without_slash[..name_end].to_ascii_lowercase();
+        let attr_str = &without_slash[name_end..];
+
+        if tag_name == "base" {
+            for (k, v) in parse_html_tag_attrs(attr_str) {
+                if k == "href" {
+                    if let Some(h) = v {
+                        if let Ok(next_base) = base_url.join(h.trim()) {
+                            if next_base.scheme() == "http" || next_base.scheme() == "https" {
+                                base_url = next_base;
+                            }
+                        }
+                    }
+                }
+            }
+            pos = gt + 1;
+            continue;
+        }
+
+        if tag_name == "meta" {
+            let attrs = parse_html_tag_attrs(attr_str);
+            let is_csp_or_xfo = attrs.iter().any(|(k, v)| {
+                k == "http-equiv"
+                    && v.as_deref().is_some_and(|hv| {
+                        let low = hv.trim().to_ascii_lowercase();
+                        low == "content-security-policy"
+                            || low == "content-security-policy-report-only"
+                            || low == "x-frame-options"
+                    })
+            });
+            if is_csp_or_xfo {
+                pos = gt + 1;
+                continue;
+            }
+        }
+
+        let attrs = parse_html_tag_attrs(attr_str);
+        let is_refresh = tag_name == "meta"
+            && attrs.iter().any(|(k, v)| {
+                k == "http-equiv"
+                    && v.as_deref()
+                        .is_some_and(|hv| hv.trim().eq_ignore_ascii_case("refresh"))
+            });
+
+        out.push('<');
+        out.push_str(&tag_name);
+        for (k, v_opt) in attrs {
+            if k == "integrity" || k == "nonce" {
+                continue;
+            }
+            match v_opt {
+                None => {
+                    out.push(' ');
+                    out.push_str(&k);
+                }
+                Some(v) => {
+                    let final_v = if is_refresh && k == "content" {
+                        if let Some(idx) = v.to_ascii_lowercase().find("url=") {
+                            let prefix = &v[..idx + 4];
+                            let raw_u = v[idx + 4..].trim().trim_matches(['"', '\'']);
+                            rewrite_proxy_url(raw_u, &base_url, proxy_prefix)
+                                .map(|ru| format!("{prefix}{ru}"))
+                                .unwrap_or(v)
+                        } else {
+                            v
+                        }
+                    } else if matches!(k.as_str(), "href" | "src" | "action" | "poster" | "data-src" | "data") {
+                        rewrite_proxy_url(&v, &base_url, proxy_prefix).unwrap_or(v)
+                    } else if k == "srcset" {
+                        rewrite_srcset_value(&v, &base_url, proxy_prefix)
+                    } else if k == "target" && matches!(v.trim(), "_top" | "_parent") {
+                        "_self".to_owned()
+                    } else {
+                        v
+                    };
+                    out.push(' ');
+                    out.push_str(&k);
+                    out.push_str("=\"");
+                    out.push_str(&escape_attr_value(&final_v));
+                    out.push('"');
+                }
+            }
+        }
+        if self_closing {
+            out.push('/');
+        }
+        out.push('>');
+        pos = gt + 1;
+
+        if !shim_injected && tag_name == "head" {
+            out.push_str(&build_proxy_shim_script(proxy_prefix, &base_url, bot_id));
+            shim_injected = true;
+        }
+
+        if tag_name == "script" && !self_closing {
+            if let Some(close_start) = find_ascii_ci_from(bytes, b"</script", pos) {
+                let close_gt = find_tag_close_quote_aware(bytes, close_start).unwrap_or(len - 1);
+                out.push_str(&html[pos..=close_gt]);
+                pos = close_gt + 1;
+            }
+        } else if tag_name == "style" && !self_closing {
+            if let Some(close_start) = find_ascii_ci_from(bytes, b"</style", pos) {
+                let close_gt = find_tag_close_quote_aware(bytes, close_start).unwrap_or(len - 1);
+                let css_inner = &html[pos..close_start];
+                out.push_str(&rewrite_css_urls(css_inner, &base_url, proxy_prefix));
+                out.push_str(&html[close_start..=close_gt]);
+                pos = close_gt + 1;
+            }
+        }
+    }
+
+    if !shim_injected {
+        let shim = build_proxy_shim_script(proxy_prefix, &base_url, bot_id);
+        return format!("{shim}{out}");
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct ProxyEntryQuery {
+    url: Option<String>,
+}
+
+async fn proxy_entry_redirect(
+    State(s): State<VirtualComputerState>,
+    Path((org, bot_id)): Path<(String, String)>,
+    Query(q): Query<ProxyEntryQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authorize_computer(&s, &headers, &org, &bot_id, false).await {
+        return e;
+    }
+    let Some(raw_url) = q.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+        return problem(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "Missing url query parameter.");
+    };
+    let allow_all = true;
+    let parsed = match validate_fetch_url_with_policy(raw_url, allow_all) {
+        Ok(u) => u,
+        Err(msg) => return problem(StatusCode::BAD_REQUEST, "INVALID_URL", &msg),
+    };
+    let Ok(handle) = s.bot_handle(&bot_id) else {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", "Unavailable.");
+    };
+    let proxy_token = {
+        let Ok(mut guard) = handle.lock() else {
+            return problem(StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", "Unavailable.");
+        };
+        guard.allow_all_web_pages = true;
+        guard.proxy_token.clone()
+    };
+    let Some(location) = build_proxy_url(&bot_id, &proxy_token, parsed.as_str()) else {
+        return problem(StatusCode::BAD_REQUEST, "INVALID_URL", "Unsupported URL.");
+    };
+    let mut r = Response::new(Body::empty());
+    *r.status_mut() = StatusCode::FOUND;
+    if let Ok(hv) = HeaderValue::from_str(&location) {
+        r.headers_mut().insert(header::LOCATION, hv);
+    }
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    r
+}
+
+async fn proxy_web_root(
+    State(s): State<VirtualComputerState>,
+    Path((bot_id, token, scheme, host)): Path<(String, String, String, String)>,
+    req: Request,
+) -> Response {
+    handle_proxy_web(s, bot_id, token, scheme, host, req).await
+}
+
+async fn proxy_web_rest(
+    State(s): State<VirtualComputerState>,
+    Path((bot_id, token, scheme, host, _rest)): Path<(String, String, String, String, String)>,
+    req: Request,
+) -> Response {
+    handle_proxy_web(s, bot_id, token, scheme, host, req).await
+}
+
+async fn handle_proxy_web(
+    s: VirtualComputerState,
+    bot_id: String,
+    token: String,
+    scheme: String,
+    host: String,
+    req: Request,
+) -> Response {
+    if validate_bot_id(&bot_id).is_err() || (scheme != "http" && scheme != "https") {
+        return problem(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "Invalid proxy target.");
+    }
+    let handle = match s.bot_handle(&bot_id) {
+        Ok(h) => h,
+        Err(_) => return problem(StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", "Unavailable."),
+    };
+    let (expected_token, allow_private) = {
+        let Ok(guard) = handle.lock() else {
+            return problem(StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", "Unavailable.");
+        };
+        (
+            guard.proxy_token.clone(),
+            guard.allow_all_web_pages || allow_all_web_pages_from_env(),
+        )
+    };
+    let token_ok = token.len() == expected_token.len()
+        && bool::from(token.as_bytes().ct_eq(expected_token.as_bytes()));
+    if !token_ok {
+        return problem(StatusCode::FORBIDDEN, "FORBIDDEN", "Invalid proxy token.");
+    }
+
+    if req.method() == Method::OPTIONS {
+        let mut r = Response::new(Body::empty());
+        *r.status_mut() = StatusCode::NO_CONTENT;
+        r.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        r.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD, OPTIONS"),
+        );
+        r.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+        return r;
+    }
+
+    let prefix_head = format!("/browse/{bot_id}/{token}/{scheme}/{host}");
+    let uri_path = req.uri().path().to_owned();
+    let suffix_path = uri_path
+        .strip_prefix(&prefix_head)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
+    let query_part = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target_raw = format!("{scheme}://{host}{suffix_path}{query_part}");
+    let url = match validate_fetch_url_with_policy(&target_raw, allow_private) {
+        Ok(u) => u,
+        Err(msg) => return problem(StatusCode::BAD_REQUEST, "INVALID_URL", &msg),
+    };
+    let target_host = url
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let pinned_addrs = match resolve_validated_addrs(&url, &s.inner.dns_jobs, allow_private).await {
+        Ok(a) => a,
+        Err(msg) => return problem(StatusCode::BAD_GATEWAY, "UPSTREAM_RESOLUTION_FAILED", &msg),
+    };
+
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(20))
+        .pool_max_idle_per_host(0)
+        .redirect(Policy::none())
+        .no_proxy();
+    if target_host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(&target_host, &pinned_addrs);
+    }
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => return problem(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", &format!("{e}")),
+    };
+
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return problem(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED", "Unsupported method."),
+    };
+    let incoming_ct = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let incoming_accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return problem(StatusCode::PAYLOAD_TOO_LARGE, "BODY_TOO_LARGE", "Request body too large."),
+    };
+
+    let mut req_builder = client
+        .request(method, url.clone())
+        .header(reqwest::header::USER_AGENT, CHROME_USER_AGENT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .header(
+            reqwest::header::REFERER,
+            format!("{scheme}://{host}/"),
+        );
+    if let Some(ct) = incoming_ct {
+        req_builder = req_builder.header(reqwest::header::CONTENT_TYPE, ct);
+    }
+    if let Some(acc) = incoming_accept {
+        req_builder = req_builder.header(reqwest::header::ACCEPT, acc);
+    }
+    if !body_bytes.is_empty() {
+        req_builder = req_builder.body(body_bytes.to_vec());
+    }
+
+    let mut resp = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return problem(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_FETCH_FAILED",
+                &format!("Failed to load page: {e}"),
+            );
+        }
+    };
+
+    let proxy_prefix = format!("/browse/{bot_id}/{token}");
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_headers = resp.headers().clone();
+
+    if status.is_redirection() {
+        if let Some(loc_val) = resp_headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Ok(next_url) = url.join(loc_val) {
+                if validate_fetch_url_with_policy(next_url.as_str(), allow_private).is_ok() {
+                    if let Some(rewritten_loc) = build_proxy_url(&bot_id, &token, next_url.as_str()) {
+                        let mut r = Response::new(Body::empty());
+                        *r.status_mut() = status;
+                        if let Ok(hv) = HeaderValue::from_str(&rewritten_loc) {
+                            r.headers_mut().insert(header::LOCATION, hv);
+                        }
+                        r.headers_mut().insert(
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("private, no-store"),
+                        );
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+
+    let content_type = resp_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_html = mime == "text/html" || mime == "application/xhtml+xml";
+    let is_css = mime == "text/css";
+
+    let mut raw = Vec::with_capacity(16 * 1024);
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let avail = MAX_PROXY_BYTES.saturating_sub(raw.len());
+        if avail == 0 {
+            break;
+        }
+        let take = chunk.len().min(avail);
+        raw.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+
+    let final_body: Vec<u8> = if is_html {
+        let text = String::from_utf8_lossy(&raw);
+        rewrite_html_for_proxy(&text, &url, &proxy_prefix, &bot_id).into_bytes()
+    } else if is_css {
+        let text = String::from_utf8_lossy(&raw);
+        rewrite_css_urls(&text, &url, &proxy_prefix).into_bytes()
+    } else {
+        raw
+    };
+
+    let mut r = Response::new(Body::from(final_body));
+    *r.status_mut() = status;
+
+    if is_html {
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+    } else if !content_type.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(&content_type) {
+            r.headers_mut().insert(header::CONTENT_TYPE, hv);
+        }
+    }
+
+    let scoped_cookie_path = format!("{proxy_prefix}/{scheme}/{host}/");
+    for cookie_hdr in resp_headers.get_all(reqwest::header::SET_COOKIE) {
+        if let Ok(raw_cookie) = cookie_hdr.to_str() {
+            let name_lower = raw_cookie
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if name_lower == "openbot_session" || name_lower.is_empty() {
+                continue;
+            }
+            let mut kept_parts = Vec::new();
+            for (idx, part) in raw_cookie.split(';').enumerate() {
+                let pt = part.trim();
+                if idx == 0 {
+                    kept_parts.push(pt.to_owned());
+                    continue;
+                }
+                let p_low = pt.to_ascii_lowercase();
+                if p_low == "secure"
+                    || p_low.starts_with("domain=")
+                    || p_low.starts_with("path=")
+                    || p_low.starts_with("samesite=")
+                {
+                    continue;
+                }
+                kept_parts.push(pt.to_owned());
+            }
+            kept_parts.push(format!("Path={scoped_cookie_path}"));
+            if let Ok(hv) = HeaderValue::from_str(&kept_parts.join("; ")) {
+                r.headers_mut().append(header::SET_COOKIE, hv);
+            }
+        }
+    }
+
+    r.headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
+    r.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    r.headers_mut()
+        .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+    r.headers_mut()
+        .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if is_html {
+        r.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    }
     r
 }
 
@@ -4868,26 +5727,30 @@ async fn get_page_json(
         };
         guard.snapshot()
     };
+    let proxy_url = build_proxy_url(&snap.bot_id, &snap.proxy_token, &snap.current_url);
     let mode = if snap.bridge_png.is_some() {
         "bridge"
-    } else if !snap.page_html.is_empty() {
+    } else if proxy_url.is_some() || !snap.page_html.is_empty() {
         "html-preview"
     } else {
         "reader"
     };
-    json_ok(
-        StatusCode::OK,
-        json!({
-            "ok": true,
-            "url": snap.current_url,
-            "title": snap.page_title,
-            "text": snap.page_text,
-            "html": snap.page_html,
-            "revision": snap.revision,
-            "mode": mode,
-        })
-        .to_string(),
-    )
+    let mut payload = json!({
+        "ok": true,
+        "url": snap.current_url,
+        "title": snap.page_title,
+        "text": snap.page_text,
+        "html": snap.page_html,
+        "revision": snap.revision,
+        "mode": mode,
+    });
+    if let Some(pu) = proxy_url {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("proxyUrl".to_owned(), Value::String(pu));
+    }
+    json_ok(StatusCode::OK, payload.to_string())
 }
 
 async fn get_page_html(
@@ -5604,6 +6467,7 @@ mod tests {
     fn png_and_jpeg_encoders_emit_valid_magic_and_frame_first_key() {
         let snap = ScreenSnapshot {
             bot_id: "bot_test".to_owned(),
+            proxy_token: String::new(),
             holder: ControlHolder::Bot,
             current_url: "https://example.com".to_owned(),
             page_title: "Example".to_owned(),
@@ -6519,5 +7383,166 @@ mod tests {
         assert!(allowed.text.contains("Hello LAN"));
 
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn live_web_proxy_rewrites_html_strips_framing_headers_and_protects_session() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/home",
+            get(|| async {
+                let html = concat!(
+                    "<!doctype html><html><head>",
+                    "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\">",
+                    "<style>body{background:url(/bg.png)}</style>",
+                    "<link rel=\"stylesheet\" href=\"/app.css\" integrity=\"sha256-abc\">",
+                    "<script src=\"/app.js\" integrity=\"sha256-xyz\">if(1<2){}</script>",
+                    "</head><body>",
+                    "<a href=\"/search?q=1\" target=\"_top\">Search</a>",
+                    "<form action=\"/submit\" method=\"post\"><input name=\"q\"></form>",
+                    "<img src=\"//cdn.test/logo.png\" srcset=\"/a.png 1x, /b.png 2x\">",
+                    "</body></html>"
+                );
+                let mut r = Response::new(Body::from(html));
+                *r.status_mut() = StatusCode::OK;
+                r.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/html; charset=utf-8"),
+                );
+                r.headers_mut()
+                    .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+                r.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static("frame-ancestors 'none'"),
+                );
+                r.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_static("openbot_session=hijack; Path=/; Secure"),
+                );
+                r.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_static("pref=dark; Domain=.example.com; Path=/; Secure"),
+                );
+                r
+            }),
+        );
+        let upstream_srv = tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let mut rnd = [0u8; 8];
+        getrandom::getrandom(&mut rnd).unwrap();
+        let db_path = std::env::temp_dir().join(format!("openbot-vc-proxy-{:x}.db", u64::from_le_bytes(rnd)));
+        let ws_root = temp_workspace("proxy");
+        let db = Arc::new(Storage::open(&db_path).unwrap());
+
+        let origin = "http://127.0.0.1:3010";
+        let host = "127.0.0.1:3010";
+        let auth = AuthState::new(
+            db.clone(),
+            origin,
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let vc = VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let app = local_auth::router(auth).merge(router(vc.clone()));
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("origin", origin)
+            .header("host", host)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#,
+            ))
+            .unwrap();
+        let setup_resp = app.clone().oneshot(setup).await.unwrap();
+        assert_eq!(setup_resp.status(), StatusCode::NO_CONTENT);
+        let cookie = setup_resp.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        {
+            let handle = vc.bot_handle("ps5-virtual").unwrap();
+            let mut guard = handle.lock().unwrap();
+            guard.allow_all_web_pages = true;
+            guard.current_url = format!("http://{upstream_addr}/home");
+        }
+
+        let page_req = Request::builder()
+            .uri("/api/v2/organizations/default/computers/ps5-virtual/page")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let page_resp = app.clone().oneshot(page_req).await.unwrap();
+        assert_eq!(page_resp.status(), StatusCode::OK);
+        let page_json: Value = serde_json::from_slice(
+            &to_bytes(page_resp.into_body(), 16 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        let proxy_url = page_json["proxyUrl"].as_str().unwrap().to_owned();
+        assert!(proxy_url.starts_with("/browse/ps5-virtual/"));
+        assert!(proxy_url.ends_with(&format!("/http/{upstream_addr}/home")));
+
+        let bad_tok_req = Request::builder()
+            .uri(&format!("/browse/ps5-virtual/00000000000000000000000000000000/http/{upstream_addr}/home"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad_tok_req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let proxied_resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&proxy_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(proxied_resp.status(), StatusCode::OK);
+        assert_eq!(
+            proxied_resp.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "SAMEORIGIN"
+        );
+        assert!(proxied_resp.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+        let set_cookies: Vec<String> = proxied_resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        assert!(!set_cookies.iter().any(|c| c.contains("openbot_session")));
+        assert!(set_cookies.iter().any(|c| c.contains("pref=dark") && !c.contains("Secure")));
+
+        let html = String::from_utf8(
+            to_bytes(proxied_resp.into_body(), 64 * 1024).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("data-openbot-proxy=\"1\""));
+        assert!(html.contains(&format!("/http/{upstream_addr}/search?q=1\"")));
+        assert!(html.contains(&format!("/http/{upstream_addr}/submit\"")));
+        assert!(html.contains(&format!("/http/{upstream_addr}/bg.png\"")));
+        assert!(html.contains("/http/cdn.test/logo.png\""));
+        assert!(html.contains("target=\"_self\""));
+        assert!(!html.contains("integrity=\"sha256-"));
+        assert!(!html.contains("script-src 'none'"));
+        assert!(html.contains("if(1<2){}"));
+
+        // Also test proxy_entry_redirect (/proxy?url=...)
+        let entry_req = Request::builder()
+            .uri(&format!(
+                "/api/v2/organizations/default/computers/ps5-virtual/proxy?url=http%3A%2F%2F{upstream_addr}%2Fhome"
+            ))
+            .header("host", host)
+            .header("origin", origin)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let entry_resp = app.clone().oneshot(entry_req).await.unwrap();
+        assert_eq!(entry_resp.status(), StatusCode::FOUND);
+        assert_eq!(entry_resp.headers().get(header::LOCATION).unwrap(), proxy_url.as_str());
+
+        upstream_srv.abort();
+        drop(db);
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir_all(ws_root);
     }
 }

@@ -142,6 +142,22 @@ pub fn router(state: AuthState) -> Router {
             post(open_person_browser),
         )
         .route(
+            "/api/v2/organizations/{organization}/people/{person}/browser/tabs",
+            post(person_browser_tabs),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/people/{person}/browser/navigate",
+            post(person_browser_navigate),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/people/{person}/browser/recording",
+            post(person_browser_recording),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/people/{person}/browser/clear",
+            post(person_browser_clear),
+        )
+        .route(
             "/api/v2/organizations/{organization}/people/{person}/recorder-connections/{connection_id}",
             delete(delete_recorder_connection),
         )
@@ -602,7 +618,7 @@ fn ensure_kv_table(c: &rusqlite::Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn load_kv(c: &rusqlite::Connection, scope: &str) -> Result<Option<Value>, StorageError> {
+pub(crate) fn load_kv(c: &rusqlite::Connection, scope: &str) -> Result<Option<Value>, StorageError> {
     let res = c
         .query_row(
             "SELECT value FROM port_compat_kv WHERE scope=?1",
@@ -620,7 +636,7 @@ fn load_kv(c: &rusqlite::Connection, scope: &str) -> Result<Option<Value>, Stora
     }
 }
 
-fn save_kv(c: &rusqlite::Connection, scope: &str, value: &Value) -> Result<(), StorageError> {
+pub(crate) fn save_kv(c: &rusqlite::Connection, scope: &str, value: &Value) -> Result<(), StorageError> {
     ensure_kv_table(c)?;
     let now = epoch()?;
     let raw = serde_json::to_string(value)
@@ -1782,6 +1798,135 @@ async fn delete_recorder_connection(
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Clone, serde::Serialize, Deserialize)]
+struct PersonBrowserTabState {
+    id: String,
+    url: String,
+    title: String,
+    active: bool,
+    #[serde(default)]
+    history: Vec<String>,
+    #[serde(default)]
+    history_idx: usize,
+}
+
+#[derive(Clone, serde::Serialize, Deserialize, Default)]
+struct PersonBrowserStored {
+    open: bool,
+    #[serde(default)]
+    next_tab_seq: u64,
+    #[serde(default)]
+    tabs: Vec<PersonBrowserTabState>,
+    #[serde(default)]
+    recording_phase: String,
+    #[serde(default)]
+    recording_id: Option<String>,
+    #[serde(default)]
+    recording_title: Option<String>,
+    #[serde(default)]
+    recording_started_at: Option<u64>,
+    #[serde(default)]
+    last_stopped: Option<Value>,
+}
+
+fn ensure_default_person_tab(state: &mut PersonBrowserStored) {
+    if state.tabs.is_empty() {
+        state.next_tab_seq = state.next_tab_seq.max(1) + 1;
+        state.tabs.push(PersonBrowserTabState {
+            id: "tab-1".to_owned(),
+            url: "about:blank".to_owned(),
+            title: "New Tab".to_owned(),
+            active: true,
+            history: vec!["about:blank".to_owned()],
+            history_idx: 0,
+        });
+    } else if !state.tabs.iter().any(|t| t.active) {
+        if let Some(first) = state.tabs.first_mut() {
+            first.active = true;
+        }
+    }
+}
+
+pub(crate) fn person_browser_api_json(raw: Option<&Value>, user_id: &str) -> Value {
+    let stored: PersonBrowserStored = raw
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let tabs: Vec<Value> = if stored.open {
+        stored
+            .tabs
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "url": t.url,
+                    "title": t.title,
+                    "active": t.active,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut out = json!({
+        "open": stored.open,
+        "tabs": tabs,
+        "available": true,
+        "computerId": "ps5-virtual",
+        "window": "screen",
+        "shows": "screen",
+        "narration": "own",
+    });
+    if stored.open {
+        out.as_object_mut()
+            .unwrap()
+            .insert("browser".to_owned(), json!("chromium"));
+        let phase = if stored.recording_phase.is_empty() {
+            "idle"
+        } else {
+            stored.recording_phase.as_str()
+        };
+        let mut rec = json!({
+            "connected": true,
+            "userId": user_id,
+            "phase": phase,
+            "actions": 0,
+            "narration": "own",
+        });
+        if let Some(ref rid) = stored.recording_id {
+            rec["recordingId"] = json!(rid);
+        }
+        if let Some(ref rt) = stored.recording_title {
+            rec["title"] = json!(rt);
+        }
+        if let Some(rs) = stored.recording_started_at {
+            rec["startedAt"] = json!(rs);
+        }
+        if let Some(ref ls) = stored.last_stopped {
+            rec["lastStopped"] = ls.clone();
+        }
+        out.as_object_mut().unwrap().insert("recorder".to_owned(), rec);
+    }
+    out
+}
+
+fn person_browser_kv_key(actor: &Identity) -> String {
+    format!("person_browser:{}:{}", actor.organization, actor.id)
+}
+
+fn person_recordings_kv_key(actor: &Identity) -> String {
+    format!("person_recordings:{}:{}", actor.organization, actor.id)
+}
+
+fn derive_url_title(url: &str) -> String {
+    if url == "about:blank" || url.is_empty() {
+        return "New Tab".to_owned();
+    }
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned())
+}
+
 async fn open_person_browser(
     State(s): State<AuthState>,
     Path((org, person)): Path<(String, String)>,
@@ -1794,6 +1939,20 @@ async fn open_person_browser(
     if let Err(e) = require_person(&actor, &person) {
         return e;
     }
+    let key = person_browser_kv_key(&actor);
+    if run_db(&s, move |c| {
+        let mut st: PersonBrowserStored = load_kv(c, &key)?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        st.open = true;
+        ensure_default_person_tab(&mut st);
+        save_kv(c, &key, &serde_json::to_value(&st).unwrap_or(Value::Null))
+    })
+    .await
+    .is_err()
+    {
+        return internal();
+    }
     respond_json(
         StatusCode::OK,
         json!({
@@ -1804,6 +1963,304 @@ async fn open_person_browser(
             "narration": "own"
         }),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonBrowserTabsInput {
+    action: String,
+    tab_id: Option<String>,
+    url: Option<String>,
+}
+
+async fn person_browser_tabs(
+    State(s): State<AuthState>,
+    Path((org, person)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(input): Json<PersonBrowserTabsInput>,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_person(&actor, &person) {
+        return e;
+    }
+    let key = person_browser_kv_key(&actor);
+    let user_id = actor.id.clone();
+    match run_db(&s, move |c| {
+        let mut st: PersonBrowserStored = load_kv(c, &key)?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        st.open = true;
+        ensure_default_person_tab(&mut st);
+        match input.action.as_str() {
+            "new" => {
+                for t in &mut st.tabs {
+                    t.active = false;
+                }
+                st.next_tab_seq = st.next_tab_seq.max(st.tabs.len() as u64 + 1) + 1;
+                let u = input
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("about:blank")
+                    .to_owned();
+                let title = derive_url_title(&u);
+                st.tabs.push(PersonBrowserTabState {
+                    id: format!("tab-{}", st.next_tab_seq),
+                    url: u.clone(),
+                    title,
+                    active: true,
+                    history: vec![u],
+                    history_idx: 0,
+                });
+            }
+            "activate" => {
+                if let Some(tid) = input.tab_id.as_deref() {
+                    if st.tabs.iter().any(|t| t.id == tid) {
+                        for t in &mut st.tabs {
+                            t.active = t.id == tid;
+                        }
+                    }
+                }
+            }
+            "close" => {
+                if let Some(tid) = input.tab_id.as_deref() {
+                    let was_active = st.tabs.iter().any(|t| t.id == tid && t.active);
+                    st.tabs.retain(|t| t.id != tid);
+                    ensure_default_person_tab(&mut st);
+                    if was_active {
+                        if let Some(last) = st.tabs.last_mut() {
+                            last.active = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        save_kv(c, &key, &val)?;
+        Ok(person_browser_api_json(Some(&val), &user_id))
+    })
+    .await
+    {
+        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Err(_) => internal(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PersonBrowserNavigateInput {
+    url: Option<String>,
+    action: Option<String>,
+}
+
+async fn person_browser_navigate(
+    State(s): State<AuthState>,
+    Path((org, person)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(input): Json<PersonBrowserNavigateInput>,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_person(&actor, &person) {
+        return e;
+    }
+    let key = person_browser_kv_key(&actor);
+    let user_id = actor.id.clone();
+    match run_db(&s, move |c| {
+        let mut st: PersonBrowserStored = load_kv(c, &key)?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        st.open = true;
+        ensure_default_person_tab(&mut st);
+        if let Some(tab) = st.tabs.iter_mut().find(|t| t.active) {
+            if let Some(raw_url) = input.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let normalized = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                    raw_url.to_owned()
+                } else {
+                    format!("https://{raw_url}")
+                };
+                if tab.history.is_empty() {
+                    tab.history.push(tab.url.clone());
+                    tab.history_idx = 0;
+                }
+                if tab.history.get(tab.history_idx).map(String::as_str) != Some(normalized.as_str()) {
+                    tab.history.truncate(tab.history_idx + 1);
+                    tab.history.push(normalized.clone());
+                    tab.history_idx = tab.history.len() - 1;
+                }
+                tab.url = normalized.clone();
+                tab.title = derive_url_title(&normalized);
+            } else if let Some(act) = input.action.as_deref() {
+                match act {
+                    "back" => {
+                        if tab.history_idx > 0 {
+                            tab.history_idx -= 1;
+                            if let Some(u) = tab.history.get(tab.history_idx) {
+                                tab.url = u.clone();
+                                tab.title = derive_url_title(&tab.url);
+                            }
+                        }
+                    }
+                    "forward" => {
+                        if tab.history_idx + 1 < tab.history.len() {
+                            tab.history_idx += 1;
+                            if let Some(u) = tab.history.get(tab.history_idx) {
+                                tab.url = u.clone();
+                                tab.title = derive_url_title(&tab.url);
+                            }
+                        }
+                    }
+                    "reload" => {}
+                    _ => {}
+                }
+            }
+        }
+        let val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        save_kv(c, &key, &val)?;
+        Ok(person_browser_api_json(Some(&val), &user_id))
+    })
+    .await
+    {
+        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Err(_) => internal(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PersonBrowserRecordingInput {
+    action: String,
+    title: Option<String>,
+}
+
+async fn person_browser_recording(
+    State(s): State<AuthState>,
+    Path((org, person)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(input): Json<PersonBrowserRecordingInput>,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_person(&actor, &person) {
+        return e;
+    }
+    let key = person_browser_kv_key(&actor);
+    let rec_key = person_recordings_kv_key(&actor);
+    let user_id = actor.id.clone();
+    match run_db(&s, move |c| {
+        let mut st: PersonBrowserStored = load_kv(c, &key)?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        st.open = true;
+        ensure_default_person_tab(&mut st);
+        let now_ms = epoch()?.saturating_mul(1000);
+        match input.action.as_str() {
+            "start" => {
+                let rid = format!("rec-{}", random_hex(6)?);
+                let title = input
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Browser recording")
+                    .to_owned();
+                st.recording_phase = "recording".to_owned();
+                st.recording_id = Some(rid);
+                st.recording_title = Some(title);
+                st.recording_started_at = Some(now_ms as u64);
+            }
+            "stop" => {
+                let rid = st
+                    .recording_id
+                    .take()
+                    .unwrap_or_else(|| format!("rec-{now_ms}"));
+                let title = st
+                    .recording_title
+                    .take()
+                    .unwrap_or_else(|| "Browser recording".to_owned());
+                let active_url = st
+                    .tabs
+                    .iter()
+                    .find(|t| t.active)
+                    .map(|t| t.url.clone())
+                    .unwrap_or_else(|| "about:blank".to_owned());
+                st.recording_phase = "idle".to_owned();
+                st.recording_started_at = None;
+                st.last_stopped = Some(json!({
+                    "recordingId": rid,
+                    "title": title,
+                    "stoppedAt": now_ms,
+                    "actions": 1,
+                    "phrases": 0,
+                }));
+                let mut recs: Vec<Value> = load_kv(c, &rec_key)?
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                recs.insert(
+                    0,
+                    json!({
+                        "id": rid,
+                        "recordingId": rid,
+                        "title": title,
+                        "url": active_url,
+                        "createdAt": now_iso(c)?,
+                        "stoppedAt": now_ms,
+                        "actions": 1,
+                        "phrases": 0,
+                    }),
+                );
+                recs.truncate(50);
+                save_kv(c, &rec_key, &Value::Array(recs))?;
+            }
+            _ => {}
+        }
+        let val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        save_kv(c, &key, &val)?;
+        Ok(person_browser_api_json(Some(&val), &user_id))
+    })
+    .await
+    {
+        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Err(_) => internal(),
+    }
+}
+
+async fn person_browser_clear(
+    State(s): State<AuthState>,
+    Path((org, person)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_person(&actor, &person) {
+        return e;
+    }
+    let key = person_browser_kv_key(&actor);
+    let user_id = actor.id.clone();
+    match run_db(&s, move |c| {
+        let mut st = PersonBrowserStored {
+            open: true,
+            ..Default::default()
+        };
+        ensure_default_person_tab(&mut st);
+        let val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        save_kv(c, &key, &val)?;
+        Ok(person_browser_api_json(Some(&val), &user_id))
+    })
+    .await
+    {
+        Ok(resp) => respond_json(StatusCode::OK, resp),
+        Err(_) => internal(),
+    }
 }
 
 async fn delete_current_recorder_connection(
@@ -1871,7 +2328,28 @@ async fn list_recordings(
     Query(q): Query<HashMap<String, String>>,
     h: HeaderMap,
 ) -> Response {
-    empty_person_page(&s, &h, &org, &person, &q, "recordings").await
+    let actor = match authorize(&s, &h, &org, false).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_person(&actor, &person) {
+        return e;
+    }
+    if let Err(e) = parse_empty_list_paging(&q) {
+        return e;
+    }
+    let key = person_recordings_kv_key(&actor);
+    let recs: Vec<Value> = run_db(&s, move |c| {
+        Ok(load_kv(c, &key)?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default())
+    })
+    .await
+    .unwrap_or_default();
+    respond_json(
+        StatusCode::OK,
+        json!({ "recordings": recs, "nextCursor": Value::Null }),
+    )
 }
 
 async fn get_recording_titles(
