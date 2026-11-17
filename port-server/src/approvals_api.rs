@@ -274,6 +274,10 @@ pub(crate) fn router_with_runs(state: AuthState, runs: Option<runs::RunState>) -
             get(get_approval_settings).patch(update_approval_settings),
         )
         .route(
+            "/api/v2/organizations/{organization}/approvals/settings",
+            get(get_approval_settings).patch(update_approval_settings),
+        )
+        .route(
             "/api/v2/organizations/{organization}/boundaries",
             get(get_boundaries).put(replace_boundaries),
         )
@@ -290,6 +294,43 @@ pub(crate) fn router_with_runs(state: AuthState, runs: Option<runs::RunState>) -
 
 fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 200 && !s.chars().any(char::is_control)
+}
+
+fn valid_scope(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 2048 && !s.chars().any(char::is_control)
+}
+
+/// Extract a sanitized, non-empty scope string from tool arguments (`path`, `url`, or `command`).
+pub(crate) fn extract_tool_scope(args: &Value) -> String {
+    let raw = args
+        .get("path")
+        .or_else(|| args.get("url"))
+        .or_else(|| args.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "*".to_owned();
+    }
+    if trimmed.len() <= 1000 {
+        return trimmed.to_owned();
+    }
+    let mut end = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        if idx + ch.len_utf8() > 1000 {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    if end == 0 {
+        "*".to_owned()
+    } else {
+        trimmed[..end].to_owned()
+    }
 }
 
 fn valid_pattern(s: &str) -> Option<String> {
@@ -497,13 +538,16 @@ fn redact_args(v: &Value) -> Value {
 fn matches_pattern(pattern: &str, value: &str) -> bool {
     let p = pattern.trim();
     if p.is_empty()
-        || p.chars().count() > 300
+        || p.chars().count() > 2048
         || p.contains('\0')
         || value.is_empty()
         || value.len() > 4096
         || value.contains('\0')
     {
         return false;
+    }
+    if p == "*" {
+        return true;
     }
     let p: Vec<char> = p.chars().collect();
     let s: Vec<char> = value.chars().collect();
@@ -528,6 +572,77 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
         i += 1;
     }
     i == p.len()
+}
+
+fn extract_url_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if lower.is_empty() {
+        None
+    } else {
+        Some(lower)
+    }
+}
+
+fn hosts_share_site(rule_host: &str, req_host: &str) -> bool {
+    if rule_host == req_host {
+        return true;
+    }
+    let r = rule_host.strip_prefix("www.").unwrap_or(rule_host);
+    let q = req_host.strip_prefix("www.").unwrap_or(req_host);
+    if r == q {
+        return true;
+    }
+    q.ends_with(&format!(".{r}")) || r.ends_with(&format!(".{q}"))
+}
+
+fn rule_matches_scope(rule_scope: &str, req_scope: &str) -> bool {
+    if matches_pattern(rule_scope, req_scope) {
+        return true;
+    }
+    let trimmed = rule_scope.trim();
+    if let Some(req_host) = extract_url_host(req_scope) {
+        if let Some(rule_host) = extract_url_host(trimmed) {
+            if !trimmed.contains('*') && hosts_share_site(&rule_host, &req_host) {
+                return true;
+            }
+        } else if !trimmed.contains('/')
+            && !trimmed.contains(' ')
+            && !trimmed.contains("://")
+            && matches_pattern(&trimmed.to_ascii_lowercase(), &req_host)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn standing_rule_scope_for_record(tool_ref: &str, scope: &str) -> String {
+    let t = tool_ref.trim().to_ascii_lowercase();
+    if t.starts_with("computer_") || is_host_command_tool(&t) {
+        return "*".to_owned();
+    }
+    let trimmed = scope.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+    {
+        return "*".to_owned();
+    }
+    trimmed.to_owned()
 }
 
 fn classify_action_kind(tool_ref: &str, effect: &str) -> Option<&'static str> {
@@ -559,6 +674,258 @@ fn classify_action_kind(tool_ref: &str, effect: &str) -> Option<&'static str> {
 fn is_host_command_tool(tool_ref: &str) -> bool {
     let t = tool_ref.to_ascii_lowercase();
     t == "run_command" || t == "host/run_command" || t == "computer_run_command"
+}
+
+fn split_unquoted_pipes(cmd: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if escape {
+            cur.push(ch);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            cur.push(ch);
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            cur.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            cur.push(ch);
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            // Reject chaining, redirection, backgrounding, subshells, and newlines.
+            if matches!(ch, ';' | '&' | '>' | '<' | '`' | '\n' | '\r') {
+                return None;
+            }
+            if ch == '$' && i + 1 < chars.len() && matches!(chars[i + 1], '(' | '{') {
+                return None;
+            }
+            if ch == '|' {
+                if i + 1 < chars.len() && matches!(chars[i + 1], '|' | '&') {
+                    return None;
+                }
+                let seg = cur.trim().to_owned();
+                if seg.is_empty() {
+                    return None;
+                }
+                segments.push(seg);
+                cur.clear();
+                i += 1;
+                continue;
+            }
+        } else if in_double {
+            if matches!(ch, '`' | '\n' | '\r') {
+                return None;
+            }
+            if ch == '$' && i + 1 < chars.len() && matches!(chars[i + 1], '(' | '{') {
+                return None;
+            }
+        }
+        cur.push(ch);
+        i += 1;
+    }
+    if in_single || in_double || escape {
+        return None;
+    }
+    let tail = cur.trim().to_owned();
+    if tail.is_empty() {
+        return None;
+    }
+    segments.push(tail);
+    Some(segments)
+}
+
+fn split_shell_words(segment: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    for ch in segment.chars() {
+        if escape {
+            cur.push(ch);
+            escape = false;
+            in_token = true;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escape = true;
+            in_token = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            in_token = true;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            in_token = true;
+            continue;
+        }
+        if ch.is_ascii_whitespace() && !in_single && !in_double {
+            if in_token {
+                words.push(std::mem::take(&mut cur));
+                in_token = false;
+            }
+            continue;
+        }
+        cur.push(ch);
+        in_token = true;
+    }
+    if in_single || in_double || escape {
+        return None;
+    }
+    if in_token {
+        words.push(cur);
+    }
+    if words.is_empty() {
+        None
+    } else {
+        Some(words)
+    }
+}
+
+fn is_safe_git_command(args: &[String]) -> bool {
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let a = args[idx].as_str();
+        if a == "-c"
+            || a.starts_with("-c=")
+            || a == "--exec-path"
+            || a.starts_with("--exec-path=")
+            || a == "--upload-pack"
+            || a.starts_with("--upload-pack=")
+            || a == "--receive-pack"
+            || a.starts_with("--receive-pack=")
+        {
+            return false;
+        }
+        if matches!(a, "-C" | "--git-dir" | "--work-tree") {
+            idx += 2;
+            continue;
+        }
+        if a.starts_with("--git-dir=")
+            || a.starts_with("--work-tree=")
+            || matches!(a, "--no-pager" | "-p" | "--paginate" | "--bare" | "--no-optional-locks")
+        {
+            idx += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            return matches!(a, "--version" | "-v" | "--help" | "-h");
+        }
+        break;
+    }
+    let Some(sub) = args.get(idx).map(String::as_str) else {
+        return false;
+    };
+    let rest = &args[idx + 1..];
+    match sub {
+        "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "blame"
+        | "describe" | "shortlog" | "reflog" | "grep" => {
+            !rest.iter().any(|a| a.starts_with("--output="))
+        }
+        "branch" => !rest.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "--delete" | "--move" | "--copy" | "--edit-description"
+            ) || a.starts_with("--set-upstream")
+                || a.starts_with("--unset-upstream")
+        }),
+        "tag" => rest.is_empty() || rest.iter().all(|a| matches!(a.as_str(), "-l" | "--list" | "-n")),
+        "remote" => {
+            rest.is_empty()
+                || rest
+                    .iter()
+                    .all(|a| matches!(a.as_str(), "-v" | "--verbose" | "show"))
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_readonly_segment(words: &[String]) -> bool {
+    let Some(cmd_raw) = words.first() else {
+        return false;
+    };
+    let cmd = cmd_raw.rsplit(['/', '\\']).next().unwrap_or(cmd_raw);
+    let args = &words[1..];
+    match cmd {
+        "ls" | "ll" | "la" | "dir" | "cat" | "head" | "tail" | "pwd" | "echo" | "printf"
+        | "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" | "wc" | "sort" | "uniq" | "cut"
+        | "tr" | "which" | "whereis" | "type" | "whoami" | "id" | "uname" | "hostname"
+        | "date" | "uptime" | "df" | "du" | "free" | "ps" | "stat" | "file" | "basename"
+        | "dirname" | "realpath" | "readlink" | "tree" | "less" | "more" | "diff" | "cmp"
+        | "md5sum" | "sha256sum" | "sha1sum" | "b2sum" => {
+            // Disallow output flags like sort -o / tee-like writes
+            if cmd == "sort" && args.iter().any(|a| a == "-o" || a.starts_with("--output")) {
+                return false;
+            }
+            true
+        }
+        "find" => !args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint" | "-fprint0"
+                    | "-fprintf" | "-fls"
+            )
+        }),
+        "git" => is_safe_git_command(args),
+        "python" | "python3" | "node" | "bun" | "npm" | "cargo" | "rustc" | "go" | "java"
+        | "gcc" | "clang" | "rustup" => {
+            !args.is_empty()
+                && args
+                    .iter()
+                    .all(|a| matches!(a.as_str(), "--version" | "-V" | "-v" | "--help" | "-h"))
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_readonly_shell_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return false;
+    }
+    let Some(segments) = split_unquoted_pipes(trimmed) else {
+        return false;
+    };
+    segments.iter().all(|seg| {
+        split_shell_words(seg).is_some_and(|words| is_safe_readonly_segment(&words))
+    })
+}
+
+fn is_auto_mode_safe_action(tool_ref: &str, effect: &str, scope: &str) -> bool {
+    if is_host_command_tool(tool_ref) {
+        return is_safe_readonly_shell_command(scope);
+    }
+    let t = tool_ref.trim().to_ascii_lowercase();
+    if matches!(
+        t.as_str(),
+        "computer_web_fetch" | "computer_navigate" | "computer_list_files" | "computer_read_file"
+    ) {
+        return !effect.eq_ignore_ascii_case("write");
+    }
+    t.starts_with("computer_") && effect.eq_ignore_ascii_case("read")
 }
 
 // ---------- Mini-CEL Parser & Evaluator for Boundaries ----------
@@ -1111,7 +1478,7 @@ fn eval_rule_tier(
         if matches_pattern(&r.bot_id, req.bot_id)
             && matches_pattern(&r.tool_ref, req.tool_ref)
             && matches_pattern(&r.effect, req.effect)
-            && matches_pattern(&r.scope, req.scope)
+            && rule_matches_scope(&r.scope, req.scope)
         {
             if selected.is_some_and(|prev| prev != r.behaviour) {
                 return Some(Err(()));
@@ -1135,10 +1502,10 @@ pub fn evaluate_action(
         req.conversation_id,
         req.tool_ref,
         req.effect,
-        req.scope,
     ]
     .iter()
     .any(|s| !valid_id(s))
+        || !valid_scope(req.scope)
     {
         return Err(ApprovalError::InvalidInput("invalid action identifiers"));
     }
@@ -1192,18 +1559,23 @@ pub fn evaluate_action(
         }
     }
 
-    // 2. Approval Settings (host_commands_cap, custom_rules_enabled, action_kinds).
-    let settings_row: Option<(bool, bool, String, String)> = tx
+    // 2. Approval Settings (host_commands_cap, custom_rules_enabled, action_kinds, execution_mode).
+    let settings_row: Option<(bool, bool, String, String, String)> = tx
         .query_row(
-            "SELECT enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json
+            "SELECT enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json, execution_mode
                FROM port_approval_settings
               WHERE organization_id = ?1",
             params![req.organization_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let (_enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json) =
-        settings_row.unwrap_or((false, true, "ask".into(), "{}".into()));
+    let (
+        _enforce_auto_review,
+        custom_rules_enabled,
+        host_commands_cap,
+        action_kinds_json,
+        execution_mode,
+    ) = settings_row.unwrap_or((false, true, "ask".into(), "{}".into(), "ask".into()));
 
     if is_host_command_tool(req.tool_ref) && host_commands_cap == "never" {
         tx.commit()?;
@@ -1219,6 +1591,18 @@ pub fn evaluate_action(
     let action_kinds: Map<String, Value> =
         serde_json::from_str(&action_kinds_json).unwrap_or_default();
     let detected_kind = classify_action_kind(req.tool_ref, req.effect).map(str::to_owned);
+
+    if execution_mode == "turbo" {
+        tx.commit()?;
+        return Ok(PolicyOutcome {
+            decision: EvaluationDecision::Allow,
+            source: "turbo_mode",
+            reason: "Permitted automatically by Turbo execution mode.".into(),
+            kind: detected_kind,
+            closed: false,
+        });
+    }
+
     if let Some(kind) = &detected_kind {
         if let Some(policy) = action_kinds.get(kind).and_then(Value::as_str) {
             if policy == "hand_off" {
@@ -1357,29 +1741,39 @@ pub fn evaluate_action(
     }
 
     // 5. Conversation-scoped grants (from `allow_conversation`).
-    let has_conv_grant: bool = tx.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-              FROM port_conversation_grants
-             WHERE organization_id = ?1
-               AND actor_id = ?2
-               AND conversation_id = ?3
-               AND bot_id = ?4
-               AND tool_ref = ?5
-               AND effect = ?6
-               AND scope = ?7
-        )",
-        params![
-            req.organization_id,
-            req.actor_id,
-            req.conversation_id,
-            req.bot_id,
-            req.tool_ref,
-            req.effect,
-            req.scope
-        ],
-        |r| r.get(0),
+    let mut conv_stmt = tx.prepare(
+        "SELECT bot_id, tool_ref, effect, scope
+           FROM port_conversation_grants
+          WHERE organization_id = ?1
+            AND actor_id = ?2
+            AND conversation_id = ?3
+          ORDER BY created_at DESC
+          LIMIT 512",
     )?;
+    let conv_rows = conv_stmt.query_map(
+        params![req.organization_id, req.actor_id, req.conversation_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+    let mut has_conv_grant = false;
+    for row in conv_rows {
+        let (bot_pat, tool_pat, eff_pat, scope_pat) = row?;
+        if matches_pattern(&bot_pat, req.bot_id)
+            && matches_pattern(&tool_pat, req.tool_ref)
+            && matches_pattern(&eff_pat, req.effect)
+            && rule_matches_scope(&scope_pat, req.scope)
+        {
+            has_conv_grant = true;
+            break;
+        }
+    }
+    drop(conv_stmt);
     tx.commit()?;
 
     if has_conv_grant {
@@ -1392,7 +1786,18 @@ pub fn evaluate_action(
         });
     }
 
-    // 6. Fail-closed default: require interactive HITL approval.
+    // 6. Auto mode: allow safe read-only & web tools and safe read-only shell commands.
+    if execution_mode == "auto" && is_auto_mode_safe_action(req.tool_ref, req.effect, req.scope) {
+        return Ok(PolicyOutcome {
+            decision: EvaluationDecision::Allow,
+            source: "auto_mode",
+            reason: "Permitted automatically as a read-only action in Auto mode.".into(),
+            kind: detected_kind,
+            closed: false,
+        });
+    }
+
+    // 7. Fail-closed default: require interactive HITL approval.
     Ok(PolicyOutcome {
         decision: EvaluationDecision::Ask,
         source: "default",
@@ -1464,11 +1869,11 @@ pub fn create_pending_approval(
         req.run_id,
         req.tool_ref,
         req.effect,
-        req.scope,
         req.thread_id,
     ]
     .iter()
     .any(|s| !valid_id(s))
+        || !valid_scope(req.scope)
         || req.tool_call_id.is_some_and(|s| !valid_id(s))
         || req.account.is_some_and(|s| !valid_id(s))
     {
@@ -1582,10 +1987,10 @@ pub fn consume_approved_action_at(
         req.conversation_id,
         req.tool_ref,
         req.effect,
-        req.scope,
     ]
     .iter()
     .any(|s| !valid_id(s))
+        || !valid_scope(req.scope)
     {
         return Err(ApprovalError::InvalidInput("invalid consume identifiers"));
     }
@@ -2378,49 +2783,100 @@ async fn decide_approval(
                     "Your workspace has switched custom rules off, so personal rules cannot be edited.",
                 ));
             }
-            let rule_id = random_id("rule_")
-                .map_err(|_| StorageError::InvalidDatabase("entropy unavailable"))?;
-            tx.execute(
-                "INSERT INTO port_approval_rules(
-                    id, organization_id, scope_owner_id, bot_id, tool_ref, effect, scope,
-                    behaviour, account, kind, created_by, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'allow', ?8, ?9, ?3, ?10)",
+            let rule_scope = standing_rule_scope_for_record(&record.tool_ref, &record.scope);
+            let exists_identical: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                      FROM port_approval_rules
+                     WHERE organization_id = ?1
+                       AND scope_owner_id = ?2
+                       AND bot_id = ?3
+                       AND tool_ref = ?4
+                       AND effect = ?5
+                       AND scope = ?6
+                       AND behaviour = 'allow'
+                )",
                 params![
-                    rule_id,
                     org_id,
                     actor_id,
                     record.bot_id,
                     record.tool_ref,
                     record.effect,
-                    record.scope,
-                    record.account,
-                    policy_kind,
-                    now,
+                    rule_scope,
                 ],
+                |r| r.get(0),
             )?;
+            if !exists_identical {
+                let rule_id = random_id("rule_")
+                    .map_err(|_| StorageError::InvalidDatabase("entropy unavailable"))?;
+                tx.execute(
+                    "INSERT INTO port_approval_rules(
+                        id, organization_id, scope_owner_id, bot_id, tool_ref, effect, scope,
+                        behaviour, account, kind, created_by, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'allow', ?8, ?9, ?3, ?10)",
+                    params![
+                        rule_id,
+                        org_id,
+                        actor_id,
+                        record.bot_id,
+                        record.tool_ref,
+                        record.effect,
+                        rule_scope,
+                        record.account,
+                        policy_kind,
+                        now,
+                    ],
+                )?;
+            }
         } else if decision == "allow_conversation" {
-            let grant_id = random_id("cgrant_")
-                .map_err(|_| StorageError::InvalidDatabase("entropy unavailable"))?;
-            tx.execute(
-                "INSERT INTO port_conversation_grants(
-                    id, organization_id, actor_id, conversation_id, thread_id,
-                    bot_id, tool_ref, effect, scope, account, kind, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            let grant_scope = standing_rule_scope_for_record(&record.tool_ref, &record.scope);
+            let exists_identical: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                      FROM port_conversation_grants
+                     WHERE organization_id = ?1
+                       AND actor_id = ?2
+                       AND conversation_id = ?3
+                       AND bot_id = ?4
+                       AND tool_ref = ?5
+                       AND effect = ?6
+                       AND scope = ?7
+                )",
                 params![
-                    grant_id,
                     org_id,
                     actor_id,
                     record.conversation_id,
-                    record.thread_id,
                     record.bot_id,
                     record.tool_ref,
                     record.effect,
-                    record.scope,
-                    record.account,
-                    policy_kind,
-                    now,
+                    grant_scope,
                 ],
+                |r| r.get(0),
             )?;
+            if !exists_identical {
+                let grant_id = random_id("cgrant_")
+                    .map_err(|_| StorageError::InvalidDatabase("entropy unavailable"))?;
+                tx.execute(
+                    "INSERT INTO port_conversation_grants(
+                        id, organization_id, actor_id, conversation_id, thread_id,
+                        bot_id, tool_ref, effect, scope, account, kind, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        grant_id,
+                        org_id,
+                        actor_id,
+                        record.conversation_id,
+                        record.thread_id,
+                        record.bot_id,
+                        record.tool_ref,
+                        record.effect,
+                        grant_scope,
+                        record.account,
+                        policy_kind,
+                        now,
+                    ],
+                )?;
+            }
         }
 
         let (new_status, completed_at, result_json): (&str, Option<i64>, Option<&str>) =
@@ -2554,13 +3010,7 @@ async fn run_computer_step(
         | "computer_key" => "write",
         _ => "read",
     };
-    let scope = args
-        .get("path")
-        .or_else(|| args.get("url"))
-        .or_else(|| args.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or("*")
-        .to_owned();
+    let scope = extract_tool_scope(&args);
 
     enum StepEval {
         Allow,
@@ -3432,23 +3882,29 @@ async fn delete_rule_impl(
 // ---------- Handlers: Approval Settings ----------
 
 fn read_approval_settings(c: &Connection, org_id: &str) -> Result<Value, StorageError> {
-    let row: Option<(bool, bool, String, String)> = c
+    let row: Option<(bool, bool, String, String, String)> = c
         .query_row(
-            "SELECT enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json
+            "SELECT enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json, execution_mode
                FROM port_approval_settings
               WHERE organization_id = ?1",
             params![org_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let (enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json) =
-        row.unwrap_or((false, true, "ask".into(), "{}".into()));
+    let (
+        enforce_auto_review,
+        custom_rules_enabled,
+        host_commands_cap,
+        action_kinds_json,
+        execution_mode,
+    ) = row.unwrap_or((false, true, "ask".into(), "{}".into(), "ask".into()));
     let action_kinds: Value = serde_json::from_str(&action_kinds_json).unwrap_or_else(|_| json!({}));
     Ok(json!({
         "enforceAutoReview": enforce_auto_review,
         "customRulesEnabled": custom_rules_enabled,
         "hostCommandsCap": host_commands_cap,
         "actionKinds": action_kinds,
+        "executionMode": execution_mode,
     }))
 }
 
@@ -3475,6 +3931,7 @@ struct UpdateApprovalSettingsBody {
     custom_rules_enabled: Option<bool>,
     host_commands_cap: Option<String>,
     action_kinds: Option<Map<String, Value>>,
+    execution_mode: Option<String>,
 }
 
 async fn update_approval_settings(
@@ -3494,6 +3951,7 @@ async fn update_approval_settings(
         && body.custom_rules_enabled.is_none()
         && body.host_commands_cap.is_none()
         && body.action_kinds.is_none()
+        && body.execution_mode.is_none()
     {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -3507,6 +3965,15 @@ async fn update_approval_settings(
                 StatusCode::BAD_REQUEST,
                 "VALIDATION_ERROR",
                 "Invalid hostCommandsCap value.",
+            );
+        }
+    }
+    if let Some(mode) = body.execution_mode.as_deref() {
+        if !matches!(mode, "ask" | "auto" | "turbo") {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "Invalid executionMode value. Must be ask, auto, or turbo.",
             );
         }
     }
@@ -3541,6 +4008,7 @@ async fn update_approval_settings(
         "customRulesEnabled": body.custom_rules_enabled,
         "hostCommandsCap": body.host_commands_cap,
         "actionKinds": body.action_kinds,
+        "executionMode": body.execution_mode,
     }));
     let fp = hash_fingerprint(&["PATCH_APPROVAL_SETTINGS", &body_canon.to_string()]);
     let org_id = i.organization.clone();
@@ -3561,6 +4029,9 @@ async fn update_approval_settings(
         let cap = body
             .host_commands_cap
             .unwrap_or_else(|| current["hostCommandsCap"].as_str().unwrap_or("ask").to_owned());
+        let execution_mode = body
+            .execution_mode
+            .unwrap_or_else(|| current["executionMode"].as_str().unwrap_or("ask").to_owned());
         let mut kinds_map = current["actionKinds"].as_object().cloned().unwrap_or_default();
         if let Some(patch_kinds) = body.action_kinds {
             for (k, v) in patch_kinds {
@@ -3570,20 +4041,22 @@ async fn update_approval_settings(
         let kinds_json = Value::Object(kinds_map.clone()).to_string();
         tx.execute(
             "INSERT INTO port_approval_settings(
-                organization_id, enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+                organization_id, enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json, execution_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(organization_id) DO UPDATE SET
                 enforce_auto_review = excluded.enforce_auto_review,
                 custom_rules_enabled = excluded.custom_rules_enabled,
                 host_commands_cap = excluded.host_commands_cap,
-                action_kinds_json = excluded.action_kinds_json",
-            params![org_id, enforce, custom, cap, kinds_json],
+                action_kinds_json = excluded.action_kinds_json,
+                execution_mode = excluded.execution_mode",
+            params![org_id, enforce, custom, cap, kinds_json, execution_mode],
         )?;
         let resp_val = json!({
             "enforceAutoReview": enforce,
             "customRulesEnabled": custom,
             "hostCommandsCap": cap,
             "actionKinds": kinds_map,
+            "executionMode": execution_mode,
         });
         append_policy_audit(
             &tx,
@@ -5486,6 +5959,489 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(hand_consume, Err(ApprovalError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn allow_always_and_conversation_work_across_urls_subdomains_and_commands() {
+        let f = setup_fixture();
+        let (_owner_cookie, _owner_id, member_cookie, member_id) =
+            setup_owner_and_member(&f).await;
+
+        f.db.try_with_connection(|c| {
+            c.execute(
+                "INSERT INTO port_conversations(id, organization_id, owner_id, thread_id, bot_ids_json, name, created_at, deleted)
+                 VALUES ('conv_member_2', 'default', ?1, 'thread_member_2', '[\"bot_member\"]', 'MemberChat2', 0, 0)",
+                params![member_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 1. computer_web_fetch: Allow always on one URL covers any URL/subdomain/long query.
+        let fetch_args = json!({"url": "https://news.ycombinator.com/news?p=1"});
+        let fetch_pending = f
+            .db
+            .try_with_connection(|c| {
+                Ok(create_pending_approval(
+                    c,
+                    &CreatePendingApprovalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        run_id: "run_web_1",
+                        tool_call_id: Some("tc_web_1"),
+                        tool_ref: "computer_web_fetch",
+                        effect: "read",
+                        scope: "https://news.ycombinator.com/news?p=1",
+                        thread_id: "thread_member",
+                        args: &fetch_args,
+                        target: None,
+                        account: None,
+                        policy: Some(&json!({"behaviour":"ask","source":"default","reason":"Ask"})),
+                        ttl_seconds: Some(600),
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+
+        let dec_web = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}/decide",
+                    fetch_pending.id
+                ),
+                &member_cookie,
+                "web-always-1",
+                r#"{"decision":"allow_always"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dec_web.status(), StatusCode::OK);
+
+        // Verify saved rule uses wildcard scope `*` and matches other pages, subdomains, and >200 char URLs.
+        let long_url = format!("https://en.wikipedia.org/wiki/PlayStation_5?q={}", "a".repeat(220));
+        for next_url in [
+            "https://news.ycombinator.com/item?id=42",
+            "https://docs.rs/tokio/latest/tokio/",
+            long_url.as_str(),
+        ] {
+            let outcome = f
+                .db
+                .try_with_connection(|c| {
+                    Ok(evaluate_action(
+                        c,
+                        &ActionEvalRequest {
+                            organization_id: "default",
+                            actor_id: &member_id,
+                            bot_id: "bot_member",
+                            conversation_id: "conv_member",
+                            tool_ref: "computer_web_fetch",
+                            effect: "read",
+                            scope: next_url,
+                            user_explicitly_requested: false,
+                            boundary_context: None,
+                        },
+                    )
+                    .unwrap())
+                })
+                .unwrap();
+            assert_eq!(outcome.decision, EvaluationDecision::Allow, "expected Allow for {next_url}");
+            assert_eq!(outcome.source, "personal_rule");
+        }
+
+        // 2. computer_run_command: Allow always on one command allows subsequent commands without re-prompting.
+        let cmd_args = json!({"command": "ls -la /tmp"});
+        let cmd_pending = f
+            .db
+            .try_with_connection(|c| {
+                Ok(create_pending_approval(
+                    c,
+                    &CreatePendingApprovalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        run_id: "run_cmd_1",
+                        tool_call_id: Some("tc_cmd_1"),
+                        tool_ref: "computer_run_command",
+                        effect: "write",
+                        scope: "ls -la /tmp",
+                        thread_id: "thread_member",
+                        args: &cmd_args,
+                        target: None,
+                        account: None,
+                        policy: Some(&json!({"behaviour":"ask","source":"default","reason":"Ask"})),
+                        ttl_seconds: Some(600),
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+        let dec_cmd = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}/decide",
+                    cmd_pending.id
+                ),
+                &member_cookie,
+                "cmd-always-1",
+                r#"{"decision":"allow_always"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dec_cmd.status(), StatusCode::OK);
+
+        let cmd_eval = f
+            .db
+            .try_with_connection(|c| {
+                Ok(evaluate_action(
+                    c,
+                    &ActionEvalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        tool_ref: "computer_run_command",
+                        effect: "write",
+                        scope: "python3 --version && ls -la",
+                        user_explicitly_requested: false,
+                        boundary_context: None,
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(cmd_eval.decision, EvaluationDecision::Allow);
+        assert_eq!(cmd_eval.source, "personal_rule");
+
+        // 3. allow_conversation on computer_navigate allows different URLs in conv_member, but not conv_member_2.
+        let nav_args = json!({"url": "https://docs.rs/tokio"});
+        let nav_pending = f
+            .db
+            .try_with_connection(|c| {
+                Ok(create_pending_approval(
+                    c,
+                    &CreatePendingApprovalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        run_id: "run_nav_1",
+                        tool_call_id: Some("tc_nav_1"),
+                        tool_ref: "computer_navigate",
+                        effect: "read",
+                        scope: "https://docs.rs/tokio",
+                        thread_id: "thread_member",
+                        args: &nav_args,
+                        target: None,
+                        account: None,
+                        policy: Some(&json!({"behaviour":"ask","source":"default","reason":"Ask"})),
+                        ttl_seconds: Some(600),
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+        let dec_nav = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}/decide",
+                    nav_pending.id
+                ),
+                &member_cookie,
+                "nav-conv-1",
+                r#"{"decision":"allow_conversation"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dec_nav.status(), StatusCode::OK);
+
+        let (same_conv, other_conv) = f
+            .db
+            .try_with_connection(|c| {
+                let a = evaluate_action(
+                    c,
+                    &ActionEvalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        tool_ref: "computer_navigate",
+                        effect: "read",
+                        scope: "https://crates.io/crates/tokio",
+                        user_explicitly_requested: false,
+                        boundary_context: None,
+                    },
+                )
+                .unwrap();
+                let b = evaluate_action(
+                    c,
+                    &ActionEvalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member_2",
+                        tool_ref: "computer_navigate",
+                        effect: "read",
+                        scope: "https://crates.io/crates/tokio",
+                        user_explicitly_requested: false,
+                        boundary_context: None,
+                    },
+                )
+                .unwrap();
+                Ok((a, b))
+            })
+            .unwrap();
+        assert_eq!(same_conv.decision, EvaluationDecision::Allow);
+        assert_eq!(same_conv.source, "conversation");
+        assert_eq!(other_conv.decision, EvaluationDecision::Ask);
+
+        // 4. Legacy exact-URL rule still matches subpages and subdomains on the same site, not unrelated domains.
+        assert!(rule_matches_scope("https://example.com/page1", "https://example.com/page2"));
+        assert!(rule_matches_scope("https://example.com/page1", "https://sub.example.com/other"));
+        assert!(!rule_matches_scope("https://example.com/page1", "https://evil.com/page1"));
+    }
+
+    #[tokio::test]
+    async fn execution_mode_ask_auto_turbo_api_and_evaluation() {
+        let f = setup_fixture();
+        let (owner_cookie, _owner_id, member_cookie, member_id) =
+            setup_owner_and_member(&f).await;
+
+        // Default GET returns executionMode = "ask" on both canonical and alias routes.
+        for path in [
+            "/api/v2/organizations/default/approval-settings",
+            "/api/v2/organizations/default/approvals/settings",
+        ] {
+            let res = f
+                .app
+                .clone()
+                .oneshot(req("GET", path, &member_cookie, "", ""))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(res.into_body(), 8192).await.unwrap()).unwrap();
+            assert_eq!(body["executionMode"], "ask");
+            assert_eq!(body["customRulesEnabled"], true);
+        }
+
+        // Invalid executionMode is rejected with 400; member PATCH is rejected with 403.
+        let bad_mode = f
+            .app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/api/v2/organizations/default/approval-settings",
+                &owner_cookie,
+                "mode-bad",
+                r#"{"executionMode":"yolo"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST);
+
+        let member_patch = f
+            .app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/api/v2/organizations/default/approval-settings",
+                &member_cookie,
+                "mode-member",
+                r#"{"executionMode":"turbo"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(member_patch.status(), StatusCode::FORBIDDEN);
+
+        // Switch to "auto" mode and verify safe reads/web/commands pass while risky writes/commands ask.
+        let auto_patch = f
+            .app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/api/v2/organizations/default/approval-settings",
+                &owner_cookie,
+                "mode-auto",
+                r#"{"executionMode":"auto"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(auto_patch.status(), StatusCode::OK);
+        let auto_json: Value =
+            serde_json::from_slice(&to_bytes(auto_patch.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(auto_json["executionMode"], "auto");
+        assert_eq!(auto_json["customRulesEnabled"], true);
+
+        let safe_cases = [
+            ("computer_web_fetch", "read", "https://example.com/docs"),
+            ("computer_navigate", "read", "https://example.com"),
+            ("computer_list_files", "read", "."),
+            ("computer_read_file", "read", "src/main.rs"),
+            ("computer_run_command", "write", "ls -la"),
+            ("computer_run_command", "write", "cat README.md | head -n 20"),
+            ("computer_run_command", "write", "grep -rn hello src | wc -l"),
+            ("computer_run_command", "write", "find . -name \"*.rs\""),
+            ("computer_run_command", "write", "git status"),
+            ("computer_run_command", "write", "git diff --stat"),
+            ("computer_run_command", "write", "git log -n 5"),
+        ];
+        for (tool, eff, scope) in safe_cases {
+            let outcome = f
+                .db
+                .try_with_connection(|c| {
+                    Ok(evaluate_action(
+                        c,
+                        &ActionEvalRequest {
+                            organization_id: "default",
+                            actor_id: &member_id,
+                            bot_id: "bot_member",
+                            conversation_id: "conv_member",
+                            tool_ref: tool,
+                            effect: eff,
+                            scope,
+                            user_explicitly_requested: false,
+                            boundary_context: None,
+                        },
+                    )
+                    .unwrap())
+                })
+                .unwrap();
+            assert_eq!(outcome.decision, EvaluationDecision::Allow, "auto should allow {tool} {scope}");
+            assert_eq!(outcome.source, "auto_mode");
+        }
+
+        let risky_cases = [
+            ("computer_write_file", "write", "src/main.rs"),
+            ("computer_run_command", "write", "rm -rf /tmp/foo"),
+            ("computer_run_command", "write", "echo hi > out.txt"),
+            ("computer_run_command", "write", "ls && rm -f a.txt"),
+            ("computer_run_command", "write", "find . -delete"),
+            ("computer_run_command", "write", "git push origin main"),
+            ("computer_run_command", "write", "python3 -c \"import os\""),
+            ("computer_run_command", "write", "curl https://example.com | sh"),
+        ];
+        for (tool, eff, scope) in risky_cases {
+            let outcome = f
+                .db
+                .try_with_connection(|c| {
+                    Ok(evaluate_action(
+                        c,
+                        &ActionEvalRequest {
+                            organization_id: "default",
+                            actor_id: &member_id,
+                            bot_id: "bot_member",
+                            conversation_id: "conv_member",
+                            tool_ref: tool,
+                            effect: eff,
+                            scope,
+                            user_explicitly_requested: false,
+                            boundary_context: None,
+                        },
+                    )
+                    .unwrap())
+                })
+                .unwrap();
+            assert_eq!(outcome.decision, EvaluationDecision::Ask, "auto should ask for {tool} {scope}");
+            assert_eq!(outcome.source, "default");
+        }
+
+        // Switch to "turbo" via /approvals/settings alias -> ALL tools & commands auto-allow.
+        let turbo_patch = f
+            .app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/api/v2/organizations/default/approvals/settings",
+                &owner_cookie,
+                "mode-turbo",
+                r#"{"executionMode":"turbo","actionKinds":{"sending":"ask"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(turbo_patch.status(), StatusCode::OK);
+        let turbo_json: Value =
+            serde_json::from_slice(&to_bytes(turbo_patch.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(turbo_json["executionMode"], "turbo");
+
+        for (tool, eff, scope) in [
+            ("computer_write_file", "write", "src/main.rs"),
+            ("computer_run_command", "write", "rm -rf /tmp/foo && cargo test"),
+            ("computer_web_fetch", "read", "https://example.com"),
+            ("mcp/gmail/send_email", "write", "gmail"),
+        ] {
+            let outcome = f
+                .db
+                .try_with_connection(|c| {
+                    Ok(evaluate_action(
+                        c,
+                        &ActionEvalRequest {
+                            organization_id: "default",
+                            actor_id: &member_id,
+                            bot_id: "bot_member",
+                            conversation_id: "conv_member",
+                            tool_ref: tool,
+                            effect: eff,
+                            scope,
+                            user_explicitly_requested: false,
+                            boundary_context: None,
+                        },
+                    )
+                    .unwrap())
+                })
+                .unwrap();
+            assert_eq!(outcome.decision, EvaluationDecision::Allow, "turbo should allow {tool} {scope}");
+            assert_eq!(outcome.source, "turbo_mode");
+        }
+
+        // Explicit hostCommandsCap = "never" still blocks host commands even in turbo mode.
+        let never_patch = f
+            .app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/api/v2/organizations/default/approval-settings",
+                &owner_cookie,
+                "mode-never",
+                r#"{"hostCommandsCap":"never"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(never_patch.status(), StatusCode::OK);
+        let blocked_cmd = f
+            .db
+            .try_with_connection(|c| {
+                Ok(evaluate_action(
+                    c,
+                    &ActionEvalRequest {
+                        organization_id: "default",
+                        actor_id: &member_id,
+                        bot_id: "bot_member",
+                        conversation_id: "conv_member",
+                        tool_ref: "computer_run_command",
+                        effect: "write",
+                        scope: "ls",
+                        user_explicitly_requested: false,
+                        boundary_context: None,
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(blocked_cmd.decision, EvaluationDecision::Deny);
+        assert_eq!(blocked_cmd.source, "safety");
     }
 }
 

@@ -81,6 +81,7 @@ export const GetApprovalSettingsResponse = zod
       .describe(
         "What the organization lets people do about each kind of action. A kind not named is open.",
       ),
+    executionMode: zod.enum(["ask", "auto", "turbo"]).optional(),
   })
   .describe("What the organization decides about asking, for everybody.");
 
@@ -169,6 +170,7 @@ export const UpdateApprovalSettingsBody = zod.object({
     )
     .optional()
     .describe("The kinds to change. A kind left out stays as it was set."),
+  executionMode: zod.enum(["ask", "auto", "turbo"]).optional(),
 });
 
 export const UpdateApprovalSettingsResponse = zod
@@ -235,6 +237,7 @@ export const UpdateApprovalSettingsResponse = zod
       .describe(
         "What the organization lets people do about each kind of action. A kind not named is open.",
       ),
+    executionMode: zod.enum(["ask", "auto", "turbo"]).optional(),
   })
   .describe("What the organization decides about asking, for everybody.");
 

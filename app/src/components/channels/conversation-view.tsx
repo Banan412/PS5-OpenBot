@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { useBotLook } from "@/components/agents/bot-look";
+import { ExecutionModeSelector } from "@/components/approvals/execution-mode-selector";
 import {
   ChatTranscript,
   skillLabels,
@@ -20,6 +21,7 @@ import {
   type DroppedAttachments,
   type QueueAction,
   type QueuedMessage,
+  type QueueTransition,
   reduceQueue,
 } from "@/components/channels/composer";
 import { StillWorkingError } from "@/components/channels/composer/queue";
@@ -54,6 +56,7 @@ export function ConversationView({
   intro,
   starterSuggestions,
   onSubmit,
+  onSendNow,
   onStop,
   voiceCall,
   modelPicker,
@@ -136,6 +139,8 @@ export function ConversationView({
    */
   starterSuggestions?: ReactNode;
   onSubmit: (draft: ComposerDraft) => void | Promise<void>;
+  /** Interrupt any active or stuck turn and send immediately, bypassing the queue. */
+  onSendNow?: (draft: ComposerDraft) => void | Promise<void>;
   /** Stop the Bot mid-answer; forwarded to turn the send button into a stop button. */
   onStop?: () => void;
   voiceCall?: { active: boolean; supported: boolean; onStart(): void };
@@ -334,34 +339,38 @@ export function ConversationView({
     [apply],
   );
 
-  const start = async (draft: ComposerDraft) => {
+  const activeStartsRef = useRef(0);
+  const runWithTracking = async (
+    sender: (draft: ComposerDraft) => void | Promise<void>,
+    draft: ComposerDraft,
+  ) => {
+    activeStartsRef.current += 1;
     setRunning(true);
     try {
-      await onSubmit(draft);
+      await sender(draft);
     } finally {
-      setRunning(false);
+      activeStartsRef.current = Math.max(0, activeStartsRef.current - 1);
+      setRunning(activeStartsRef.current > 0);
     }
   };
-  /** Read through a ref so an inline `onSubmit` from the route does not re-run the drain effect. */
+  const start = (draft: ComposerDraft) => runWithTracking(onSubmit, draft);
+  const startNow = (draft: ComposerDraft) =>
+    runWithTracking(onSendNow ?? onSubmit, draft);
+  /** Read through a ref so an inline `onSubmit` / `onSendNow` from the route does not re-run the drain effect. */
   const startRef = useRef(start);
   startRef.current = start;
+  const startNowRef = useRef(startNow);
+  startNowRef.current = startNow;
 
-  /**
-   * Send now, or park it. Which one is the composer's call: it holds the only accurate view of
-   * whether a turn is in flight, and `reduceQueue` holds what follows from the answer.
-   */
-  const submit = useCallback(
-    (draft: ComposerDraft, whileBusy: boolean) => {
-      const next = apply({
-        busy: whileBusy,
-        draft,
-        id: newId(),
-        type: "submit",
-      });
+  const dispatchRun = useCallback(
+    (
+      next: QueueTransition,
+      runner: (draft: ComposerDraft) => Promise<void>,
+    ) => {
       if (!next.run) {
         return undefined;
       }
-      const started = startRef.current(next.run);
+      const started = runner(next.run);
       /*
        * A SEND THAT TOOK THE QUEUE WITH IT AND THEN FAILED LEAVES THE PARKED HALF HELD BY NOBODY,
        * which is the same shape the drain effect below answers, and with the same line.
@@ -389,7 +398,49 @@ export function ConversationView({
       }
       return started;
     },
-    [apply, restoreFailedRun],
+    [restoreFailedRun],
+  );
+
+  /**
+   * Send now, or park it. Which one is the composer's call: it holds the only accurate view of
+   * whether a turn is in flight, and `reduceQueue` holds what follows from the answer.
+   */
+  const submit = useCallback(
+    (draft: ComposerDraft, whileBusy: boolean) => {
+      const next = apply({
+        busy: whileBusy,
+        draft,
+        id: newId(),
+        type: "submit",
+      });
+      return dispatchRun(next, (run) => startRef.current(run));
+    },
+    [apply, dispatchRun],
+  );
+
+  const submitNow = useCallback(
+    (draft: ComposerDraft) => {
+      heldBack.current = false;
+      const next = apply({
+        busy: false,
+        draft,
+        id: newId(),
+        type: "submit",
+      });
+      return dispatchRun(next, (run) => startNowRef.current(run));
+    },
+    [apply, dispatchRun],
+  );
+
+  const sendQueuedNow = useCallback(
+    (id: string) => {
+      heldBack.current = false;
+      const next = apply({ id, type: "sendNow" });
+      void dispatchRun(next, (run) => startNowRef.current(run))?.catch(
+        () => undefined,
+      );
+    },
+    [apply, dispatchRun],
   );
 
   /**
@@ -492,6 +543,7 @@ export function ConversationView({
           onRemoveQueued={(id) => {
             apply({ id, type: "remove" });
           }}
+          onSendQueuedNow={sendQueuedNow}
           queued={queued}
           restoring={restoring}
           {...(stopped ? { stopped } : {})}
@@ -549,18 +601,17 @@ export function ConversationView({
         )}
         <Composer
           modelPicker={
-            modelPicker || channelId ? (
-              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                {modelPicker}
-                {channelId ? (
-                  <ContextMeter
-                    active={inFlight}
-                    conversationId={channelId}
-                    refreshKey={messages.length}
-                  />
-                ) : null}
-              </div>
-            ) : undefined
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              {modelPicker}
+              {channelId ? (
+                <ContextMeter
+                  active={inFlight}
+                  conversationId={channelId}
+                  refreshKey={messages.length}
+                />
+              ) : null}
+              <ExecutionModeSelector disabled={disabled} />
+            </div>
           }
           {...(routine ? { routine } : {})}
           agents={agents}
@@ -579,6 +630,11 @@ export function ConversationView({
               ? (draft) => {
                   submit(draft, true);
                 }
+              : undefined
+          }
+          onSendNow={
+            queueWhileBusy || onSendNow
+              ? (draft) => submitNow(draft)
               : undefined
           }
           onStop={onStop}

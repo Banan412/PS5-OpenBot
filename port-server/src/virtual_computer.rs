@@ -372,7 +372,7 @@ impl VirtualComputerState {
         if !self.verify_bot_exists(bot_id).await? {
             return Err("bot not found".to_owned());
         }
-        self.execute_tool_verified(bot_id, tool_name, args_json, false)
+        self.execute_tool_verified(bot_id, tool_name, args_json, false, false)
             .await
     }
 
@@ -403,6 +403,27 @@ impl VirtualComputerState {
         tool_name: &str,
         args_json: Value,
     ) -> Result<Value, String> {
+        self.execute_tool_for_owner_with_policy(
+            organization_id,
+            owner_id,
+            bot_id,
+            tool_name,
+            args_json,
+            false,
+        )
+        .await
+    }
+
+    /// Owner-scoped virtual tool dispatcher with explicit web policy override (e.g. Turbo mode).
+    pub async fn execute_tool_for_owner_with_policy(
+        &self,
+        organization_id: &str,
+        owner_id: &str,
+        bot_id: &str,
+        tool_name: &str,
+        args_json: Value,
+        allow_all_web_pages: bool,
+    ) -> Result<Value, String> {
         self.execute_tool_for_owner_with_control(
             organization_id,
             owner_id,
@@ -410,6 +431,7 @@ impl VirtualComputerState {
             tool_name,
             args_json,
             false,
+            allow_all_web_pages,
         )
         .await
     }
@@ -422,6 +444,7 @@ impl VirtualComputerState {
         tool_name: &str,
         args_json: Value,
         allow_human_control: bool,
+        allow_all_web_pages: bool,
     ) -> Result<Value, String> {
         let ok = self
             .verify_bot_owner(organization_id, owner_id, bot_id)
@@ -430,8 +453,14 @@ impl VirtualComputerState {
         if !ok {
             return Err("bot not found".to_owned());
         }
-        self.execute_tool_verified(bot_id, tool_name, args_json, allow_human_control)
-            .await
+        self.execute_tool_verified(
+            bot_id,
+            tool_name,
+            args_json,
+            allow_human_control,
+            allow_all_web_pages,
+        )
+        .await
     }
 
     async fn execute_tool_verified(
@@ -440,6 +469,7 @@ impl VirtualComputerState {
         tool_name: &str,
         args_json: Value,
         allow_human_control: bool,
+        allow_all_web_pages: bool,
     ) -> Result<Value, String> {
         let handle = self.bot_handle(bot_id)?;
         let cwd = {
@@ -458,7 +488,13 @@ impl VirtualComputerState {
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing string argument 'url'".to_owned())?
                 .to_owned();
-            let fetched = web_fetch_or_bridge(&url, bot_id, self.inner.dns_jobs.clone()).await?;
+            let fetched = web_fetch_or_bridge_with_policy(
+                &url,
+                bot_id,
+                self.inner.dns_jobs.clone(),
+                allow_all_web_pages,
+            )
+            .await?;
             let mut guard = handle
                 .lock()
                 .map_err(|_| "computer state unavailable".to_owned())?;
@@ -1925,14 +1961,14 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 // SSRF-Hardened Web Fetch + HTML Text Extractor
 // ---------------------------------------------------------------------------
 
-struct FetchResult {
-    url: String,
-    status: u16,
-    title: String,
-    text: String,
-    html: String,
-    bridge_png: Option<Vec<u8>>,
-    truncated: bool,
+pub(crate) struct FetchResult {
+    pub(crate) url: String,
+    pub(crate) status: u16,
+    pub(crate) title: String,
+    pub(crate) text: String,
+    pub(crate) html: String,
+    pub(crate) bridge_png: Option<Vec<u8>>,
+    pub(crate) truncated: bool,
 }
 
 pub(crate) fn is_forbidden_ipv4(ip: Ipv4Addr, local_ips: &[Ipv4Addr]) -> bool {
@@ -2022,23 +2058,66 @@ fn has_explicit_scheme_without_slashes(s: &str) -> bool {
     }
 }
 
+const MAX_DOH_RESPONSE_BYTES: usize = 64 * 1024;
+const DOH_ENDPOINTS: &[&str] = &[
+    "https://1.1.1.1/dns-query",
+    "https://dns.google/resolve",
+    "https://8.8.8.8/resolve",
+];
+
+fn allow_all_web_pages_from_env() -> bool {
+    std::env::var("OPENBOT_ALLOW_ALL_WEB_PAGES")
+        .map(|v| {
+            let trimmed = v.trim();
+            trimmed == "1"
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn is_local_hostname(host: &str) -> bool {
+    let lower = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+}
+
+pub(crate) fn is_unspecified_or_sinkhole_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_unspecified())
+        }
+    }
+}
+
 fn validate_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
+    validate_fetch_url_with_policy(raw, false)
+}
+
+fn validate_fetch_url_with_policy(raw: &str, allow_private: bool) -> Result<reqwest::Url, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with("//") {
         return Err("invalid URL".to_owned());
     }
-    let candidate = if trimmed.contains("://") || has_explicit_scheme_without_slashes(trimmed) {
+    let authority_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+    let head = &trimmed[..authority_end];
+    let candidate = if head.contains("://") || has_explicit_scheme_without_slashes(trimmed) {
         trimmed.to_owned()
     } else {
-        let authority_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
-        let authority = &trimmed[..authority_end];
-        let host_part = authority.split(':').next().unwrap_or("");
-        let is_ipv6_bracket = authority.starts_with('[') && authority.contains(']');
-        let lower_host = host_part.to_ascii_lowercase();
-        let is_localhost = lower_host == "localhost"
-            || lower_host.ends_with(".localhost")
-            || lower_host.ends_with(".local");
-        if !is_ipv6_bracket && !is_localhost && !host_part.contains('.') {
+        let host_part = head.split(':').next().unwrap_or("");
+        let is_ipv6_bracket = head.starts_with('[') && head.contains(']');
+        let is_localhost = is_local_hostname(host_part);
+        if !allow_private && !is_ipv6_bracket && !is_localhost && !host_part.contains('.') {
+            return Err("invalid URL".to_owned());
+        }
+        if allow_private && host_part.is_empty() && !is_ipv6_bracket {
             return Err("invalid URL".to_owned());
         }
         format!("https://{trimmed}")
@@ -2052,8 +2131,7 @@ fn validate_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
         return Err("URLs with embedded credentials are forbidden".to_owned());
     }
     let host = url.host_str().ok_or_else(|| "URL missing host".to_owned())?;
-    let lower = host.trim_end_matches('.').to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+    if !allow_private && is_local_hostname(host) {
         return Err("local hostnames are forbidden".to_owned());
     }
     Ok(url)
@@ -2064,6 +2142,15 @@ pub(crate) fn select_allowed_socket_addrs(
     addrs: Vec<SocketAddr>,
     local_ips: &[Ipv4Addr],
 ) -> Result<Vec<SocketAddr>, String> {
+    select_socket_addrs_with_policy(host, addrs, local_ips, false)
+}
+
+pub(crate) fn select_socket_addrs_with_policy(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+    local_ips: &[Ipv4Addr],
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, String> {
     if addrs.is_empty() {
         return Err(format!("DNS resolution for host '{host}' returned no addresses"));
     }
@@ -2071,7 +2158,12 @@ pub(crate) fn select_allowed_socket_addrs(
     let mut allowed_v6 = Vec::new();
     let mut blocked = Vec::new();
     for addr in addrs {
-        if is_forbidden_ip(addr.ip(), local_ips) {
+        let forbidden = if allow_private {
+            is_unspecified_or_sinkhole_ip(addr.ip())
+        } else {
+            is_forbidden_ip(addr.ip(), local_ips)
+        };
+        if forbidden {
             blocked.push(addr.ip());
         } else if addr.is_ipv4() {
             allowed_v4.push(addr);
@@ -2086,6 +2178,11 @@ pub(crate) fn select_allowed_socket_addrs(
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        if allow_private {
+            return Err(format!(
+                "resolved IP address(es) [{blocked_list}] for host '{host}' are unroutable"
+            ));
+        }
         return Err(format!(
             "resolved IP address(es) [{blocked_list}] for host '{host}' are forbidden by SSRF policy"
         ));
@@ -2093,10 +2190,191 @@ pub(crate) fn select_allowed_socket_addrs(
     Ok(allowed_v4)
 }
 
+pub(crate) fn should_fallback_to_doh(
+    host: &str,
+    os_result: &Result<Vec<SocketAddr>, String>,
+) -> bool {
+    let clean_host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    if clean_host.is_empty()
+        || clean_host.parse::<IpAddr>().is_ok()
+        || is_local_hostname(clean_host)
+        || !clean_host.contains('.')
+    {
+        return false;
+    }
+    match os_result {
+        Err(_) => true,
+        Ok(addrs) => {
+            addrs.is_empty()
+                || addrs
+                    .iter()
+                    .all(|addr| is_unspecified_or_sinkhole_ip(addr.ip()))
+        }
+    }
+}
+
+pub(crate) fn parse_doh_answer_ips(body: &[u8], port: u16) -> Result<Vec<SocketAddr>, String> {
+    let doc: Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid DoH JSON: {e}"))?;
+    if let Some(status) = doc.get("Status").and_then(Value::as_u64) {
+        if status != 0 {
+            return Err(format!("DoH query returned DNS status {status}"));
+        }
+    }
+    let mut addrs = Vec::new();
+    if let Some(answers) = doc.get("Answer").and_then(Value::as_array) {
+        for ans in answers {
+            if let Some(rtype) = ans.get("type").and_then(Value::as_u64) {
+                if rtype != 1 && rtype != 28 {
+                    continue;
+                }
+            }
+            let Some(data) = ans.get("data").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Ok(ip) = data.trim().parse::<IpAddr>() {
+                let sa = SocketAddr::new(ip, port);
+                if !addrs.contains(&sa) {
+                    addrs.push(sa);
+                }
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+async fn query_doh_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    host: &str,
+    record_type: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, String> {
+    let clean_host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    let url = reqwest::Url::parse_with_params(
+        endpoint,
+        &[("name", clean_host), ("type", record_type)],
+    )
+    .map_err(|e| format!("invalid DoH endpoint URL: {e}"))?;
+
+    let mut resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/dns-json")
+        .header(reqwest::header::USER_AGENT, "OpenBot-PS5/1.0")
+        .send()
+        .await
+        .map_err(|e| format!("DoH request failed ({endpoint}): {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("DoH HTTP {} from {endpoint}", resp.status().as_u16()));
+    }
+
+    let mut bytes = Vec::with_capacity(2048);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("DoH body read failed ({endpoint}): {e}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DOH_RESPONSE_BYTES {
+            return Err(format!("DoH response exceeded {MAX_DOH_RESPONSE_BYTES} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    parse_doh_answer_ips(&bytes, port)
+}
+
+pub(crate) async fn resolve_via_doh_endpoints(
+    endpoints: &[&str],
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
+        .pool_max_idle_per_host(0)
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("DoH client error: {e}"))?;
+
+    let mut last_err: Option<String> = None;
+    for record_type in ["A", "AAAA"] {
+        for endpoint in endpoints {
+            match query_doh_endpoint(&client, endpoint, host, record_type, port).await {
+                Ok(addrs) => {
+                    let usable: Vec<SocketAddr> = addrs
+                        .into_iter()
+                        .filter(|a| !is_unspecified_or_sinkhole_ip(a.ip()))
+                        .collect();
+                    if !usable.is_empty() {
+                        return Ok(usable);
+                    }
+                    last_err = Some(format!(
+                        "DoH {endpoint} returned no usable {record_type} addresses for '{host}'"
+                    ));
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("DoH resolution failed for host '{host}'")))
+}
+
+async fn resolve_host_addrs_with_fallback<F, Fut>(
+    host: &str,
+    os_result: Result<Vec<SocketAddr>, String>,
+    local_ips: &[Ipv4Addr],
+    allow_private: bool,
+    doh_lookup: F,
+) -> Result<Vec<SocketAddr>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<SocketAddr>, String>>,
+{
+    let candidate_addrs = if should_fallback_to_doh(host, &os_result) {
+        match doh_lookup().await {
+            Ok(doh_addrs) if !doh_addrs.is_empty() => doh_addrs,
+            Ok(_) => match os_result {
+                Ok(os_addrs) if !os_addrs.is_empty() => os_addrs,
+                Ok(_) => {
+                    return Err(format!(
+                        "DNS resolution for host '{host}' returned no addresses"
+                    ));
+                }
+                Err(e) => return Err(e),
+            },
+            Err(doh_err) => match os_result {
+                Ok(os_addrs) if !os_addrs.is_empty() => os_addrs,
+                Ok(_) => {
+                    return Err(format!(
+                        "DNS resolution for host '{host}' returned no addresses (DoH fallback failed: {doh_err})"
+                    ));
+                }
+                Err(os_err) => {
+                    return Err(format!("{os_err} (DoH fallback failed: {doh_err})"));
+                }
+            },
+        }
+    } else {
+        os_result?
+    };
+    select_socket_addrs_with_policy(host, candidate_addrs, local_ips, allow_private)
+}
+
 async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<FetchResult, String> {
-    let mut url = validate_fetch_url(raw_url)?;
+    web_fetch_ssrf_safe_with_policy(raw_url, dns_jobs, allow_all_web_pages_from_env()).await
+}
+
+pub(crate) async fn web_fetch_ssrf_safe_with_policy(
+    raw_url: &str,
+    dns_jobs: Arc<Semaphore>,
+    allow_private: bool,
+) -> Result<FetchResult, String> {
+    let mut url = validate_fetch_url_with_policy(raw_url, allow_private)?;
     let mut resp_opt = None;
-    for _hop in 0..=3usize {
+    for _hop in 0..=5usize {
         let host = url
             .host_str()
             .ok_or_else(|| "missing host".to_owned())?
@@ -2111,40 +2389,83 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
             .try_acquire_owned()
             .map_err(|_| "too many concurrent DNS lookups".to_owned())?;
         let resolve_host = host.clone();
-        let pinned_addrs: Vec<SocketAddr> = tokio::time::timeout(
+        enum LookupOutcome {
+            Literal(Vec<SocketAddr>),
+            NeedsResolution {
+                local_ips: Vec<Ipv4Addr>,
+                os_result: Result<Vec<SocketAddr>, String>,
+            },
+        }
+        let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let local_ips = origin::system_ipv4()
-                    .map_err(|_| "local interface enumeration unavailable; failing closed".to_owned())?;
+                let local_ips = if allow_private {
+                    Vec::new()
+                } else {
+                    origin::system_ipv4().map_err(|_| {
+                        "local interface enumeration unavailable; failing closed".to_owned()
+                    })?
+                };
 
                 if let Ok(ip) = resolve_host.parse::<IpAddr>() {
-                    if is_forbidden_ip(ip, &local_ips) {
+                    let forbidden = if allow_private {
+                        is_unspecified_or_sinkhole_ip(ip)
+                    } else {
+                        is_forbidden_ip(ip, &local_ips)
+                    };
+                    if forbidden {
                         return Err(format!(
                             "target IP address {ip} for host '{resolve_host}' is forbidden by SSRF policy"
                         ));
                     }
-                    return Ok(vec![SocketAddr::new(ip, port)]);
+                    return Ok(LookupOutcome::Literal(vec![SocketAddr::new(ip, port)]));
                 }
 
-                let addrs: Vec<SocketAddr> = (resolve_host.as_str(), port)
+                let os_result = (resolve_host.as_str(), port)
                     .to_socket_addrs()
-                    .map_err(|e| format!("DNS resolution failed for host '{resolve_host}': {e}"))?
-                    .collect();
-                select_allowed_socket_addrs(&resolve_host, addrs, &local_ips)
+                    .map(|iter| iter.collect::<Vec<_>>())
+                    .map_err(|e| format!("DNS resolution failed for host '{resolve_host}': {e}"));
+                Ok(LookupOutcome::NeedsResolution {
+                    local_ips,
+                    os_result,
+                })
             }),
         )
         .await
         .map_err(|_| "DNS resolution timed out".to_owned())?
         .map_err(|_| "DNS resolution task failed".to_owned())??;
 
-        let client = reqwest::Client::builder()
+        let pinned_addrs = match outcome {
+            LookupOutcome::Literal(addrs) => addrs,
+            LookupOutcome::NeedsResolution {
+                local_ips,
+                os_result,
+            } => {
+                let doh_host = host.clone();
+                resolve_host_addrs_with_fallback(
+                    &host,
+                    os_result,
+                    &local_ips,
+                    allow_private,
+                    move || async move {
+                        resolve_via_doh_endpoints(DOH_ENDPOINTS, &doh_host, port).await
+                    },
+                )
+                .await?
+            }
+        };
+
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .pool_max_idle_per_host(0)
             .redirect(Policy::none())
-            .no_proxy()
-            .resolve_to_addrs(&host, &pinned_addrs)
+            .no_proxy();
+        if host.parse::<IpAddr>().is_err() {
+            builder = builder.resolve_to_addrs(&host, &pinned_addrs);
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
 
@@ -2164,7 +2485,7 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
             let next = url
                 .join(loc)
                 .map_err(|_| "invalid redirect URL".to_owned())?;
-            url = validate_fetch_url(next.as_str())?;
+            url = validate_fetch_url_with_policy(next.as_str(), allow_private)?;
             continue;
         }
         resp_opt = Some(resp);
@@ -2306,10 +2627,20 @@ fn process_fetched_bytes(
     }
 }
 
+#[allow(dead_code)]
 async fn web_fetch_or_bridge(
     raw_url: &str,
     bot_id: &str,
     dns_jobs: Arc<Semaphore>,
+) -> Result<FetchResult, String> {
+    web_fetch_or_bridge_with_policy(raw_url, bot_id, dns_jobs, false).await
+}
+
+async fn web_fetch_or_bridge_with_policy(
+    raw_url: &str,
+    bot_id: &str,
+    dns_jobs: Arc<Semaphore>,
+    allow_all_web_pages: bool,
 ) -> Result<FetchResult, String> {
     if let Ok(bridge_base) = std::env::var("OPENBOT_BROWSER_BRIDGE_URL") {
         let trimmed = bridge_base.trim().trim_end_matches('/');
@@ -2375,7 +2706,12 @@ async fn web_fetch_or_bridge(
             }
         }
     }
-    web_fetch_ssrf_safe(raw_url, dns_jobs).await
+    web_fetch_ssrf_safe_with_policy(
+        raw_url,
+        dns_jobs,
+        allow_all_web_pages || allow_all_web_pages_from_env(),
+    )
+    .await
 }
 
 fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2782,7 +3118,9 @@ fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
     // Strip <script>...</script>, <style>...</style>, and <noscript>...</noscript> blocks
     // before enforcing MAX_PREVIEW_HTML_BYTES so <head> scripts/styles don't starve <body>.
     let safe_base = escape_html(&clip_str_chars(base_url, 1024));
-    let base_tag = format!("<base href=\"{safe_base}\" target=\"_blank\">");
+    let base_tag = format!(
+        "<base href=\"{safe_base}\" target=\"_blank\"><style>html,body{{margin:8px;font-family:system-ui,-apple-system,sans-serif}}img,svg{{max-width:100%;height:auto}}</style>"
+    );
     let budget = MAX_PREVIEW_HTML_BYTES.saturating_sub(base_tag.len() + 32);
     let mut cleaned = String::with_capacity(raw_html.len().min(budget));
     let bytes = raw_html.as_bytes();
@@ -3985,6 +4323,23 @@ async fn run_rest_tool(
             );
         }
     }
+    let org_for_mode = actor.organization.clone();
+    let allow_turbo_web = if matches!(tool_name, "computer_web_fetch" | "computer_navigate") {
+        s.inner
+            .auth
+            .db
+            .try_with_connection(|c| {
+                let mode: Option<String> = rusqlite::OptionalExtension::optional(c.query_row(
+                    "SELECT execution_mode FROM port_approval_settings WHERE organization_id=?1",
+                    params![org_for_mode],
+                    |r| r.get(0),
+                ))?;
+                Ok(mode.as_deref() == Some("turbo"))
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
     match s
         .execute_tool_for_owner_with_control(
             &actor.organization,
@@ -3993,6 +4348,7 @@ async fn run_rest_tool(
             tool_name,
             args,
             allow_human_control,
+            allow_turbo_web,
         )
         .await
     {
@@ -5922,5 +6278,246 @@ mod tests {
         drop(db);
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_dir_all(ws_root);
+    }
+
+    #[test]
+    fn doh_json_parser_extracts_a_aaaa_skips_cname_and_rejects_errors() {
+        let payload = br#"{
+            "Status": 0,
+            "Answer": [
+                { "name": "www.youtube.com.", "type": 5, "TTL": 300, "data": "youtube-ui.l.google.com." },
+                { "name": "youtube-ui.l.google.com.", "type": 1, "TTL": 120, "data": "142.250.185.206" },
+                { "name": "youtube-ui.l.google.com.", "type": 1, "TTL": 120, "data": "142.250.185.206" },
+                { "name": "youtube-ui.l.google.com.", "type": 28, "TTL": 120, "data": "2607:f8b0:4005:80b::200e" }
+            ]
+        }"#;
+        let parsed = parse_doh_answer_ips(payload, 443).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                SocketAddr::new("142.250.185.206".parse().unwrap(), 443),
+                SocketAddr::new("2607:f8b0:4005:80b::200e".parse().unwrap(), 443),
+            ]
+        );
+
+        let empty_ok = parse_doh_answer_ips(br#"{"Status":0,"Answer":[]}"#, 443).unwrap();
+        assert!(empty_ok.is_empty());
+
+        let nxdomain = parse_doh_answer_ips(br#"{"Status":3,"Answer":[]}"#, 443).unwrap_err();
+        assert!(nxdomain.contains("status 3"), "unexpected err: {nxdomain}");
+
+        assert!(parse_doh_answer_ips(b"not json", 443).is_err());
+    }
+
+    #[tokio::test]
+    async fn doh_fallback_triggers_on_sinkhole_or_os_error_and_respects_ssrf_and_local_hosts() {
+        let local = vec![Ipv4Addr::new(192, 168, 10, 3)];
+
+        // Sinkhole (0.0.0.0 / ::) and OS DNS failure on public domains trigger DoH
+        assert!(should_fallback_to_doh(
+            "youtube.com",
+            &Ok(vec![SocketAddr::new("0.0.0.0".parse().unwrap(), 443)])
+        ));
+        assert!(should_fallback_to_doh(
+            "www.youtube.com",
+            &Ok(vec![
+                SocketAddr::new("0.0.0.0".parse().unwrap(), 443),
+                SocketAddr::new("::".parse().unwrap(), 443),
+            ])
+        ));
+        assert!(should_fallback_to_doh(
+            "youtu.be",
+            &Err("lookup failed".to_owned())
+        ));
+        assert!(should_fallback_to_doh("m.youtube.com", &Ok(vec![])));
+
+        // Valid public IP or non-unspecified SSRF IP (e.g. 127.0.0.1) does NOT bypass via DoH
+        assert!(!should_fallback_to_doh(
+            "youtube.com",
+            &Ok(vec![SocketAddr::new("142.250.185.206".parse().unwrap(), 443)])
+        ));
+        assert!(!should_fallback_to_doh(
+            "evil.example",
+            &Ok(vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 443)])
+        ));
+
+        // Local hostnames / single-label LAN names / literal IPs never query public DoH
+        assert!(!should_fallback_to_doh("localhost", &Err("err".to_owned())));
+        assert!(!should_fallback_to_doh("printer.local", &Ok(vec![SocketAddr::new("0.0.0.0".parse().unwrap(), 80)])));
+        assert!(!should_fallback_to_doh("nas", &Err("err".to_owned())));
+        assert!(!should_fallback_to_doh("127.0.0.1", &Err("err".to_owned())));
+
+        // Full resolution fallback when OS DNS returns [0.0.0.0] sinkhole for youtube.com
+        let resolved_sinkhole = resolve_host_addrs_with_fallback(
+            "youtube.com",
+            Ok(vec![SocketAddr::new("0.0.0.0".parse().unwrap(), 443)]),
+            &local,
+            false,
+            || async {
+                Ok(vec![SocketAddr::new("142.250.185.206".parse().unwrap(), 443)])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved_sinkhole,
+            vec![SocketAddr::new("142.250.185.206".parse().unwrap(), 443)]
+        );
+
+        // Full resolution fallback when OS DNS fails completely
+        let resolved_err = resolve_host_addrs_with_fallback(
+            "youtu.be",
+            Err("DNS resolution failed for host 'youtu.be'".to_owned()),
+            &local,
+            false,
+            || async {
+                Ok(vec![SocketAddr::new("142.250.185.174".parse().unwrap(), 443)])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved_err,
+            vec![SocketAddr::new("142.250.185.174".parse().unwrap(), 443)]
+        );
+
+        // If OS DNS returns 127.0.0.1, DoH MUST NOT be consulted and SSRF must reject it
+        let ssrf_blocked = resolve_host_addrs_with_fallback(
+            "evil.example",
+            Ok(vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 443)]),
+            &local,
+            false,
+            || async { panic!("DoH fallback must not run for 127.0.0.1 SSRF result") },
+        )
+        .await
+        .unwrap_err();
+        assert!(ssrf_blocked.contains("SSRF"), "unexpected error: {ssrf_blocked}");
+
+        // Even if DoH returns a private IP while allow_private == false, SSRF still blocks it
+        let doh_private_blocked = resolve_host_addrs_with_fallback(
+            "youtube.com",
+            Ok(vec![SocketAddr::new("0.0.0.0".parse().unwrap(), 443)]),
+            &local,
+            false,
+            || async {
+                Ok(vec![SocketAddr::new("192.168.1.1".parse().unwrap(), 443)])
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            doh_private_blocked.contains("SSRF"),
+            "unexpected error: {doh_private_blocked}"
+        );
+
+        // In allow_private mode, 192.168.x.x is allowed and 0.0.0.0 sinkhole still falls back to DoH
+        let allowed_lan = resolve_host_addrs_with_fallback(
+            "nas.local",
+            Ok(vec![SocketAddr::new("192.168.10.50".parse().unwrap(), 80)]),
+            &local,
+            true,
+            || async { panic!("DoH fallback must not run for .local") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            allowed_lan,
+            vec![SocketAddr::new("192.168.10.50".parse().unwrap(), 80)]
+        );
+    }
+
+    #[tokio::test]
+    async fn doh_http_client_queries_endpoints_and_falls_back_to_second_provider() {
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let app1 = Router::new().route(
+            "/dns-query",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "upstream error") }),
+        );
+        let srv1 = tokio::spawn(async move { axum::serve(listener1, app1).await.unwrap() });
+
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let app2 = Router::new().route(
+            "/resolve",
+            get(|headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
+                let accept = headers
+                    .get(header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert_eq!(accept, "application/dns-json");
+                assert_eq!(params.get("name").map(String::as_str), Some("youtube.com"));
+                assert_eq!(params.get("type").map(String::as_str), Some("A"));
+                Json(json!({
+                    "Status": 0,
+                    "Answer": [
+                        { "name": "youtube.com.", "type": 1, "TTL": 120, "data": "142.250.185.206" }
+                    ]
+                }))
+            }),
+        );
+        let srv2 = tokio::spawn(async move { axum::serve(listener2, app2).await.unwrap() });
+
+        let ep1 = format!("http://{addr1}/dns-query");
+        let ep2 = format!("http://{addr2}/resolve");
+        let resolved = resolve_via_doh_endpoints(&[&ep1, &ep2], "youtube.com", 443)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new("142.250.185.206".parse().unwrap(), 443)]
+        );
+
+        srv1.abort();
+        srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn web_fetch_ssrf_safe_with_policy_honors_allow_private_and_public_youtube_urls() {
+        assert_eq!(
+            validate_fetch_url("youtu.be/dQw4w9WgXcQ").unwrap().as_str(),
+            "https://youtu.be/dQw4w9WgXcQ"
+        );
+        assert_eq!(
+            validate_fetch_url("m.youtube.com").unwrap().as_str(),
+            "https://m.youtube.com/"
+        );
+        assert_eq!(
+            validate_fetch_url("youtube.com/results?search_query=https://other.com")
+                .unwrap()
+                .as_str(),
+            "https://youtube.com/results?search_query=https://other.com"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/page",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<html><head><title>Permissive OK</title></head><body><p>Hello LAN</p></body></html>",
+                )
+            }),
+        );
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dns_jobs = Arc::new(Semaphore::new(4));
+        let url = format!("http://{addr}/page");
+
+        let blocked = web_fetch_ssrf_safe_with_policy(&url, dns_jobs.clone(), false)
+            .await
+            .err()
+            .unwrap();
+        assert!(blocked.contains("SSRF"), "unexpected error: {blocked}");
+
+        let allowed = web_fetch_ssrf_safe_with_policy(&url, dns_jobs, true)
+            .await
+            .unwrap();
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.title, "Permissive OK");
+        assert!(allowed.text.contains("Hello LAN"));
+
+        srv.abort();
     }
 }

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import {
   ContextMeter,
   type ConversationContextInfo,
@@ -113,5 +113,55 @@ test("ContextMeter fetches live context endpoint and hides cleanly on 404", asyn
     expect(el?.textContent).toContain("16.4k tok");
     expect(el?.textContent).toContain("91% left");
     expect(el?.textContent).not.toContain("Compacted");
+  });
+});
+
+test("ContextMeter hover tooltip uses dark surface styling instead of white bg-foreground", async () => {
+  const snapshot: ConversationContextInfo = {
+    used_tokens: 4200,
+    context_limit: 8192,
+    remaining_tokens: 3992,
+    percent_used: 51.3,
+    auto_compact_threshold: 6144,
+    compacted: true,
+    system_tokens: 500,
+    history_tokens: 3100,
+    tools_tokens: 600,
+    compacted_before_tokens: 7100,
+    compacted_after_tokens: 4200,
+    dropped_turns: 2,
+  };
+
+  const view = render(
+    <TooltipProvider delay={0}>
+      <ContextMeter context={snapshot} />
+    </TooltipProvider>,
+  );
+
+  const trigger = view.container.querySelector(
+    '[data-slot="context-meter"]',
+  ) as HTMLElement;
+  expect(trigger).not.toBeNull();
+  fireEvent.pointerEnter(trigger);
+  fireEvent.focus(trigger);
+
+  await waitFor(() => {
+    const popup = document.querySelector(
+      '[data-slot="tooltip-content"]',
+    ) as HTMLElement | null;
+    expect(popup).not.toBeNull();
+    expect(popup?.className).toContain("bg-[#141720]");
+    expect(popup?.className).toContain("border-white/10");
+    expect(popup?.className).toContain("text-zinc-100");
+    const arrow = popup?.querySelector(
+      '[data-slot="tooltip-arrow"]',
+    ) as HTMLElement | null;
+    expect(arrow).not.toBeNull();
+    expect(arrow?.className).toContain("bg-[#141720]");
+    expect(arrow?.className).toContain("fill-[#141720]");
+    expect(popup?.innerHTML).toContain("bg-white/10");
+    expect(popup?.innerHTML).toContain("border-white/10");
+    expect(popup?.innerHTML).not.toContain("bg-background/20");
+    expect(popup?.innerHTML).not.toContain("border-background/15");
   });
 });

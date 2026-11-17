@@ -15,4 +15,6 @@ export interface ApprovalSettings {
   /** The most a person may allow for commands on their own computer. */
   hostCommandsCap: HostCommandPolicy;
   actionKinds: ApprovalActionKinds;
+  /** Execution mode for tool/command approvals: ask, auto, or turbo. */
+  executionMode?: "ask" | "auto" | "turbo";
 }

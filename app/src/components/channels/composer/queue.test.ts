@@ -693,3 +693,43 @@ describe("restoring a failed run", () => {
     expect(result.queue).toBe(queue);
   });
 });
+
+describe("sending a queued message now", () => {
+  test("pops the targeted message to run immediately while keeping the rest queued in order", () => {
+    const file = attachment("spec");
+    let queue = park([], "one", "first", ["alpha"]);
+    queue = park(queue, "two", "second", ["beta"], [file]);
+    queue = park(queue, "three", "third");
+
+    const result = reduceQueue(queue, { id: "two", type: "sendNow" });
+
+    expect(result.queue.map((m) => m.id)).toEqual(["one", "three"]);
+    expect(result.run).toEqual({
+      agentId: null,
+      attachments: [file],
+      commandIds: ["beta"],
+      isEmpty: false,
+      text: "second",
+    });
+    expect(result.droppedAttachments).toEqual([]);
+    expect(result.restoreIfRunFails).toEqual([
+      {
+        attachments: [file],
+        commandIds: ["beta"],
+        id: "two",
+        text: "second",
+      },
+    ]);
+  });
+
+  test("an unknown id leaves the queue reference untouched and starts no run", () => {
+    const queue = park([], "one", "still waiting");
+
+    const result = reduceQueue(queue, { id: "missing", type: "sendNow" });
+
+    expect(result.queue).toBe(queue);
+    expect(result.run).toBeNull();
+    expect(result.droppedAttachments).toEqual([]);
+    expect(result.restoreIfRunFails).toEqual([]);
+  });
+});

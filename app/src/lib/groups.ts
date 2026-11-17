@@ -202,6 +202,7 @@ export function sendGroupMessageMutationOptions(
       text: string;
       agentId: string | null;
       attachmentIds?: readonly string[];
+      interruptActive?: boolean;
     }) => {
       await sendConversationMessage(
         organizationId(),
@@ -213,6 +214,7 @@ export function sendGroupMessageMutationOptions(
           ...(input.attachmentIds && input.attachmentIds.length > 0
             ? { attachmentIds: [...input.attachmentIds] }
             : {}),
+          ...(input.interruptActive ? { interruptActive: true } : {}),
         } as Parameters<typeof sendConversationMessage>[2],
         once(),
         { fallback: "Your message could not be sent to the group." },

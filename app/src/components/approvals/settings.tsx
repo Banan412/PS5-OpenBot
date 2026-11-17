@@ -1,4 +1,5 @@
 import {
+  IconBolt,
   IconChecklist,
   IconEyeCheck,
   IconHandStop,
@@ -27,8 +28,10 @@ import {
   approvalInboxOptions,
   approvalPreferencesMutationOptions,
   createApprovalRuleMutationOptions,
+  normalizeExecutionMode,
   revokeApprovalRuleMutationOptions,
   ruleCoversBot,
+  teamApprovalSettingsMutationOptions,
   updateApprovalRuleMutationOptions,
 } from "@/lib/approvals";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
@@ -41,6 +44,10 @@ import {
   ASK_FIRST_TITLE,
   HANDED_TO_YOU,
 } from "./ask-first-copy";
+import {
+  EXECUTION_MODE_OPTIONS,
+  ExecutionModeSelector,
+} from "./execution-mode-selector";
 import { HOST_LABELS, LabelSelect, RuleForm, RuleRow } from "./rules";
 
 /**
@@ -59,14 +66,26 @@ export function ApprovalSettings() {
   const preferences = useMutation(
     approvalPreferencesMutationOptions(queryClient),
   );
+  const teamSettings = useMutation(
+    teamApprovalSettingsMutationOptions(queryClient),
+  );
   const addRule = useMutation(createApprovalRuleMutationOptions(queryClient));
   const changeRule = useMutation(
     updateApprovalRuleMutationOptions(queryClient),
   );
   const revoke = useMutation(revokeApprovalRuleMutationOptions(queryClient));
   const error =
-    inbox.error ?? preferences.error ?? changeRule.error ?? revoke.error;
+    inbox.error ??
+    preferences.error ??
+    teamSettings.error ??
+    changeRule.error ??
+    revoke.error;
   if (inbox.isPending && !error) return null;
+  const executionMode = normalizeExecutionMode(inbox.data?.team?.executionMode);
+  const executionDescription = EXECUTION_MODE_OPTIONS.find(
+    (option) => option.value === executionMode,
+  )?.description;
+  const canEditExecutionMode = !me || isOrganizationAdmin(me.role);
   const enforced = inbox.data?.team?.enforceAutoReview ?? false;
   const rulesOff = inbox.data?.team?.customRulesEnabled === false;
   const everyBot = (inbox.data?.rules ?? []).filter(
@@ -121,6 +140,31 @@ export function ApprovalSettings() {
         title="Before a Bot acts"
       >
         <PageRows>
+          <Item size="sm">
+            <ItemMedia variant="icon">
+              <IconBolt />
+            </ItemMedia>
+            <ItemContent>
+              <ItemTitle>Execution mode</ItemTitle>
+              <ItemDescription className="line-clamp-none">
+                {executionDescription}
+                {canEditExecutionMode
+                  ? ""
+                  : " Controlled by your organization administrator."}
+              </ItemDescription>
+            </ItemContent>
+            <ItemActions>
+              <ExecutionModeSelector
+                disabled={inbox.isLoading || teamSettings.isPending}
+                onChange={(nextMode) =>
+                  teamSettings.mutate({ executionMode: nextMode })
+                }
+                readOnly={!canEditExecutionMode}
+                value={executionMode}
+              />
+            </ItemActions>
+          </Item>
+          <Separator />
           <Item size="sm">
             <ItemMedia variant="icon">
               <IconHandStop />

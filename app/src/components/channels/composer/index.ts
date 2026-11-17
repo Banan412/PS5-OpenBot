@@ -18,4 +18,8 @@ export {
   type QueueTransition,
   reduceQueue,
 } from "./queue";
+export {
+  SendModeToggle,
+  type SendModeToggleProps,
+} from "./send-mode-toggle";
 export { type AgentOption, toAgentOptions } from "./triggers";

@@ -18,7 +18,7 @@ use std::{
 
 // "OBPS"; identifies our database and avoids migrating an unrelated file.
 const APPLICATION_ID: i32 = 0x4f42_5053;
-const CURRENT_VERSION: i32 = 12;
+const CURRENT_VERSION: i32 = 13;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
@@ -205,7 +205,51 @@ fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
         tx.execute_batch(include_str!("../migrations/0012_attachments_routines.sql"))?;
         tx.pragma_update(None, "user_version", 12)?;
     }
+    if version < 13 {
+        ensure_column(
+            &tx,
+            "port_approval_settings",
+            "execution_mode",
+            "TEXT NOT NULL DEFAULT 'ask' CHECK (execution_mode IN ('ask', 'auto', 'turbo'))",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO port_approval_settings(
+                organization_id, enforce_auto_review, custom_rules_enabled,
+                host_commands_cap, action_kinds_json, execution_mode
+            )
+            SELECT id, 0, 1, 'ask', '{}', 'ask' FROM auth_organizations",
+            [],
+        )?;
+        tx.pragma_update(None, "user_version", 13)?;
+    }
     tx.commit()?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), StorageError> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -319,6 +363,73 @@ mod tests {
             assert!(task.join().unwrap().is_ok());
         });
         drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrates_v12_approval_settings_idempotently_to_execution_mode() {
+        let dir = test_dir();
+        let path = dir.join("v12.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "TRUNCATE").unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(include_str!("../migrations/0001_metadata.sql")).unwrap();
+            conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
+            conn.execute_batch(include_str!("../migrations/0002_local_auth.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0003_bots.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0004_conversations.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0005_preferences.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0006_run_events.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0007_runs.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0008_direct_threads.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0009_governance.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0010_compat.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0011_approvals.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/0012_attachments_routines.sql")).unwrap();
+            conn.execute(
+                "INSERT INTO auth_organizations(id, slug, name) VALUES ('default', 'default', 'OpenBot')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auth_organizations(id, slug, name) VALUES ('org_seeded', 'org_seeded', 'Seeded')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO port_approval_settings(organization_id, enforce_auto_review, custom_rules_enabled, host_commands_cap, action_kinds_json)
+                 VALUES ('default', 0, 1, 'ask', '{}')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 12).unwrap();
+        }
+
+        let db = Storage::open(&path).unwrap();
+        db.try_with_connection(|c| {
+            let ver: i32 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(ver, 13);
+            let mode_default: String = c.query_row(
+                "SELECT execution_mode FROM port_approval_settings WHERE organization_id = 'default'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(mode_default, "ask");
+            let (seeded_custom, seeded_mode): (bool, String) = c.query_row(
+                "SELECT custom_rules_enabled, execution_mode FROM port_approval_settings WHERE organization_id = 'org_seeded'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert!(seeded_custom);
+            assert_eq!(seeded_mode, "ask");
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        // Reopening again stays idempotent.
+        let db2 = Storage::open(&path).unwrap();
+        drop(db2);
         fs::remove_dir_all(dir).unwrap();
     }
 }

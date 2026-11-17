@@ -99,7 +99,12 @@ export type QueueAction =
    */
   | { type: "restore"; messages: readonly QueuedMessage[] }
   /** Second thoughts, before it has run. */
-  | { type: "remove"; id: string };
+  | { type: "remove"; id: string }
+  /**
+   * Pull one parked message out of the queue to send immediately (interrupting any active or
+   * stuck turn), leaving the rest in order if any remain.
+   */
+  | { type: "sendNow"; id: string };
 
 export type QueueTransition = {
   /** The queue afterwards. The same array when nothing moved, so a render can be skipped. */
@@ -366,6 +371,25 @@ export function reduceQueue(
         run: null,
         droppedAttachments: removed.flatMap((message) => message.attachments),
         restoreIfRunFails: [],
+      };
+    }
+
+    case "sendNow": {
+      const target = queue.find((message) => message.id === action.id);
+      if (!target) {
+        return {
+          queue,
+          run: null,
+          droppedAttachments: [],
+          restoreIfRunFails: [],
+        };
+      }
+      const joined = joinQueued([target], null);
+      return {
+        queue: queue.filter((message) => message.id !== action.id),
+        run: joined.draft,
+        droppedAttachments: joined.dropped,
+        restoreIfRunFails: carrying([target], joined.draft.attachments),
       };
     }
   }

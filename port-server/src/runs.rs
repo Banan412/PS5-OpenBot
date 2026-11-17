@@ -794,10 +794,25 @@ fn load_tool_summaries_by_message(
         } else {
             "NO_RESULT (did not complete)".to_owned()
         };
-        let line = format!("[Tool call: {}({}) -> {}]", tc.name, args_summary, outcome);
+        let line = format!("(History: executed {} with {} -> {})", tc.name, args_summary, outcome);
         out.entry(tc.msg_id).or_default().push(line);
     }
     Ok(out)
+}
+
+fn sanitize_legacy_tool_text(text: &str) -> String {
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[Tool call:")
+            || trimmed.starts_with("✅ Status:")
+            || trimmed.starts_with("Status: 200 OK")
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
 }
 
 fn build_group_transcript(
@@ -838,12 +853,17 @@ fn build_group_transcript(
     for (idx, (mid, role, bid, text, status)) in history.into_iter().enumerate() {
         let is_last_person = Some(idx) == last_person_idx;
         let is_recent = idx + 2 >= history_len;
-        let spoken = if is_last_person {
-            text
-        } else if idx + 1 == history_len {
-            clip_chars(&text, msg_clip.max(1200))
+        let clean_text = if role == "bot" {
+            sanitize_legacy_tool_text(&text)
         } else {
-            clip_chars(&text, msg_clip)
+            text
+        };
+        let spoken = if is_last_person {
+            clean_text
+        } else if idx + 1 == history_len {
+            clip_chars(&clean_text, msg_clip.max(1200))
+        } else {
+            clip_chars(&clean_text, msg_clip)
         };
         let mut entry = String::new();
         if role == "person" {
@@ -972,6 +992,9 @@ fn build_dm_messages(
     for (idx, (mid, role, _bid, mut msg_text, status)) in history.into_iter().enumerate() {
         let is_last_person = Some(idx) == last_person_idx;
         let is_recent = idx + 2 >= history_len;
+        if role == "bot" {
+            msg_text = sanitize_legacy_tool_text(&msg_text);
+        }
         if !is_last_person {
             let cap = if idx + 1 == history_len { 1200 } else { 600 };
             msg_text = clip_chars(&msg_text, cap);
@@ -1186,6 +1209,8 @@ pub(crate) struct Input {
     pub(crate) bot_id: Option<String>,
     #[serde(default)]
     pub(crate) attachment_ids: Option<Vec<String>>,
+    #[serde(default, alias = "interrupt_active")]
+    pub(crate) interrupt_active: bool,
 }
 
 #[derive(Deserialize)]
@@ -1235,22 +1260,79 @@ async fn stop(
         return problem(StatusCode::SERVICE_UNAVAILABLE, "Service unavailable");
     };
     let db = s.auth.db.clone();
-    let result = tokio::task::spawn_blocking(move || { let _permit=permit; db.try_with_connection(|c| {
-        let row:Option<Option<String>>=c.query_row("SELECT (SELECT id FROM port_runs r WHERE r.conversation_id=c.id AND r.bot_id=?1 AND r.status='running' AND (?5 IS NULL OR r.id=?5) LIMIT 1) FROM port_conversations c JOIN port_bots b ON b.id=?1 AND b.organization_id=c.organization_id AND b.owner_id=c.owner_id WHERE c.thread_id=?2 AND c.organization_id=?3 AND c.owner_id=?4 AND c.deleted=0",params![bot,thread,actor.organization,actor.id,scope.run_id],|r|r.get(0)).optional()?;
-        Ok(row)
-    }) }).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        db.try_with_connection(|c| {
+            let row: Option<Option<String>> = c
+                .query_row(
+                    "SELECT COALESCE(
+                        (SELECT id FROM port_runs r WHERE r.conversation_id=c.id AND r.bot_id=?1 AND r.status='running' AND (?5 IS NULL OR r.id=?5) LIMIT 1),
+                        CASE WHEN ?5 IS NULL THEN (SELECT id FROM port_runs r WHERE r.conversation_id=c.id AND r.status='running' LIMIT 1) ELSE NULL END
+                     )
+                       FROM port_conversations c
+                       JOIN port_bots b ON b.id=?1 AND b.organization_id=c.organization_id AND b.owner_id=c.owner_id
+                      WHERE c.thread_id=?2 AND c.organization_id=?3 AND c.owner_id=?4 AND c.deleted=0",
+                    params![bot, thread, actor.organization, actor.id, scope.run_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(row)
+        })
+    })
+    .await;
     let run = match result {
         Ok(Ok(Some(v))) => v,
         Ok(Ok(None)) => return problem(StatusCode::NOT_FOUND, "Thread or bot not found"),
         _ => return problem(StatusCode::SERVICE_UNAVAILABLE, "Service unavailable"),
     };
-    let stopped = run
+    let mut stopped = run
         .as_ref()
         .and_then(|id| s.active.lock().ok().and_then(|map| map.get(id).cloned()))
         .is_some_and(|token| {
             token.cancel();
             true
         });
+    if !stopped {
+        if let Some(stuck_run_id) = run.as_ref() {
+            // If a DB run row is marked 'running' while absent from `s.active` and `capacity` is free,
+            // unstick it so the thread does not remain permanently blocked.
+            if let Ok(_free_permit) = s.capacity.clone().try_acquire_owned() {
+                if let Ok(db_p) = s.auth.db_jobs.clone().try_acquire_owned() {
+                    let db_c = s.auth.db.clone();
+                    let rid = stuck_run_id.clone();
+                    let cleaned = tokio::task::spawn_blocking(move || {
+                        let _p = db_p;
+                        db_c.try_with_connection(|c| {
+                            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                            let conv_id: Option<String> = tx
+                                .query_row(
+                                    "SELECT conversation_id FROM port_runs WHERE id=?1 AND status='running'",
+                                    params![rid],
+                                    |r| r.get(0),
+                                )
+                                .optional()?;
+                            let n = tx.execute(
+                                "UPDATE port_runs SET status='failed' WHERE id=?1 AND status='running'",
+                                params![rid],
+                            )?;
+                            if let Some(cid) = conv_id {
+                                tx.execute(
+                                    "UPDATE port_conversation_messages SET status='failed' WHERE conversation_id=?1 AND status IN ('running', 'queued')",
+                                    params![cid],
+                                )?;
+                            }
+                            tx.commit()?;
+                            Ok(n > 0)
+                        })
+                    })
+                    .await;
+                    if matches!(cleaned, Ok(Ok(true))) {
+                        stopped = true;
+                    }
+                }
+            }
+        }
+    }
     let mut response = Json(if stopped { json!({"stopped":true,"interrupt":{"type":"RUN_ERROR","message":"Run stopped by user","code":"STOPPED"}}) } else { json!({"stopped":false}) }).into_response();
     response
         .headers_mut()
@@ -1427,23 +1509,141 @@ pub(crate) async fn send_with_run_id(
         fingerprint_input["runId"] = Value::String(id.clone());
     }
     let fingerprint = Sha256::digest(fingerprint_input.to_string().as_bytes()).to_vec();
-    let permit = match s.capacity.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            if let Some(ref b) = bot_override {
-                return retry_while_busy(
-                    &s,
-                    &actor.id,
-                    &actor.organization,
-                    &conversation,
-                    b,
-                    &input.id,
-                    &key,
-                    &fingerprint,
-                )
-                .await;
+    if input.interrupt_active {
+        if let Ok(db_p) = s.auth.db_jobs.clone().try_acquire_owned() {
+            let db_c = s.auth.db.clone();
+            let conv_c = conversation.clone();
+            let org_c = actor.organization.clone();
+            let own_c = actor.id.clone();
+            let msg_c = input.id.clone();
+            let key_c = key.clone();
+            let fp_c = fingerprint.clone();
+            let pre = tokio::task::spawn_blocking(move || {
+                let _p = db_p;
+                db_c.try_with_connection(|c| {
+                    let exists: bool = c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM port_conversations WHERE id=?1 AND organization_id=?2 AND owner_id=?3 AND deleted=0)",
+                        params![conv_c, org_c, own_c],
+                        |r| r.get(0),
+                    )?;
+                    if !exists {
+                        return Ok(json!({"status":"skip"}));
+                    }
+                    match existing(c, &own_c, &conv_c, &msg_c, &key_c, &fp_c)? {
+                        Existing::Replay => return Ok(json!({"status":"replay"})),
+                        Existing::Conflict => return Ok(json!({"status":"conflict"})),
+                        Existing::None => {}
+                    }
+                    let mut stmt = c.prepare(
+                        "SELECT id FROM port_runs WHERE conversation_id=?1 AND status='running'",
+                    )?;
+                    let ids: Vec<String> = stmt
+                        .query_map(params![conv_c], |r| r.get(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(json!({"status":"ok","running":ids}))
+                })
+            })
+            .await;
+            if let Ok(Ok(val)) = pre {
+                match val["status"].as_str() {
+                    Some("replay") => return accepted(&input.id, false),
+                    Some("conflict") => {
+                        return problem(StatusCode::CONFLICT, "Message or idempotency key conflict");
+                    }
+                    Some("ok") => {
+                        if let Some(ids) = val["running"].as_array() {
+                            let map = s.active.lock().unwrap_or_else(|e| e.into_inner());
+                            for id_val in ids {
+                                if let Some(rid) = id_val.as_str() {
+                                    if let Some(token) = map.get(rid) {
+                                        token.cancel();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-            return problem(StatusCode::CONFLICT, "Conversation already running");
+        }
+    }
+    let permit = if input.interrupt_active {
+        let mut acquired = None;
+        for attempt in 0..40usize {
+            match s.capacity.clone().try_acquire_owned() {
+                Ok(p) => {
+                    acquired = Some(p);
+                    break;
+                }
+                Err(_) if attempt < 39 => {
+                    if let Ok(db_p) = s.auth.db_jobs.clone().try_acquire_owned() {
+                        let db_c = s.auth.db.clone();
+                        let conv_c = conversation.clone();
+                        if let Ok(Ok(ids)) = tokio::task::spawn_blocking(move || {
+                            let _p = db_p;
+                            db_c.try_with_connection(|c| {
+                                let mut stmt = c.prepare(
+                                    "SELECT id FROM port_runs WHERE conversation_id=?1 AND status='running'",
+                                )?;
+                                let rows = stmt
+                                    .query_map(params![conv_c], |r| r.get::<_, String>(0))?
+                                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                                Ok(rows)
+                            })
+                        })
+                        .await
+                        {
+                            let map = s.active.lock().unwrap_or_else(|e| e.into_inner());
+                            for rid in &ids {
+                                if let Some(token) = map.get(rid) {
+                                    token.cancel();
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        match acquired {
+            Some(p) => p,
+            None => {
+                if let Some(ref b) = bot_override {
+                    return retry_while_busy(
+                        &s,
+                        &actor.id,
+                        &actor.organization,
+                        &conversation,
+                        b,
+                        &input.id,
+                        &key,
+                        &fingerprint,
+                    )
+                    .await;
+                }
+                return problem(StatusCode::CONFLICT, "Conversation already running");
+            }
+        }
+    } else {
+        match s.capacity.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                if let Some(ref b) = bot_override {
+                    return retry_while_busy(
+                        &s,
+                        &actor.id,
+                        &actor.organization,
+                        &conversation,
+                        b,
+                        &input.id,
+                        &key,
+                        &fingerprint,
+                    )
+                    .await;
+                }
+                return problem(StatusCode::CONFLICT, "Conversation already running");
+            }
         }
     };
     let registration = s.registration.clone();
@@ -1462,6 +1662,8 @@ pub(crate) async fn send_with_run_id(
     let text = stored_text;
     let attach_ids = attachment_ids.clone();
     let vc_for_attach = s.virtual_computer.clone();
+    let interrupt_active = input.interrupt_active;
+    let active_for_cleanup = s.active.clone();
     let result=tokio::task::spawn_blocking(move||{let _p=db_permit;db.try_with_connection(|c|{
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let conv:Option<(String,String)>=tx.query_row("SELECT thread_id,bot_ids_json FROM port_conversations WHERE id=?1 AND organization_id=?2 AND owner_id=?3 AND deleted=0",params![conversation_id,org_id,owner],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -1495,8 +1697,37 @@ pub(crate) async fn send_with_run_id(
             "DELETE FROM port_metadata WHERE key=?1",
             params![format!("conversation_replay_gap:{conversation_id}")],
         )?;
-        let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM port_runs WHERE conversation_id=?1 AND status='running')",params![conversation_id],|r|r.get(0))?;
-        if active{return Ok(json!({"result":"busy"}))}
+        let running_ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM port_runs WHERE conversation_id=?1 AND status='running'")?;
+            let rows = stmt
+                .query_map(params![conversation_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            rows
+        };
+        if !running_ids.is_empty() {
+            let can_clear = interrupt_active || {
+                let map = active_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+                running_ids.iter().all(|rid| !map.contains_key(rid))
+            };
+            if can_clear {
+                tx.execute(
+                    "UPDATE port_runs SET status='failed' WHERE conversation_id=?1 AND status='running'",
+                    params![conversation_id],
+                )?;
+                tx.execute(
+                    "UPDATE port_conversation_messages SET status='failed' WHERE conversation_id=?1 AND status IN ('running', 'queued')",
+                    params![conversation_id],
+                )?;
+                let mut map = active_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+                for rid in &running_ids {
+                    if let Some(tok) = map.remove(rid) {
+                        tok.cancel();
+                    }
+                }
+            } else {
+                return Ok(json!({"result":"busy"}));
+            }
+        }
         let run=match requested_run_id {Some(id)=>{let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM port_runs WHERE id=?1)",params![id],|r|r.get(0))?;if exists{return Ok(json!({"result":"conflict"}))}id},None=>random_id()?};let reply=format!("assistant_{}",random_id()?);let timestamp=now()?;
         tx.execute("INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'person',?3,NULL,?4,'completed',?5)",params![message_id,conversation_id,owner,text,timestamp])?;
         let mut attached_files: Vec<(String, String, i64, Vec<u8>, Option<String>)> = Vec::new();
@@ -1800,7 +2031,7 @@ pub(crate) async fn send_with_run_id(
     accepted(&input.id, true)
 }
 
-const VC_TOOL_GROUNDING_PROMPT: &str = "TOOL USE RULES: You have Virtual Computer tools (computer_web_fetch, computer_read_file, computer_write_file, computer_list_files, computer_run_command). When asked to open, visit, or fetch a URL or website, you MUST invoke computer_web_fetch with a full https:// URL. When asked to read, write, list, or run workspace files or commands, you MUST invoke the corresponding workspace tool. For computer_write_file, keep each file concise or write large files in smaller chunks using append: true so tool arguments do not hit the output/context limit. NEVER claim you opened, fetched, read, wrote, or ran anything without an actual successful tool call in this conversation; if a tool fails or is denied, report the exact error or denial.";
+const VC_TOOL_GROUNDING_PROMPT: &str = "TOOL USE RULES: You have Virtual Computer tools (computer_web_fetch, computer_read_file, computer_write_file, computer_list_files, computer_run_command). When asked to open, visit, or fetch a URL or website, you MUST invoke computer_web_fetch with a full https:// URL. When asked to read, write, list, or run workspace files or commands, you MUST invoke the corresponding workspace tool. For computer_write_file, keep each file concise or write large files in smaller chunks using append: true so tool arguments do not hit the output/context limit. NEVER write fake '[Tool call: ...]', '(History: ...)', or 'Status: 200 OK' text instead of calling a tool; invoke the real function tool call via tool_calls. NEVER claim you opened, fetched, read, wrote, or ran anything without an actual successful tool call in this conversation; if a tool fails or is denied, report the exact error or denial.";
 
 fn append_vc_tool_grounding(request: &mut Value) {
     if let Some(msgs) = request.get_mut("messages").and_then(Value::as_array_mut) {
@@ -2265,6 +2496,7 @@ async fn execute_with_handoff(
             &cancel,
             &mut total_answer,
             0,
+            &[],
         )
         .await;
     }
@@ -2478,7 +2710,66 @@ pub(crate) fn compact_request_for_oom(request: &mut Value) {
     *msgs = compacted;
 }
 
+#[derive(Clone)]
+struct ExecutedToolSummary {
+    tool_name: String,
+    scope: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+fn summarize_executed_tools(tools: &[ExecutedToolSummary]) -> String {
+    let start = tools.len().saturating_sub(5);
+    let parts: Vec<String> = tools[start..]
+        .iter()
+        .map(|t| {
+            let target = clip_chars(t.scope.trim(), 80);
+            if t.ok {
+                match t.tool_name.as_str() {
+                    "computer_write_file" => format!("saved `{target}`"),
+                    "computer_read_file" => format!("read `{target}`"),
+                    "computer_list_files" => format!("listed `{target}`"),
+                    "computer_run_command" => format!("ran `{target}`"),
+                    "computer_web_fetch" | "computer_navigate" => format!("fetched `{target}`"),
+                    other => format!("ran `{other}`"),
+                }
+            } else {
+                let err = t
+                    .error
+                    .as_deref()
+                    .map(|e| clip_chars(e.trim(), 80))
+                    .unwrap_or_else(|| "failed".to_owned());
+                match t.tool_name.as_str() {
+                    "computer_write_file" => format!("failed to save `{target}` ({err})"),
+                    "computer_read_file" => format!("failed to read `{target}` ({err})"),
+                    "computer_list_files" => format!("failed to list `{target}` ({err})"),
+                    "computer_run_command" => format!("command `{target}` failed ({err})"),
+                    "computer_web_fetch" | "computer_navigate" => {
+                        format!("failed to fetch `{target}` ({err})")
+                    }
+                    other => format!("`{other}` failed ({err})"),
+                }
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "Done.".to_owned()
+    } else {
+        format!("Done — {}.", parts.join(", "))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+fn looks_like_hallucinated_tool_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("[tool call:")
+        || lower.contains("computer_web_fetch(")
+        || lower.contains("computer_write_file(")
+        || lower.contains("computer_run_command(")
+        || lower.contains("computer_read_file(")
+        || (lower.contains("✅ status: 200") && lower.contains("http"))
+}
+
 async fn execute_tool_rounds(
     auth: &AuthState,
     model: &ModelClient,
@@ -2495,12 +2786,14 @@ async fn execute_tool_rounds(
     cancel: &CancellationToken,
     total_answer: &mut String,
     start_round: usize,
+    initial_executed: &[ExecutedToolSummary],
 ) -> (bool, Option<Value>, Option<String>) {
     let mut failed = false;
     let mut terminal: Option<Value> = None;
     let mut failure_detail: Option<String> = None;
     let mut oom_retried = false;
     let mut run_compaction: Option<context_manager::CompactionResult> = None;
+    let mut executed_tools: Vec<ExecutedToolSummary> = initial_executed.to_vec();
     let mut round = start_round;
     while round <= 4usize {
         if cancel.is_cancelled() {
@@ -2514,6 +2807,10 @@ async fn execute_tool_rounds(
         if is_synthesis_round {
             if let Some(obj) = current_request.as_object_mut() {
                 obj.remove("tools");
+                obj.remove("tool_choice");
+            }
+        } else if round > 1 {
+            if let Some(obj) = current_request.as_object_mut() {
                 obj.remove("tool_choice");
             }
         }
@@ -2598,6 +2895,24 @@ async fn execute_tool_rounds(
                 break;
             }
         };
+        if round == 0
+            && !is_synthesis_round
+            && turn.tool_calls.is_empty()
+            && executed_tools.is_empty()
+            && looks_like_hallucinated_tool_text(&stream_deltas)
+            && current_request.get("tools").is_some()
+        {
+            if let Some(arr) = current_request.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.push(json!({"role":"assistant","content":stream_deltas}));
+                arr.push(json!({
+                    "role":"user",
+                    "content":"System correction: You wrote fake tool-call text instead of calling a tool. Do NOT write '[Tool call: ...]'. Call the real function tool right now using tool_calls."
+                }));
+            }
+            current_request["tool_choice"] = json!("required");
+            round += 1;
+            continue;
+        }
         if is_synthesis_round || turn.tool_calls.is_empty() {
             if !turn.truncated_tool_call_ids.is_empty() {
                 let note = "Output reached the model's context/token limit before the tool call could finish. Please try generating it in smaller parts or chunks.";
@@ -2631,6 +2946,36 @@ async fn execute_tool_rounds(
                     .await;
                     total_answer.push_str(&note_text);
                 }
+            } else if !executed_tools.is_empty()
+                && (total_answer.trim().is_empty() || is_silent_group_pass(total_answer))
+            {
+                let summary = summarize_executed_tools(&executed_tools);
+                let summary_msg_id = format!("{round_msg_id}_summary");
+                let was_empty = total_answer.trim().is_empty();
+                if was_empty {
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_START","messageId":summary_msg_id,"role":"assistant"}),
+                        cancel,
+                    )
+                    .await;
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_CONTENT","messageId":summary_msg_id,"delta":summary}),
+                        cancel,
+                    )
+                    .await;
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_END","messageId":summary_msg_id}),
+                        cancel,
+                    )
+                    .await;
+                }
+                *total_answer = summary;
             }
             terminal = Some(json!({"type":"RUN_FINISHED","threadId":thread,"runId":run}));
             break;
@@ -2656,15 +3001,11 @@ async fn execute_tool_rounds(
                 _ => json!({}),
             };
             let effect = match tc.name.as_str() {
-                "computer_write_file" | "computer_run_command" => "write",
+                "computer_write_file" | "computer_run_command" | "computer_click"
+                | "computer_type" | "computer_key" => "write",
                 _ => "read",
             };
-            let scope = args
-                .get("path")
-                .or_else(|| args.get("url"))
-                .or_else(|| args.get("command"))
-                .and_then(Value::as_str)
-                .unwrap_or("*");
+            let scope = approvals_api::extract_tool_scope(&args);
             let eval_res = {
                 let db = auth.db.clone();
                 let org_c = org.to_owned();
@@ -2704,13 +3045,39 @@ async fn execute_tool_rounds(
             };
             match outcome.decision {
                 approvals_api::EvaluationDecision::Allow => {
+                    let allow_all_web = outcome.source == "turbo_mode";
                     let exec_res = vc
-                        .execute_tool_for_owner(org, owner, bot, &tc.name, args.clone())
+                        .execute_tool_for_owner_with_policy(
+                            org,
+                            owner,
+                            bot,
+                            &tc.name,
+                            args.clone(),
+                            allow_all_web,
+                        )
                         .await;
-                    let content_str = match exec_res {
-                        Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "{}".into()),
-                        Err(err) => json!({"error": err}).to_string(),
+                    let (tool_ok, tool_err, content_str) = match exec_res {
+                        Ok(val) => {
+                            let err_msg = val
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let ok_flag = err_msg.is_none()
+                                && val.get("ok").and_then(Value::as_bool) != Some(false);
+                            (
+                                ok_flag,
+                                err_msg,
+                                serde_json::to_string(&val).unwrap_or_else(|_| "{}".into()),
+                            )
+                        }
+                        Err(err) => (false, Some(err.clone()), json!({"error": err}).to_string()),
                     };
+                    executed_tools.push(ExecutedToolSummary {
+                        tool_name: tc.name.clone(),
+                        scope: scope.clone(),
+                        ok: tool_ok,
+                        error: tool_err,
+                    });
                     let res_msg_id = format!("tool_{}", tc.id);
                     if let Ok(ev) = run_engine::ag_ui_tool_result(&res_msg_id, &tc.id, &content_str) {
                         if !append_event(auth, conversation, ev, cancel).await {
@@ -2781,6 +3148,12 @@ async fn execute_tool_rounds(
                     break;
                 }
                 approvals_api::EvaluationDecision::Deny => {
+                    executed_tools.push(ExecutedToolSummary {
+                        tool_name: tc.name.clone(),
+                        scope: scope.clone(),
+                        ok: false,
+                        error: Some(outcome.reason.clone()),
+                    });
                     let db = auth.db.clone();
                     let org_c = org.to_owned();
                     let own_c = owner.to_owned();
@@ -3044,8 +3417,33 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                 return;
             }
             if let Some(vc) = s.virtual_computer.as_ref() {
+                let db_turbo = s.auth.db.clone();
+                let org_turbo = org.clone();
+                let allow_turbo_web = tokio::task::spawn_blocking(move || {
+                    db_turbo
+                        .try_with_connection(|c| {
+                            let mode: Option<String> = c
+                                .query_row(
+                                    "SELECT execution_mode FROM port_approval_settings WHERE organization_id=?1",
+                                    params![org_turbo],
+                                    |r| r.get(0),
+                                )
+                                .optional()?;
+                            Ok(mode.as_deref() == Some("turbo"))
+                        })
+                        .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false);
                 match vc
-                    .execute_tool_for_owner(&org, &actor, &bot_id, &tool_ref, args.clone())
+                    .execute_tool_for_owner_with_policy(
+                        &org,
+                        &actor,
+                        &bot_id,
+                        &tool_ref,
+                        args.clone(),
+                        allow_turbo_web,
+                    )
                     .await
                 {
                     Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "{}".into()),
@@ -3339,6 +3737,16 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
         let mut failure_detail = model_err;
         if !failed {
             if let Some(vc) = s.virtual_computer.as_ref() {
+                let initial = if was_approved {
+                    vec![ExecutedToolSummary {
+                        tool_name: tool_ref.clone(),
+                        scope: scope.clone(),
+                        ok: exec_error.is_none(),
+                        error: exec_error.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                };
                 (failed, terminal, failure_detail) = execute_tool_rounds(
                     &s.auth,
                     &s.model,
@@ -3355,6 +3763,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                     &child,
                     &mut total_answer,
                     1,
+                    &initial,
                 )
                 .await;
             }
@@ -5271,6 +5680,7 @@ mod stop_tests {
             let transcript = build_group_transcript(c, "c", "o", None, 700, 1200, 300)?;
             assert!(
                 transcript.contains("computer_web_fetch")
+                    && !transcript.contains("[Tool call:")
                     && transcript.contains("ERROR: resolved IP address is forbidden by SSRF policy")
                     && transcript.contains("PAUSED (awaiting user approval)"),
                 "unexpected group transcript: {transcript}"
@@ -5284,10 +5694,18 @@ mod stop_tests {
                 .join("\n");
             assert!(
                 joined.contains("computer_web_fetch")
+                    && !joined.contains("[Tool call:")
                     && joined.contains("ERROR: resolved IP address is forbidden by SSRF policy")
                     && joined.contains("PAUSED (awaiting user approval)"),
                 "unexpected DM history: {joined}"
             );
+            assert!(looks_like_hallucinated_tool_text(
+                "Here is the page:\n[Tool call: computer_web_fetch(url=\"https://www.google.com\")] -> fetched\n✅ Status: 200 OK"
+            ));
+            let cleaned = sanitize_legacy_tool_text(
+                "Summary below:\n[Tool call: computer_web_fetch(url=\"https://www.google.com\")]\n✅ Status: 200 OK\nActual note",
+            );
+            assert_eq!(cleaned, "Summary below:\nActual note");
             Ok(())
         })
         .unwrap();
@@ -6129,6 +6547,232 @@ mod stop_tests {
             Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM port_metadata WHERE key='conversation_replay_gap:conv')", [], |r| r.get(0))?)
         }).unwrap();
         assert!(!gap_exists);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn empty_model_reply_after_tool_execution_emits_tool_summary() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            for round in 0..2usize {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let chunk = if round == 0 {
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc_write","type":"function","function":{"name":"computer_write_file","arguments":"{\"path\":\"hello.txt\",\"contents\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-empty-summary-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-empty-summary-ws-{}", random_id().unwrap()));
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into())
+            .unwrap()
+            .with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Programmer','','Write files.',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_approval_settings(organization_id,enforce_auto_review,custom_rules_enabled,host_commands_cap,action_kinds_json,execution_mode) VALUES('default',0,1,'ask','{}','turbo') ON CONFLICT(organization_id) DO UPDATE SET execution_mode='turbo';",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/conv/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-empty-sum")
+            .body(Body::from(r#"{"id":"m1","text":"Write hello.txt","botId":"bot"}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m1'", [], |r| r.get::<_, String>(0))?)) {
+                status = s;
+                if status != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+        mock.await.unwrap();
+
+        let reply_text: String = db.try_with_connection(|c| {
+            Ok(c.query_row(
+                "SELECT text FROM port_conversation_messages WHERE conversation_id='conv' AND role='bot' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        }).unwrap();
+        assert!(reply_text.contains("saved `hello.txt`"), "unexpected reply: {reply_text}");
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[tokio::test]
+    async fn interrupt_active_cancels_busy_or_stuck_run_and_runs_immediately() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        let hold_tx = Arc::new(Mutex::new(Some(hold_tx)));
+        let mock = tokio::spawn(async move {
+            // Connection 1: hang in a separate task until released (simulates slow/stuck active run).
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let hold_task = tokio::spawn(async move {
+                let mut b1 = [0u8; 4096];
+                let _ = s1.read(&mut b1).await;
+                let _ = hold_rx.await;
+                drop(s1);
+            });
+
+            // Connection 2: fast reply for instant-send message.
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let mut b2 = [0u8; 4096];
+            let _ = s2.read(&mut b2).await;
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Instant reply!\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s2.write_all(resp.as_bytes()).await.unwrap();
+            let _ = hold_task.await;
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-instant-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap();
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','help',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        // Start run 1 (hangs).
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/organizations/default/conversations/conv/messages")
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "k-inst-1")
+                    .body(Body::from(r#"{"id":"m1","text":"slow message"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Without interruptActive, normal send returns 409 Conversation already running.
+        let r_busy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/organizations/default/conversations/conv/messages")
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "k-inst-busy")
+                    .body(Body::from(r#"{"id":"m_busy","text":"blocked"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_busy.status(), StatusCode::CONFLICT);
+
+        // With interruptActive: true, it cancels the active run and accepts immediately!
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/organizations/default/conversations/conv/messages")
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "k-inst-2")
+                    .body(Body::from(r#"{"id":"m2","text":"instant override","interruptActive":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::ACCEPTED);
+
+        let mut status2 = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m2'", [], |r| r.get::<_, String>(0))?)) {
+                status2 = s;
+                if status2 != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status2, "completed");
+
+        if let Some(tx) = hold_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        mock.await.unwrap();
 
         drop(db);
         let _ = std::fs::remove_file(path);

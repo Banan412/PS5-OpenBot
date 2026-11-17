@@ -26,7 +26,10 @@ import {
 } from "@/components/approvals/question-notice";
 import { ChannelWorkRows } from "@/components/channels/channel-work";
 import { attachmentModality } from "@/components/channels/chat-messages";
-import { toAgentOptions } from "@/components/channels/composer";
+import {
+  type ComposerDraft,
+  toAgentOptions,
+} from "@/components/channels/composer";
 import { ModelPicker } from "@/components/channels/composer/model-picker";
 import { StillWorkingError } from "@/components/channels/composer/queue";
 import { ConversationIntro } from "@/components/channels/conversation-intro";
@@ -41,6 +44,7 @@ import { VoiceCallWidget } from "@/components/channels/voice-call-widget";
 import { HandoffResumeNotice } from "@/components/computer/handoff-resume-notice";
 import { StarterSuggestions } from "@/components/starter-tour/starter-suggestions";
 import { agentListQueryOptions } from "@/lib/agents/queries";
+import { organizationId } from "@/lib/api/request";
 import {
   answerPersonQuestionMutationOptions,
   approvalInboxOptions,
@@ -70,6 +74,7 @@ import {
   turnsLeftRunning,
   turnsNoLongerAway,
 } from "@/lib/channels/turns-finished-away";
+import { client } from "@/lib/client";
 import { publishedPlaygroundQueryOptions } from "@/lib/components/queries";
 import { useConversationActivity } from "@/lib/computers/activity";
 import { channelAgentId, useActiveBot } from "@/lib/copilot/active-bot";
@@ -1008,9 +1013,13 @@ export function ChannelChat({
         const target = agentRef.current;
         if (!current || turnsRef.current > 0 || target.isRunning) return;
         try {
-          await whileObserved(target, () =>
-            copilotkit.connectAgent({ agent: target }),
-          );
+          await joinWithin({
+            connect: whileObserved(target, () =>
+              copilotkit.connectAgent({ agent: target }),
+            ),
+            deadline: afterMs(JOIN_DEADLINE_MS),
+            detach: () => target.detachActiveRun(),
+          });
         } catch {
           // A join that fails leaves the read at the turn's end (`onTurnFinishedAway`) to bring its answer in.
         }
@@ -1103,6 +1112,8 @@ export function ChannelChat({
    * pre-existing shape of `awaitingReply`, not a new one, and narrowing it means giving a run a
    * handle that `copilotkit.runAgent` does not hand back.
    */
+  /** Resolves an in-flight `deliver` run race immediately when the user stops or interrupts. */
+  const interruptTurnRef = useRef<(() => void) | null>(null);
   const turnFailure = useRef<string | null>(null);
   /** A run of the turn going here failed because its stream reached this browser out of shape. */
   const streamBroke = useRef(false);
@@ -1428,6 +1439,9 @@ export function ChannelChat({
             else quiet.heard();
           },
         });
+        const interruptedPromise = new Promise<"interrupted">((resolve) => {
+          interruptTurnRef.current = () => resolve("interrupted");
+        });
         const run = withVoiceContext(
           copilotkit,
           target.agentId,
@@ -1438,7 +1452,9 @@ export function ChannelChat({
         const ended = await Promise.race([
           run.then(() => "ran" as const),
           quiet.over,
+          interruptedPromise,
         ]).finally(() => {
+          interruptTurnRef.current = null;
           quiet.stop();
           hearing.unsubscribe();
         });
@@ -1447,6 +1463,9 @@ export function ChannelChat({
           run.catch(() => undefined);
           void target.detachActiveRun().catch(() => undefined);
           awaitingReply.current = false;
+          if (ended === "interrupted") {
+            break;
+          }
           // What the thread holds is what was saved: read back when the runtime can be asked.
           if (ended === "over") {
             const whole = await readBackFromThread(target, existingMessageIds);
@@ -1518,6 +1537,36 @@ export function ChannelChat({
       .join("\n\n");
   };
 
+  const interruptActiveTurn = async () => {
+    awaitingReply.current = false;
+    turnFailure.current = null;
+    stopEpoch.current++;
+    const target = agentRef.current;
+    try {
+      copilotkit.stopAgent({ agent: target });
+    } catch {
+      // Best-effort abort on client runtime.
+    }
+    void client(
+      `/api/copilotkit/agent/${encodeURIComponent(runtimeAgentId)}/stop/${encodeURIComponent(channel.threadId)}`,
+      {
+        method: "POST",
+        headers: { "openbot-organization": organizationId() },
+      },
+    ).catch(() => undefined);
+    interruptTurnRef.current?.();
+    const deadline = Date.now() + 800;
+    while (
+      (turnsRef.current > 0 || agentRef.current.isRunning) &&
+      Date.now() < deadline
+    ) {
+      await afterMs(40);
+    }
+    if (agentRef.current.isRunning) {
+      await agentRef.current.detachActiveRun().catch(() => undefined);
+    }
+  };
+
   /**
    * Send a user turn through the channel, including activity reporting and history repair.
    *
@@ -1531,6 +1580,7 @@ export function ChannelChat({
     attachments: Attachment[] = [],
     /** The message to send for `text`, when it is more than the words: an answer to a question. */
     sent?: Message,
+    options?: { interruptActive?: boolean },
   ) => {
     const trimmed = text.trim();
     // A pasted screenshot with no caption is still a message to send: `canSendDraft` already
@@ -1538,11 +1588,22 @@ export function ChannelChat({
     // enabled and inert.
     if (!trimmed && attachments.length === 0) return "";
 
+    const interruptActive = Boolean(options?.interruptActive);
+    if (
+      interruptActive &&
+      (turnsRef.current > 0 ||
+        agentRef.current.isRunning ||
+        turnsGoingAway(channel.id) > 0 ||
+        carryingOn)
+    ) {
+      await interruptActiveTurn();
+    }
+
     // Voice and typed requests share this turn boundary, including gaps between frontend tools.
     if (
       turnsRef.current > 0 ||
       agentRef.current.isRunning ||
-      turnsGoingAway(channel.id) > 0
+      (!interruptActive && turnsGoingAway(channel.id) > 0)
     ) {
       // Its own kind, so a drained queue tries again once the Bot is free (`StillWorkingError`).
       throw new StillWorkingError();
@@ -1778,9 +1839,40 @@ export function ChannelChat({
     },
   });
   const stopTask = () => {
+    const epoch = ++stopEpoch.current;
     awaitingReply.current = false;
-    stopEpoch.current++;
+    turnFailure.current = null;
     copilotkit.stopAgent({ agent });
+    setTimeout(() => {
+      if (stopEpoch.current !== epoch) return;
+      interruptTurnRef.current?.();
+      if (agentRef.current.isRunning) {
+        void agentRef.current.detachActiveRun().catch(() => undefined);
+      }
+    }, 400);
+  };
+
+  const submitConversationDraft = async (
+    draft: ComposerDraft,
+    interruptActive: boolean,
+  ) => {
+    await runModel.beforeSend();
+    // `draft.agentId` carries the @mentioned coworker, but nothing routes on it yet: this
+    // channel is pinned to one `runtimeAgentId` for the life of its thread, so honouring a
+    // per-message mention is a change to that binding, not to the composer.
+    //
+    // An answer is words only: a draft carrying files or a `/` skill is sent as a turn. The
+    // skill stays at the start of the words as `/<command>`, where the server finds it and
+    // gives the Bot its instructions (server/src/plugins/picked-skill.ts).
+    const asked =
+      draft.attachments.length === 0 && draft.commandIds.length === 0
+        ? await waitingQuestion()
+        : undefined;
+    if (asked) {
+      await answerTo(draft.text, asked);
+      return;
+    }
+    await say(draft.text, draft.attachments, undefined, { interruptActive });
   };
 
   /**
@@ -1995,25 +2087,8 @@ export function ChannelChat({
                 )}
               </>
             }
-            onSubmit={async (draft) => {
-              await runModel.beforeSend();
-              // `draft.agentId` carries the @mentioned coworker, but nothing routes on it yet: this
-              // channel is pinned to one `runtimeAgentId` for the life of its thread, so honouring a
-              // per-message mention is a change to that binding, not to the composer.
-              //
-              // An answer is words only: a draft carrying files or a `/` skill is sent as a turn. The
-              // skill stays at the start of the words as `/<command>`, where the server finds it and
-              // gives the Bot its instructions (server/src/plugins/picked-skill.ts).
-              const asked =
-                draft.attachments.length === 0 && draft.commandIds.length === 0
-                  ? await waitingQuestion()
-                  : undefined;
-              if (asked) {
-                await answerTo(draft.text, asked);
-                return;
-              }
-              await say(draft.text, draft.attachments);
-            }}
+            onSendNow={(draft) => submitConversationDraft(draft, true)}
+            onSubmit={(draft) => submitConversationDraft(draft, false)}
             /**
              * Stop through the core so the abort signal reaches frontend tools; `say` repairs any
              * unanswered tool call before the next turn.

@@ -5,6 +5,7 @@ import {
 } from "@copilotkit/react-core/v2";
 import {
   IconArrowUp,
+  IconBolt,
   IconPlayerStopFilled,
   IconPlus,
 } from "@tabler/icons-react";
@@ -38,6 +39,7 @@ import {
   shouldClaimPaste,
 } from "@/lib/channels/attachments";
 import { newId } from "@/lib/new-id";
+import { type SendMode, useSendMode } from "@/lib/settings/send-mode";
 import { cn } from "@/lib/utils";
 import { Button } from "../../ui/button";
 import { AttachmentStrip } from "./attachment-strip";
@@ -65,6 +67,7 @@ import {
 } from "./draft";
 import { screenPickedFiles } from "./picked-files";
 import { type RejectedFile, RejectedFiles } from "./rejected-files";
+import { SendModeToggle } from "./send-mode-toggle";
 import { type AgentOption, buildTriggers } from "./triggers";
 import { useDictation } from "./use-dictation";
 
@@ -181,6 +184,16 @@ export type ComposerProps = {
    * else's turn and block the next correction.
    */
   onQueue?: (draft: ComposerDraft) => void;
+  /**
+   * Interrupt any active or stuck turn and send this draft immediately, bypassing the queue.
+   */
+  onSendNow?: (draft: ComposerDraft) => void | Promise<void>;
+  /** Controlled send mode (`"queue"` | `"instant"`). Defaults to the persisted client setting. */
+  sendMode?: SendMode;
+  /** Optional handler when the user toggles send mode inside the composer. */
+  onSendModeChange?: (mode: SendMode) => void;
+  /** Show the Queue / Instant send-mode toggle in the composer bar. */
+  showSendModeToggle?: boolean;
   /** Stop the Bot mid-answer; while pending, the send button becomes a stop button. */
   onStop?: () => void;
   /**
@@ -380,6 +393,10 @@ export function Composer({
   commands = NO_COMMANDS,
   onSubmit,
   onQueue,
+  onSendNow,
+  sendMode: sendModeProp,
+  onSendModeChange,
+  showSendModeToggle,
   onStop,
   disabled = false,
   onSendHeld,
@@ -395,11 +412,16 @@ export function Composer({
   queuedAttachmentCount = 0,
   routine,
 }: ComposerProps) {
+  const [storedSendMode, setStoredSendMode] = useSendMode();
+  const sendMode = sendModeProp ?? storedSendMode;
+  const handleSendModeChange = onSendModeChange ?? setStoredSendMode;
+  const showSendMode = showSendModeToggle ?? Boolean(onQueue || onSendNow);
   const [value, setValue] = useState<Segment[]>(
     initialValue ? [{ type: "text", text: initialValue }] : [],
   );
   const [isSubmitting, setIsSubmitting] = useState(false);
   const submitInFlight = useRef(false);
+  const submitSeq = useRef(0);
   const promptAreaRef = useRef<PromptAreaHandle>(null);
   /**
    * The composer's outer element, and the reason the hook's own `containerRef` is left on the
@@ -1270,7 +1292,7 @@ export function Composer({
    * React has re-rendered with the new state, which would send the message twice.
    */
   const submitDraft = useCallback(
-    async (segments: Segment[]) => {
+    async (segments: Segment[], options?: { forceInstant?: boolean }) => {
       // Enter while live dictation listens stops it and keeps the words in the box. It never
       // sends: the person reads what was heard first, and the next Enter sends it. Asked before
       // anything else, so an empty box still stops listening.
@@ -1300,19 +1322,18 @@ export function Composer({
         return;
       }
 
+      const instant =
+        Boolean(options?.forceInstant) ||
+        (sendMode === "instant" && Boolean(onSendNow));
+
       /*
        * A TURN IS IN FLIGHT, AND THIS IS THE FORK THE WHOLE AFFORDANCE HANGS ON.
        *
-       * With somewhere to park it the message goes there and the box empties, so the person sees
-       * their words land. Without, we are back to refusing, which is what every caller that does
-       * not queue still gets.
-       *
-       * It returns before `submitInFlight` and `isSubmitting` are touched on purpose. Those guard
-       * one send from starting twice; a send here is held open for the length of the whole run, so
-       * borrowing them for a parked message would let the first turn lock out every correction
-       * typed while it worked — the exact thing this exists to allow.
+       * In Queue mode, with somewhere to park it the message goes there and the box empties, so
+       * the person sees their words land. In Instant mode (or when Send now is pressed), we bypass
+       * parking and invoke `onSendNow` to interrupt any active/stuck turn and send immediately.
        */
-      if (isBusy) {
+      if (isBusy && !instant) {
         if (!onQueue) {
           return;
         }
@@ -1336,10 +1357,12 @@ export function Composer({
         return;
       }
 
-      if (submitInFlight.current || !onSubmit) {
+      const handler = instant && onSendNow ? onSendNow : onSubmit;
+      if ((!instant && submitInFlight.current) || !handler) {
         return;
       }
 
+      const seq = ++submitSeq.current;
       submitInFlight.current = true;
       setIsSubmitting(true);
       // Clear optimistically; restore if the send fails before becoming a message.
@@ -1356,7 +1379,7 @@ export function Composer({
       const riding = submitted.attachments.map((attachment) => attachment.id);
       setSending(riding);
       try {
-        await onSubmit(submitted);
+        await handler(submitted);
         // Only once the send has become a message, and only the ones that rode on it —
         // `consumeAttachments()` would also swallow anything attached while the run was in
         // flight, which belongs to the next message and has never been sent.
@@ -1369,6 +1392,10 @@ export function Composer({
           removeAttachment(id);
         }
       } catch {
+        // An earlier send interrupted by a newer Send now must not put its words back over the box.
+        if (submitSeq.current !== seq) {
+          return;
+        }
         /*
          * THE WORDS COME BACK IN FRONT OF WHATEVER ARRIVED WHILE THE SEND WAS OUT, NOT OVER IT.
          *
@@ -1411,15 +1438,17 @@ export function Composer({
          * this catch does, so there is nothing left for the throw to carry.
          */
       } finally {
-        // Handed back to the composer either way: on success they are already gone from the
-        // hook's own state, and on failure this is what puts the chips back beside the restored
-        // words rather than leaving somebody to re-pick files that are still staged server-side.
-        setSending([]);
-        submitInFlight.current = false;
-        setIsSubmitting(false);
-        // Asked for here, performed in the effect below, which runs after the commit that clears
-        // `isSubmitting` and so after the render the caret would otherwise be placed against.
-        wantsFocus.current = true;
+        if (submitSeq.current === seq) {
+          // Handed back to the composer either way: on success they are already gone from the
+          // hook's own state, and on failure this is what puts the chips back beside the restored
+          // words rather than leaving somebody to re-pick files that are still staged server-side.
+          setSending([]);
+          submitInFlight.current = false;
+          setIsSubmitting(false);
+          // Asked for here, performed in the effect below, which runs after the commit that clears
+          // `isSubmitting` and so after the render the caret would otherwise be placed against.
+          wantsFocus.current = true;
+        }
       }
     },
     [
@@ -1430,9 +1459,11 @@ export function Composer({
       isBusy,
       onQueue,
       onSendHeld,
+      onSendNow,
       onSubmit,
       releaseStagedRows,
       removeAttachment,
+      sendMode,
       staged,
     ],
   );
@@ -1484,7 +1515,8 @@ export function Composer({
    * Not the same question as "is anything typed" — an empty composer mid-turn can queue nothing,
    * and the button it wants is Stop.
    */
-  const canQueue = Boolean(onQueue) && isBusy && !disabled;
+  const canQueue =
+    Boolean(onQueue) && isBusy && !disabled && sendMode === "queue";
   /**
    * There is a message here to send or to park.
    *
@@ -1494,6 +1526,14 @@ export function Composer({
    * anything to do.
    */
   const sendable = canSendDraft(draft) && !tooManyStaged;
+  const canInstantSend =
+    Boolean(onSendNow) &&
+    sendable &&
+    !disabled &&
+    !dictation.busy &&
+    !dictation.live.active;
+  const instantWhenBusy =
+    isBusy && sendMode === "instant" && Boolean(onSendNow);
   /** Something to send, mid-turn, with a queue to put it in. */
   const parking = canQueue && sendable;
   const canSend =
@@ -1501,7 +1541,7 @@ export function Composer({
     !dictation.busy &&
     !dictation.live.active &&
     sendable &&
-    (!isBusy || canQueue);
+    (!isBusy || canQueue || instantWhenBusy);
   /** Live dictation began from the microphone: the caret goes to the end of the box, where Enter stops it. */
   const focusForDictation = useCallback(() => {
     promptAreaRef.current?.focus();
@@ -1515,28 +1555,44 @@ export function Composer({
     !draft.attachments.some(
       (attachment) => attachment.status === "uploading",
     ) &&
-    (!isBusy || canQueue) &&
-    Boolean(onSubmit || onQueue);
+    (!isBusy || canQueue || instantWhenBusy) &&
+    Boolean(onSubmit || onQueue || onSendNow);
   /**
    * Stop is available only once there is a run for it to reach, and it gives way to Send the moment
-   * there is something typed to park.
-   *
-   * `stoppable` rather than `pending`, because a turn is in flight before its run is, and a button
-   * that cannot do the thing it names is worse than no button at all.
-   *
-   * One button, so one of the two has to yield. Send wins because the correction is the thing that
-   * cannot wait: park it and the box empties, which brings Stop straight back — so stopping is
-   * never more than one press away, and the press before it is the one that saves the sentence.
-   * Showing both would be honest and would also put two round buttons in a row on a compact
-   * composer that has room for one.
+   * there is something typed to park (or send immediately in Instant mode).
    */
-  const canStop = Boolean(onStop) && (stoppable ?? pending) && !parking;
+  const canStop =
+    Boolean(onStop) &&
+    (stoppable ?? pending) &&
+    !parking &&
+    !(instantWhenBusy && sendable);
   /**
    * The same arrow either way, because it is the same gesture, but a screen reader is told which of
    * the two it is about to do. "Send" on a button that will not send for another minute is a small
    * lie told to exactly the people who cannot see the queue it lands in.
    */
-  const sendLabel = parking ? "Queue message" : "Send message";
+  const sendLabel = parking
+    ? "Queue message"
+    : instantWhenBusy
+      ? "Send now"
+      : "Send message";
+  const showInlineSendNow = isBusy && sendMode === "queue" && canInstantSend;
+  const inlineSendNowButton = showInlineSendNow ? (
+    <Button
+      aria-label="Send now"
+      className="h-8 gap-1 rounded-full px-2.5 text-xs font-medium"
+      data-slot="composer-send-now"
+      data-testid="composer-send-now"
+      onClick={() => void submitDraft(value, { forceInstant: true })}
+      size="sm"
+      title="Interrupt active turn and send immediately"
+      type="button"
+      variant="secondary"
+    >
+      <IconBolt aria-hidden="true" className="size-3.5" />
+      <span>Send now</span>
+    </Button>
+  ) : null;
   const callAction =
     draft.isEmpty && draft.attachments.length === 0 ? voiceCall : undefined;
   const actionClassName = cn(
@@ -1580,9 +1636,18 @@ export function Composer({
       data-slot="composer-send"
       disabled={!canSend}
       size="icon"
+      title={
+        instantWhenBusy
+          ? "Interrupt active turn and send immediately"
+          : undefined
+      }
       type="submit"
     >
-      <IconArrowUp className="size-3.5" />
+      {instantWhenBusy ? (
+        <IconBolt className="size-3.5" />
+      ) : (
+        <IconArrowUp className="size-3.5" />
+      )}
     </Button>
   );
 
@@ -1730,8 +1795,8 @@ export function Composer({
                 value={value}
               />
             </div>
-            <div className="mt-2 flex items-center justify-between gap-2">
-              <div className="flex min-w-0 items-center gap-1">
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-wrap items-center gap-1">
                 {attachmentsEnabled ? (
                   <Button
                     aria-label="Attach a file"
@@ -1753,11 +1818,19 @@ export function Composer({
                 {modelPicker}
               </div>
               <div className="flex shrink-0 items-center gap-1">
+                {showSendMode ? (
+                  <SendModeToggle
+                    disabled={disabled}
+                    onChange={handleSendModeChange}
+                    value={sendMode}
+                  />
+                ) : null}
                 <DictationButton
                   dictation={dictation}
                   disabled={disabled || voiceCall?.active === true}
                   onStarted={focusForDictation}
                 />
+                {inlineSendNowButton}
                 {primaryAction}
               </div>
             </div>
@@ -1845,11 +1918,19 @@ export function Composer({
 
             <div className="flex items-center gap-1">
               {modelPicker}
+              {showSendMode ? (
+                <SendModeToggle
+                  disabled={disabled}
+                  onChange={handleSendModeChange}
+                  value={sendMode}
+                />
+              ) : null}
               <DictationButton
                 dictation={dictation}
                 disabled={disabled || voiceCall?.active === true}
                 onStarted={focusForDictation}
               />
+              {inlineSendNowButton}
               {primaryAction}
             </div>
           </div>

@@ -3,14 +3,16 @@ import { approvalPhrase } from "@openbot/shared/tool-name";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { type ReactNode, useState } from "react";
-import { shareOf, ShareText } from "@/components/approvals/share-details";
+import { ShareText, shareOf } from "@/components/approvals/share-details";
 import { DecisionCard } from "@/components/decisions/decision-card";
 import type { Tone } from "@/components/gallery/frame";
 import {
   type ApprovalDecision,
   approvalInboxOptions,
+  approvalsKey,
   decideApproval,
 } from "@/lib/approvals";
+import { botLifecycleKeys } from "@/lib/bot-lifecycle/queries";
 import { noteAnswered } from "@/lib/computers/activity";
 import { EASE_OUT } from "@/lib/motion";
 
@@ -60,9 +62,11 @@ const CHOICE_WORDS: Record<
 };
 
 export function InlineApproval({
+  requestId,
   toolCallId,
   fallback,
 }: {
+  requestId?: string;
   toolCallId?: string;
   fallback: ReactNode;
 }) {
@@ -75,21 +79,25 @@ export function InlineApproval({
    * what came of it.
    */
   const [answered, setAnswered] = useState<ApprovalDecision | null>(null);
+  const request = requestId
+    ? inbox.data?.requests.find((candidate) => candidate.id === requestId)
+    : toolCallId
+      ? inbox.data?.requests.find(
+          (candidate) => candidate.action.toolCallId === toolCallId,
+        )
+      : undefined;
+  const resolvedToolCallId = toolCallId ?? request?.action.toolCallId;
   const decision = useMutation({
     mutationFn: (choice: ApprovalDecision) =>
       decideApproval(request?.id ?? "", choice),
     onSuccess: (_, choice) => {
       setAnswered(choice);
       // Answered here, so the step's entry in Activity says when, even on a page opened after it was asked.
-      if (toolCallId) noteAnswered(toolCallId);
-      return cache.invalidateQueries({ queryKey: ["approvals"] });
+      if (resolvedToolCallId) noteAnswered(resolvedToolCallId);
+      void cache.invalidateQueries({ queryKey: botLifecycleKeys.attention });
+      return cache.invalidateQueries({ queryKey: approvalsKey });
     },
   });
-  const request = toolCallId
-    ? inbox.data?.requests.find(
-        (candidate) => candidate.action.toolCallId === toolCallId,
-      )
-    : undefined;
   const pending = request?.status === "pending";
   const handOff = request?.action.policy?.behaviour === "hand_off";
   const choices: ApprovalDecision[] = !request
@@ -184,18 +192,20 @@ export function InlineApproval({
  */
 export function ConversationApprovals({ threadId }: { threadId: string }) {
   const inbox = useQuery(approvalInboxOptions());
-  const ids = (inbox.data?.requests ?? []).flatMap((request) =>
-    request.status === "pending" &&
-    request.action.threadId === threadId &&
-    request.action.toolCallId
-      ? [request.action.toolCallId]
-      : [],
+  const pending = (inbox.data?.requests ?? []).filter(
+    (request) =>
+      request.status === "pending" && request.action.threadId === threadId,
   );
-  if (ids.length === 0) return null;
+  if (pending.length === 0) return null;
   return (
     <div className="space-y-2">
-      {ids.map((id) => (
-        <InlineApproval key={id} toolCallId={id} fallback={null} />
+      {pending.map((request) => (
+        <InlineApproval
+          key={request.id}
+          requestId={request.id}
+          toolCallId={request.action.toolCallId}
+          fallback={null}
+        />
       ))}
     </div>
   );

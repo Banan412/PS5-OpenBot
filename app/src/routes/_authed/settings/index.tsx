@@ -8,6 +8,7 @@ import {
 import { AiModelSection } from "@/components/settings/ai-connection";
 import { MessageListPreference } from "@/components/settings/message-list-preference";
 import { NameRow } from "@/components/settings/profile";
+import { SendModeRow } from "@/components/settings/send-mode-row";
 import { StandingInstructionsRow } from "@/components/settings/standing-instructions";
 import { ThemeRow } from "@/components/settings/theme-row";
 import { UsageDataSection } from "@/components/settings/usage-data";
@@ -62,6 +63,11 @@ function RouteComponent() {
           <SkinPicker />
         </PageRows>
         <MessageListPreference />
+      </PageSection>
+      <PageSection title="Chat">
+        <PageRows>
+          <SendModeRow />
+        </PageRows>
       </PageSection>
       {/*
        * Drawn from the same registry the listeners match against, so this list is what the keys

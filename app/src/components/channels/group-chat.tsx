@@ -3,6 +3,7 @@ import { IconDownload, IconFile } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { ExecutionModeSelector } from "@/components/approvals/execution-mode-selector";
 import { ConversationApprovals } from "@/components/approvals/inline-approval";
 import {
   QuestionNotice,
@@ -45,7 +46,7 @@ import { newId } from "@/lib/new-id";
 import { ContextMeter } from "../chat/context-meter";
 import { ChannelAvatar } from "./avatar";
 import { RestoringTranscript } from "./chat-transcript";
-import { Composer, toAgentOptions } from "./composer";
+import { Composer, type ComposerDraft, toAgentOptions } from "./composer";
 import { ModelPicker } from "./composer/model-picker";
 import { TeamBotConsentCard } from "./team-bot-consent";
 
@@ -173,6 +174,37 @@ export function GroupChat({
       atBottom.current = true;
     }
   }, [lastKey, newestIsMine]);
+
+  const sendGroupDraft = async (
+    draft: ComposerDraft,
+    interruptActive: boolean,
+  ) => {
+    await runModel.beforeSend();
+    const attachmentIds = draft.attachments
+      .map((item) => {
+        const meta = item.metadata as { attachmentId?: unknown } | undefined;
+        return typeof meta?.attachmentId === "string"
+          ? meta.attachmentId
+          : null;
+      })
+      .filter((id): id is string => id !== null);
+    if (!draft.text && attachmentIds.length === 0) return;
+    if (
+      question &&
+      attachmentIds.length === 0 &&
+      (!draft.agentId || draft.agentId === askerId)
+    ) {
+      await answerTo(draft.text, question);
+      return;
+    }
+    await send.mutateAsync({
+      id: newId(),
+      text: draft.text,
+      agentId: draft.agentId,
+      ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+      ...(interruptActive ? { interruptActive: true } : {}),
+    });
+  };
 
   if (group.isPending)
     return (
@@ -302,6 +334,7 @@ export function GroupChat({
                 conversationId={channelId}
                 refreshKey={messages.length}
               />
+              <ExecutionModeSelector disabled={bots.length === 0} />
             </div>
           }
           pending={
@@ -313,34 +346,8 @@ export function GroupChat({
           }
           routine={bots[0] ? { agentId: bots[0].id, channelId } : undefined}
           autoFocus
-          onSubmit={async (draft) => {
-            await runModel.beforeSend();
-            const attachmentIds = draft.attachments
-              .map((item) => {
-                const meta = item.metadata as
-                  | { attachmentId?: unknown }
-                  | undefined;
-                return typeof meta?.attachmentId === "string"
-                  ? meta.attachmentId
-                  : null;
-              })
-              .filter((id): id is string => id !== null);
-            if (!draft.text && attachmentIds.length === 0) return;
-            if (
-              question &&
-              attachmentIds.length === 0 &&
-              (!draft.agentId || draft.agentId === askerId)
-            ) {
-              await answerTo(draft.text, question);
-              return;
-            }
-            await send.mutateAsync({
-              id: newId(),
-              text: draft.text,
-              agentId: draft.agentId,
-              ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
-            });
-          }}
+          onSendNow={(draft) => sendGroupDraft(draft, true)}
+          onSubmit={(draft) => sendGroupDraft(draft, false)}
         />
       </div>
     </div>

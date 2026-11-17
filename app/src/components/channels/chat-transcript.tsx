@@ -22,6 +22,7 @@ import {
 import { SEARCH_TOOLS, toolsFound } from "@openbot/shared/tool-search";
 import {
   IconAlertTriangle,
+  IconBolt,
   IconBox,
   IconChevronDown,
   IconClock,
@@ -192,6 +193,8 @@ type ChatTranscriptProps = {
   queued?: readonly QueuedMessage[];
   /** Take one back before it runs. Without it a queued line is shown but cannot be undone. */
   onRemoveQueued?: (id: string) => void;
+  /** Send one queued message right now, interrupting any active or stuck turn. */
+  onSendQueuedNow?: (id: string) => void;
   /** History has been asked for and has not arrived. Drawn only when there is nothing else to draw. */
   restoring?: boolean;
   /**
@@ -442,10 +445,12 @@ function Queued({
   attachments,
   text,
   onRemove,
+  onSendNow,
 }: {
   attachments: readonly Attachment[];
   text: string;
   onRemove?: (() => void) | undefined;
+  onSendNow?: (() => void) | undefined;
 }) {
   /*
    * THE FILES COME WITH IT, and until they did they were on NO SURFACE IN THE APP AT ALL. Parking
@@ -481,6 +486,19 @@ function Queued({
            * to queue something is not being interrupted by the news that it is queued.
            */}
           <span role="status">Queued</span>
+          {onSendNow ? (
+            <button
+              aria-label={`Send queued message now: ${describeParked(text, files)}`}
+              className="ml-2 inline-flex items-center gap-1 font-medium text-foreground underline underline-offset-2 hover:text-primary focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+              data-slot="queued-send-now"
+              onClick={onSendNow}
+              title="Interrupt active turn and send this message now"
+              type="button"
+            >
+              <IconBolt aria-hidden="true" className="size-3" />
+              Send now
+            </button>
+          ) : null}
           {onRemove ? (
             <button
               /*
@@ -2137,6 +2155,7 @@ export function ChatTranscript({
   intro,
   messages,
   onRemoveQueued,
+  onSendQueuedNow,
   queued = EMPTY_QUEUE,
   restoring = false,
   stopped,
@@ -2522,6 +2541,9 @@ export function ChatTranscript({
               onRemove={
                 onRemoveQueued ? () => onRemoveQueued(message.id) : undefined
               }
+              onSendNow={
+                onSendQueuedNow ? () => onSendQueuedNow(message.id) : undefined
+              }
               text={message.text}
             />
           ))}
@@ -2738,6 +2760,11 @@ export function ChatTranscript({
                         onRemove={
                           onRemoveQueued
                             ? () => onRemoveQueued(message.id)
+                            : undefined
+                        }
+                        onSendNow={
+                          onSendQueuedNow
+                            ? () => onSendQueuedNow(message.id)
                             : undefined
                         }
                         text={message.text}

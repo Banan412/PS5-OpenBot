@@ -10,4 +10,5 @@ export interface UpdateApprovalSettingsRequest {
   hostCommandsCap?: HostCommandPolicy;
   /** The kinds to change. A kind left out stays as it was set. */
   actionKinds?: ApprovalActionKinds;
+  executionMode?: "ask" | "auto" | "turbo";
 }

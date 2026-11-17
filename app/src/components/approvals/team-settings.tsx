@@ -1,4 +1,5 @@
 import {
+  IconBolt,
   IconChecklist,
   IconChevronRight,
   IconCreditCard,
@@ -37,12 +38,17 @@ import {
   type ActionKindPolicy,
   approvalInboxOptions,
   createTeamApprovalRuleMutationOptions,
+  normalizeExecutionMode,
   revokeTeamApprovalRuleMutationOptions,
   teamApprovalSettingsMutationOptions,
   updateTeamApprovalRuleMutationOptions,
 } from "@/lib/approvals";
 import { reviewerGuidanceQueryOptions } from "@/lib/reviewer-guidance/queries";
 import { queryClient } from "@/query-client";
+import {
+  EXECUTION_MODE_OPTIONS,
+  ExecutionModeSelector,
+} from "./execution-mode-selector";
 import { HOST_LABELS, LabelSelect, RuleForm, RuleRow } from "./rules";
 import { SharedUseRequests } from "./shared-use-requests";
 
@@ -103,6 +109,10 @@ export function TeamApprovalSettings() {
   if (inbox.isPending && !error) return null;
   const settings = inbox.data?.team;
   const teamRules = inbox.data?.teamRules ?? [];
+  const executionMode = normalizeExecutionMode(settings?.executionMode);
+  const executionDescription = EXECUTION_MODE_OPTIONS.find(
+    (option) => option.value === executionMode,
+  )?.description;
 
   return (
     <>
@@ -114,6 +124,27 @@ export function TeamApprovalSettings() {
       {settings ? (
         <PageSection title="Organization settings">
           <PageRows>
+            <Item size="sm">
+              <ItemMedia variant="icon">
+                <IconBolt />
+              </ItemMedia>
+              <ItemContent>
+                <ItemTitle>Execution mode</ItemTitle>
+                <ItemDescription className="line-clamp-none">
+                  {executionDescription}
+                </ItemDescription>
+              </ItemContent>
+              <ItemActions>
+                <ExecutionModeSelector
+                  disabled={team.isPending}
+                  onChange={(nextMode) =>
+                    team.mutate({ executionMode: nextMode })
+                  }
+                  value={executionMode}
+                />
+              </ItemActions>
+            </Item>
+            <Separator />
             <Item size="sm">
               <ItemMedia variant="icon">
                 <IconEyeCheck />

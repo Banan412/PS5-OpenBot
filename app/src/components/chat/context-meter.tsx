@@ -350,23 +350,24 @@ export function ContextMeter({
         }
       />
       <TooltipContent
-        className="w-64 flex-col items-stretch gap-1.5 p-2.5 text-xs"
+        arrowClassName="bg-[#141720] fill-[#141720]"
+        className="w-64 flex-col items-stretch gap-1.5 rounded-lg border border-white/10 bg-[#141720] p-2.5 text-xs text-zinc-100 shadow-xl"
         side="top"
       >
-        <div className="flex items-center justify-between gap-2 font-medium">
+        <div className="flex items-center justify-between gap-2 font-medium text-zinc-100">
           <span>Context window</span>
           <span className="tabular-nums">
             {Math.round(data.used_tokens).toLocaleString()} /{" "}
             {Math.round(data.context_limit).toLocaleString()} tok
           </span>
         </div>
-        <div className="h-1.5 w-full overflow-hidden rounded-full bg-background/20">
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
           <div
             className={cn("h-full rounded-full", barTone)}
             style={{ width: `${Math.max(pctUsed > 0 ? 3 : 0, pctUsed)}%` }}
           />
         </div>
-        <div className="flex items-center justify-between text-[11px] opacity-85 tabular-nums">
+        <div className="flex items-center justify-between text-[11px] text-zinc-300 tabular-nums">
           <span>
             {Math.round(data.remaining_tokens).toLocaleString()} tok remaining
           </span>
@@ -375,10 +376,10 @@ export function ContextMeter({
         {(data.system_tokens !== undefined ||
           data.history_tokens !== undefined ||
           data.tools_tokens !== undefined) && (
-          <div className="mt-0.5 space-y-0.5 border-t border-background/15 pt-1.5 text-[11px] opacity-90">
+          <div className="mt-0.5 space-y-0.5 border-t border-white/10 pt-1.5 text-[11px] text-zinc-300">
             {data.system_tokens !== undefined ? (
               <div className="flex justify-between tabular-nums">
-                <span>System</span>
+                <span className="text-zinc-400">System</span>
                 <span>
                   {Math.round(data.system_tokens).toLocaleString()} tok
                 </span>
@@ -386,7 +387,7 @@ export function ContextMeter({
             ) : null}
             {data.history_tokens !== undefined ? (
               <div className="flex justify-between tabular-nums">
-                <span>Messages</span>
+                <span className="text-zinc-400">Messages</span>
                 <span>
                   {Math.round(data.history_tokens).toLocaleString()} tok
                 </span>
@@ -394,7 +395,7 @@ export function ContextMeter({
             ) : null}
             {data.tools_tokens !== undefined && data.tools_tokens > 0 ? (
               <div className="flex justify-between tabular-nums">
-                <span>Tools schema</span>
+                <span className="text-zinc-400">Tools schema</span>
                 <span>
                   {Math.round(data.tools_tokens).toLocaleString()} tok
                 </span>
@@ -403,13 +404,13 @@ export function ContextMeter({
             {data.server_kv_tokens !== null &&
             data.server_kv_tokens !== undefined ? (
               <div className="flex justify-between tabular-nums">
-                <span>Server KV slot</span>
+                <span className="text-zinc-400">Server KV slot</span>
                 <span>
                   {Math.round(data.server_kv_tokens).toLocaleString()} tok
                 </span>
               </div>
             ) : null}
-            <div className="flex justify-between tabular-nums opacity-80">
+            <div className="flex justify-between text-zinc-400 tabular-nums">
               <span>Auto-compact at</span>
               <span>
                 {Math.round(data.auto_compact_threshold).toLocaleString()} tok
@@ -418,7 +419,7 @@ export function ContextMeter({
           </div>
         )}
         {data.compacted ? (
-          <div className="mt-0.5 border-t border-background/15 pt-1.5 text-[11px] text-amber-300">
+          <div className="mt-0.5 border-t border-white/10 pt-1.5 text-[11px] text-amber-300">
             Auto-compacted
             {data.compacted_before_tokens && data.compacted_after_tokens
               ? ` (${Math.round(data.compacted_before_tokens).toLocaleString()} → ${Math.round(data.compacted_after_tokens).toLocaleString()} tok)`
@@ -429,7 +430,7 @@ export function ContextMeter({
           </div>
         ) : null}
         {data.online === false ? (
-          <div className="text-[11px] opacity-75">
+          <div className="text-[11px] text-zinc-400">
             Model server offline · using fallback limit
           </div>
         ) : null}

@@ -27,8 +27,10 @@ import {
   updateApprovalPreferences,
   updatePersonApprovalRule,
 } from "@/lib/api/generated/approvals/approvals";
+import type { ApprovalSettings } from "@/lib/api/generated/model";
 import { idempotencyKey, organizationId } from "@/lib/api/request";
 import { botLifecycleKeys } from "@/lib/bot-lifecycle/queries";
+import { tryClient } from "@/lib/client";
 
 /** The person asking: every approval, question, preference and rule here is their own. */
 const ME = "me";
@@ -85,6 +87,11 @@ export type ConversationGrant = {
   createdAt: string;
 };
 export type HostCommandPolicy = "ask" | "allow" | "never";
+export type ExecutionMode = "ask" | "auto" | "turbo";
+
+export function normalizeExecutionMode(value: unknown): ExecutionMode {
+  return value === "auto" || value === "turbo" ? value : "ask";
+}
 export type ApprovalRuleInput = {
   botId: string;
   toolRef: string;
@@ -158,6 +165,8 @@ export type ApprovalInboxData = {
     hostCommandsCap: HostCommandPolicy;
     /** The kinds the admin closed. A kind not named is open. */
     actionKinds?: Partial<Record<ActionKind, ActionKindPolicy>>;
+    /** Antigravity-style execution mode: ask, auto, or turbo. */
+    executionMode?: ExecutionMode;
   };
   /** The member's command policy after the team cap. */
   hostCommands?: HostCommandPolicy;
@@ -382,6 +391,7 @@ export const setTeamApprovalSettings = (input: {
   customRulesEnabled?: boolean;
   hostCommandsCap?: HostCommandPolicy;
   actionKinds?: Partial<Record<ActionKind, ActionKindPolicy>>;
+  executionMode?: ExecutionMode;
 }) =>
   updateApprovalSettings(organizationId(), input, once(), {
     fallback: "The organization setting could not be saved.",
@@ -435,8 +445,45 @@ export const updateTeamApprovalRule = (
 
 /** The inbox's key, which every approval write invalidates: requests, rules and settings alike. */
 export const approvalsKey = ["approvals"] as const;
-const settle = (queryClient: QueryClient) => () =>
-  queryClient.invalidateQueries({ queryKey: approvalsKey });
+export const approvalSettingsKey = (orgId: string | undefined) =>
+  ["approval-settings", orgId ?? ""] as const;
+
+export async function fetchApprovalSettings(
+  orgId: string,
+  signal?: AbortSignal,
+): Promise<ApprovalSettings | null> {
+  if (!orgId) return null;
+  const url = `/api/v2/organizations/${encodeURIComponent(orgId)}/approval-settings`;
+  try {
+    const response = await tryClient(url, { signal });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    return body as ApprovalSettings;
+  } catch {
+    return null;
+  }
+}
+
+export const approvalSettingsQueryOptions = (
+  orgId: string | undefined,
+  enabled = true,
+) =>
+  queryOptions({
+    queryKey: approvalSettingsKey(orgId),
+    queryFn: ({ signal }) =>
+      orgId ? fetchApprovalSettings(orgId, signal) : Promise.resolve(null),
+    enabled: Boolean(enabled && orgId),
+    retry: false,
+    staleTime: 5_000,
+  });
+
+const settle = (queryClient: QueryClient) => () => {
+  void queryClient.invalidateQueries({
+    queryKey: approvalSettingsKey(organizationId()),
+  });
+  return queryClient.invalidateQueries({ queryKey: approvalsKey });
+};
 
 export const approvalPreferencesMutationOptions = (queryClient: QueryClient) =>
   mutationOptions({
@@ -470,6 +517,16 @@ export const revokeApprovalRuleMutationOptions = (queryClient: QueryClient) =>
 export const teamApprovalSettingsMutationOptions = (queryClient: QueryClient) =>
   mutationOptions({
     mutationFn: setTeamApprovalSettings,
+    onSuccess: (updated) => {
+      const orgId = organizationId();
+      queryClient.setQueryData<ApprovalSettings | null>(
+        approvalSettingsKey(orgId),
+        (prev) => (prev ? { ...prev, ...updated } : updated),
+      );
+      queryClient.setQueryData<ApprovalInboxData>(approvalsKey, (inbox) =>
+        inbox?.team ? { ...inbox, team: { ...inbox.team, ...updated } } : inbox,
+      );
+    },
     onSettled: settle(queryClient),
   });
 export const createTeamApprovalRuleMutationOptions = (
