@@ -29,6 +29,12 @@ use std::{
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+const MAX_GROUP_TRANSCRIPT_CHARS: usize = 6000;
+const MAX_DM_HISTORY_CHARS: usize = 7000;
+const MAX_TOOL_RESULT_CHARS_FOR_LLM: usize = 3072;
+const MAX_OLD_TOOL_RESULT_CHARS_FOR_LLM: usize = 400;
+const OOM_RETRY_MAX_TOKENS: u64 = 512;
+
 #[derive(Clone)]
 pub struct RunState {
     pub(crate) auth: AuthState,
@@ -515,20 +521,23 @@ fn build_group_transcript(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(st);
     history.reverse();
-    let mut transcript = String::new();
+    history.retain(|(_, role, _, text)| role == "person" || !is_silent_group_pass(text));
     let history_len = history.len();
+    let last_person_idx = history.iter().rposition(|(_, role, _, _)| role == "person");
+    let mut entries: Vec<(bool, String)> = Vec::with_capacity(history_len);
     for (idx, (mid, role, bid, text)) in history.into_iter().enumerate() {
-        if role != "person" && is_silent_group_pass(&text) {
-            continue;
-        }
+        let is_last_person = Some(idx) == last_person_idx;
         let is_recent = idx + 2 >= history_len;
-        let spoken = if is_recent {
+        let spoken = if is_last_person {
             text
+        } else if idx + 1 == history_len {
+            clip_chars(&text, msg_clip.max(1200))
         } else {
             clip_chars(&text, msg_clip)
         };
+        let mut entry = String::new();
         if role == "person" {
-            transcript.push_str(&format!("User: {spoken}\n"));
+            entry.push_str(&format!("User: {spoken}\n"));
             if let Ok(mut att_st) = tx.prepare(
                 "SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC",
             ) {
@@ -541,16 +550,20 @@ fn build_group_transcript(
                     ))
                 }) {
                     for att in rows.flatten() {
-                        transcript.push_str(&format!(
+                        entry.push_str(&format!(
                             "[Attached file: uploads/{} ({}, {} bytes)]\n",
                             att.0, att.1, att.2
                         ));
                         if let Some(ext) = att.3.filter(|s| !s.trim().is_empty()) {
                             let clipped = clip_chars(
                                 ext.trim(),
-                                if is_recent { att_recent_clip } else { att_old_clip },
+                                if is_last_person || is_recent {
+                                    att_recent_clip
+                                } else {
+                                    att_old_clip
+                                },
                             );
-                            transcript.push_str(&format!(
+                            entry.push_str(&format!(
                                 "--- Content of {} ---\n{clipped}\n--- End of {} ---\n",
                                 att.0, att.0
                             ));
@@ -574,10 +587,121 @@ fn build_group_transcript(
                         })
                 })
                 .unwrap_or_else(|| "Teammate".to_owned());
-            transcript.push_str(&format!("[{speaker}]: {spoken}\n"));
+            entry.push_str(&format!("[{speaker}]: {spoken}\n"));
         }
+        entries.push((is_last_person, entry));
+    }
+
+    let mut total_chars: usize = entries.iter().map(|(_, s)| s.chars().count()).sum();
+    while total_chars > MAX_GROUP_TRANSCRIPT_CHARS && entries.len() > 1 {
+        let drop_idx = (0..entries.len() - 1)
+            .find(|&i| !entries[i].0)
+            .or_else(|| (entries.len() > 1).then_some(0));
+        let Some(idx) = drop_idx else {
+            break;
+        };
+        if entries[idx].0 && entries.len() <= 2 {
+            break;
+        }
+        let (_, removed) = entries.remove(idx);
+        total_chars = total_chars.saturating_sub(removed.chars().count());
+    }
+
+    let mut transcript = String::with_capacity(total_chars.min(MAX_GROUP_TRANSCRIPT_CHARS));
+    for (_, part) in entries {
+        transcript.push_str(&part);
     }
     Ok(transcript)
+}
+
+fn build_dm_messages(
+    tx: &rusqlite::Connection,
+    conversation_id: &str,
+    bot_id: &str,
+    instructions: &str,
+    include_attachments: bool,
+) -> rusqlite::Result<Vec<Value>> {
+    let mut st = tx.prepare(
+        "SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR (role='bot' AND bot_id=?2 AND text!='')) ORDER BY rowid DESC LIMIT 8",
+    )?;
+    let mut history = st
+        .query_map(params![conversation_id, bot_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(st);
+    history.reverse();
+    let history_len = history.len();
+    let last_person_idx = history.iter().rposition(|(_, role, _, _)| role == "person");
+    let mut items: Vec<(bool, Value)> = Vec::with_capacity(history_len);
+    for (idx, (mid, role, _bid, mut msg_text)) in history.into_iter().enumerate() {
+        let is_last_person = Some(idx) == last_person_idx;
+        let is_recent = idx + 2 >= history_len;
+        if !is_last_person {
+            let cap = if idx + 1 == history_len { 1200 } else { 600 };
+            msg_text = clip_chars(&msg_text, cap);
+        }
+        if include_attachments && role == "person" {
+            let mut att_st = tx.prepare(
+                "SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC",
+            )?;
+            let atts = att_st
+                .query_map(params![conversation_id, mid], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(att_st);
+            if !atts.is_empty() {
+                let max_att = if is_last_person || is_recent { 1800 } else { 400 };
+                let mut note = String::new();
+                for (fname, mime, sz, ext) in atts {
+                    note.push_str(&format!(
+                        "\n[Attached file: uploads/{fname} ({mime}, {sz} bytes)]"
+                    ));
+                    if let Some(t) = ext.filter(|s| !s.trim().is_empty()) {
+                        let clipped = clip_chars(t.trim(), max_att);
+                        note.push_str(&format!(
+                            "\n--- Content of {fname} ---\n{clipped}\n--- End of {fname} ---"
+                        ));
+                    }
+                }
+                msg_text.push_str(&note);
+            }
+        }
+        let role_str = if role == "person" { "user" } else { "assistant" };
+        items.push((is_last_person, json!({"role": role_str, "content": msg_text})));
+    }
+
+    let msg_len = |v: &Value| -> usize {
+        v.get("content")
+            .and_then(Value::as_str)
+            .map(|s| s.chars().count())
+            .unwrap_or(0)
+    };
+    let mut total_chars: usize = items.iter().map(|(_, v)| msg_len(v)).sum();
+    while total_chars > MAX_DM_HISTORY_CHARS && items.len() > 1 {
+        let drop_idx = (0..items.len() - 1).find(|&i| !items[i].0);
+        let Some(idx) = drop_idx else {
+            break;
+        };
+        let (_, removed) = items.remove(idx);
+        total_chars = total_chars.saturating_sub(msg_len(&removed));
+    }
+
+    let mut messages = Vec::with_capacity(items.len() + 1);
+    messages.push(json!({"role":"system","content":instructions}));
+    messages.extend(items.into_iter().map(|(_, v)| v));
+    Ok(messages)
 }
 
 pub(crate) async fn trigger_scheduled_message(
@@ -1118,37 +1242,7 @@ pub(crate) async fn send_with_run_id(
                 json!({"role":"user","content":user_prompt}),
             ]
         } else {
-            let mut st=tx.prepare("SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR (role='bot' AND bot_id=?2 AND text!='')) ORDER BY rowid DESC LIMIT 8")?;
-            let mut history=st.query_map(params![conversation_id,bot_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(st);history.reverse();
-            let mut messages=vec![json!({"role":"system","content":instructions})];
-            let history_len = history.len();
-            for (idx, (mid, role, _bid, mut msg_text)) in history.into_iter().enumerate() {
-                let is_recent = idx + 2 >= history_len;
-                if !is_recent {
-                    msg_text = clip_chars(&msg_text, 900);
-                }
-                if role == "person" {
-                    let mut att_st = tx.prepare("SELECT filename, mime_type, size_bytes, extracted_text FROM port_attachments WHERE conversation_id=?1 AND message_id=?2 ORDER BY rowid ASC")?;
-                    let atts = att_st.query_map(params![conversation_id, mid], |r| {
-                        Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,Option<String>>(3)?))
-                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(att_st);
-                    if !atts.is_empty() {
-                        let max_att = if is_recent { 1800 } else { 400 };
-                        let mut note = String::new();
-                        for (fname, mime, sz, ext) in atts {
-                            note.push_str(&format!("\n[Attached file: uploads/{fname} ({mime}, {sz} bytes)]"));
-                            if let Some(t) = ext.filter(|s| !s.trim().is_empty()) {
-                                let clipped = clip_chars(t.trim(), max_att);
-                                note.push_str(&format!("\n--- Content of {fname} ---\n{clipped}\n--- End of {fname} ---"));
-                            }
-                        }
-                        msg_text.push_str(&note);
-                    }
-                }
-                messages.push(json!({"role":if role=="person"{"user"}else{"assistant"},"content":msg_text}));
-            }
-            messages
+            build_dm_messages(&tx, &conversation_id, &bot_id, &instructions, true)?
         };
         let stage_bots = if lead_orchestration {
             bots.clone()
@@ -1464,46 +1558,81 @@ async fn execute(
     }
 
     if vc.is_none() {
-        let producer_cancel = cancel.clone();
-        let (tx, mut rx) = mpsc::channel(16);
-        let t = thread.clone();
-        let r = run.clone();
-        let m = reply.clone();
-        let req_clone = current_request.clone();
-        let task = tokio::spawn(async move {
-            run_engine::stream_text(model, req_clone, &t, &r, &m, tx, producer_cancel).await
-        });
         let mut answer = String::new();
         let mut failed = false;
         let mut failure_detail: Option<String> = None;
         let mut terminal = None;
-        while let Some(event) = rx.recv().await {
-            if event.get("type").and_then(Value::as_str) == Some("RUN_FINISHED") {
-                terminal = Some(event);
-                continue;
-            }
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                if answer.len().saturating_add(delta.len()) > 1024 * 1024 {
+        let mut emitted_run_started = false;
+        let mut emitted_text_start = false;
+
+        for attempt in 0..2usize {
+            let producer_cancel = cancel.clone();
+            let (tx, mut rx) = mpsc::channel(16);
+            let t = thread.clone();
+            let r = run.clone();
+            let m = reply.clone();
+            let req_clone = current_request.clone();
+            let model_clone = model.clone();
+            let task = tokio::spawn(async move {
+                run_engine::stream_text(model_clone, req_clone, &t, &r, &m, tx, producer_cancel)
+                    .await
+            });
+            let mut emitted_content_this_attempt = false;
+            failed = false;
+            failure_detail = None;
+            terminal = None;
+
+            while let Some(event) = rx.recv().await {
+                let etype = event.get("type").and_then(Value::as_str);
+                if etype == Some("RUN_STARTED") {
+                    if emitted_run_started {
+                        continue;
+                    }
+                    emitted_run_started = true;
+                } else if etype == Some("TEXT_MESSAGE_START") {
+                    if emitted_text_start {
+                        continue;
+                    }
+                    emitted_text_start = true;
+                } else if etype == Some("RUN_FINISHED") {
+                    terminal = Some(event);
+                    continue;
+                }
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    emitted_content_this_attempt = true;
+                    if answer.len().saturating_add(delta.len()) > 1024 * 1024 {
+                        failed = true;
+                        cancel.cancel();
+                        break;
+                    }
+                    answer.push_str(delta);
+                }
+                if !append_event(&auth, &conversation, event, &cancel).await {
                     failed = true;
                     cancel.cancel();
                     break;
                 }
-                answer.push_str(delta);
             }
-            if !append_event(&auth, &conversation, event, &cancel).await {
-                failed = true;
-                cancel.cancel();
-                break;
-            }
-        }
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                failed = true;
-                failure_detail = Some(e.to_string());
-            }
-            Err(_) => {
-                failed = true;
+            match task.await {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    if attempt == 0
+                        && !failed
+                        && !emitted_content_this_attempt
+                        && !cancel.is_cancelled()
+                        && e.is_oom_or_context_error()
+                    {
+                        compact_request_for_oom(&mut current_request);
+                        continue;
+                    }
+                    failed = true;
+                    failure_detail = Some(e.to_string());
+                    break;
+                }
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
             }
         }
         if external_cancel.is_cancelled() || terminal.is_none() {
@@ -1630,6 +1759,144 @@ pub(crate) fn tools_schema() -> Value {
     ])
 }
 
+fn compact_tools_schema() -> Value {
+    json!([
+        {"type":"function","function":{"name":"computer_read_file","description":"Read file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+        {"type":"function","function":{"name":"computer_list_files","description":"List dir","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
+        {"type":"function","function":{"name":"computer_write_file","description":"Write file","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"},"append":{"type":"boolean"}},"required":["path","contents"]}}},
+        {"type":"function","function":{"name":"computer_run_command","description":"Run cmd","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
+        {"type":"function","function":{"name":"computer_web_fetch","description":"Fetch URL","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}
+    ])
+}
+
+fn compact_oversized_user_content(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    if text.contains('\n') {
+        let prefix = "...[earlier context compacted]\n";
+        let budget = max_chars.saturating_sub(prefix.chars().count());
+        let mut kept_rev: Vec<&str> = Vec::new();
+        let mut used = 0usize;
+        for line in text.lines().rev() {
+            let line_chars = line.chars().count() + 1;
+            if used + line_chars > budget {
+                break;
+            }
+            used += line_chars;
+            kept_rev.push(line);
+        }
+        if !kept_rev.is_empty() {
+            kept_rev.reverse();
+            return format!("{prefix}{}", kept_rev.join("\n"));
+        }
+    }
+    clip_chars(text, max_chars)
+}
+
+fn trim_older_tool_outputs(request: &mut Value) {
+    let Some(msgs) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(last_tc_idx) = msgs
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant") && m.get("tool_calls").is_some())
+    else {
+        return;
+    };
+    for msg in msgs[..last_tc_idx].iter_mut() {
+        if msg.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(text) = msg.get("content").and_then(Value::as_str).map(str::to_owned) {
+                if text.chars().count() > MAX_OLD_TOOL_RESULT_CHARS_FOR_LLM {
+                    msg["content"] = Value::String(clip_chars(&text, MAX_OLD_TOOL_RESULT_CHARS_FOR_LLM));
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn compact_request_for_oom(request: &mut Value) {
+    let capped_max = request
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .map(|v| v.min(OOM_RETRY_MAX_TOKENS))
+        .unwrap_or(OOM_RETRY_MAX_TOKENS);
+    request["max_tokens"] = json!(capped_max);
+
+    if request.get("tools").is_some() {
+        request["tools"] = compact_tools_schema();
+    }
+
+    let Some(msgs) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if msgs.is_empty() {
+        return;
+    }
+
+    let has_system = msgs[0].get("role").and_then(Value::as_str) == Some("system");
+    let mut compacted: Vec<Value> = Vec::with_capacity(5);
+    if has_system {
+        let mut sys = msgs[0].clone();
+        if let Some(s) = sys.get("content").and_then(Value::as_str).map(str::to_owned) {
+            if s.chars().count() > 1600 {
+                sys["content"] = Value::String(clip_chars(&s, 1600));
+            }
+        }
+        compacted.push(sys);
+    }
+
+    let tail = if has_system { &msgs[1..] } else { &msgs[..] };
+    if !tail.is_empty() {
+        let last_user_idx = tail
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+        let keep_from = match last_user_idx {
+            Some(u_idx) if u_idx + 1 < tail.len() => {
+                // Active tool-call turn: keep from latest user message onward (preserves tool_call/tool pairing).
+                u_idx
+            }
+            Some(u_idx) => {
+                let candidate = u_idx.saturating_sub(1);
+                let two_chars: usize = tail[candidate..]
+                    .iter()
+                    .filter_map(|m| m.get("content").and_then(Value::as_str))
+                    .map(|s| s.chars().count())
+                    .sum();
+                if two_chars <= 3200 {
+                    candidate
+                } else {
+                    u_idx
+                }
+            }
+            None => tail.len().saturating_sub(2),
+        };
+        let last_kept_user_rel = tail[keep_from..]
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+
+        for (rel_idx, orig) in tail[keep_from..].iter().enumerate() {
+            let mut m = orig.clone();
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+            if let Some(text) = m.get("content").and_then(Value::as_str).map(str::to_owned) {
+                let clipped = match role {
+                    "tool" => clip_chars(&text, 1024),
+                    "assistant" => clip_chars(&text, 600),
+                    "user" if Some(rel_idx) == last_kept_user_rel => {
+                        compact_oversized_user_content(&text, 2400)
+                    }
+                    "user" => clip_chars(&text, 600),
+                    _ => clip_chars(&text, 800),
+                };
+                m["content"] = Value::String(clipped);
+            }
+            compacted.push(m);
+        }
+    }
+
+    *msgs = compacted;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_tool_rounds(
     auth: &AuthState,
@@ -1650,10 +1917,15 @@ async fn execute_tool_rounds(
     let mut failed = false;
     let mut terminal: Option<Value> = None;
     let mut failure_detail: Option<String> = None;
-    for round in start_round..4usize {
+    let mut oom_retried = false;
+    let mut round = start_round;
+    while round < 4usize {
         if cancel.is_cancelled() {
             failed = true;
             break;
+        }
+        if round > 0 {
+            trim_older_tool_outputs(current_request);
         }
         let round_msg_id = if round == 0 {
             reply.to_owned()
@@ -1671,7 +1943,9 @@ async fn execute_tool_rounds(
             run_engine::stream_turn(model_clone, req_clone, &t, &r, &m, false, tx, producer_cancel).await
         });
         let mut stream_deltas = String::new();
+        let mut emitted_round_output = false;
         while let Some(event) = rx.recv().await {
+            emitted_round_output = true;
             if event.get("type").and_then(Value::as_str) == Some("TEXT_MESSAGE_CONTENT") {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     if total_answer.len().saturating_add(stream_deltas.len()).saturating_add(delta.len())
@@ -1699,6 +1973,16 @@ async fn execute_tool_rounds(
         let turn = match task.await {
             Ok(Ok(turn)) => turn,
             Ok(Err(e)) => {
+                if !oom_retried
+                    && !failed
+                    && !emitted_round_output
+                    && !cancel.is_cancelled()
+                    && e.is_oom_or_context_error()
+                {
+                    oom_retried = true;
+                    compact_request_for_oom(current_request);
+                    continue;
+                }
                 failed = true;
                 failure_detail = Some(e.to_string());
                 break;
@@ -1795,7 +2079,7 @@ async fn execute_tool_rounds(
                             break;
                         }
                     }
-                    let llm_content = clip_chars(&content_str, 3500);
+                    let llm_content = clip_chars(&content_str, MAX_TOOL_RESULT_CHARS_FOR_LLM);
                     if let Some(arr) = current_request.get_mut("messages").and_then(Value::as_array_mut) {
                         arr.push(json!({"role":"tool","tool_call_id":tc.id,"content":llm_content}));
                     }
@@ -1890,7 +2174,7 @@ async fn execute_tool_rounds(
                             break;
                         }
                     }
-                    let llm_content = clip_chars(&content_str, 3500);
+                    let llm_content = clip_chars(&content_str, MAX_TOOL_RESULT_CHARS_FOR_LLM);
                     if let Some(arr) = current_request.get_mut("messages").and_then(Value::as_array_mut) {
                         arr.push(json!({"role":"tool","tool_call_id":tc.id,"content":llm_content}));
                     }
@@ -1900,6 +2184,7 @@ async fn execute_tool_rounds(
         if failed || interrupted {
             break;
         }
+        round += 1;
     }
     (failed, terminal, failure_detail)
 }
@@ -2180,18 +2465,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                         "INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',?9)",
                         params![run, conv_c, act_c, bot_c, user_msg, reply, req_key, vec![0u8; 32], timestamp],
                     )?;
-                    let mut st = tx.prepare("SELECT role,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND text!='' AND (role='person' OR (role='bot' AND bot_id=?2)) ORDER BY rowid DESC LIMIT 8")?;
-                    let mut history = st
-                        .query_map(params![conv_c, bot_c], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(st);
-                    history.reverse();
-                    let mut messages = vec![json!({"role":"system","content":instructions})];
-                    let history_len = history.len();
-                    for (idx, (role, text)) in history.into_iter().enumerate() {
-                        let content = if idx + 2 >= history_len { text } else { clip_chars(&text, 900) };
-                        messages.push(json!({"role":if role=="person"{"user"}else{"assistant"},"content":content}));
-                    }
+                    let mut messages = build_dm_messages(&tx, &conv_c, &bot_c, &instructions, false)?;
                     messages.push(json!({
                         "role": "assistant",
                         "content": Value::Null,
@@ -2200,7 +2474,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tc_c,
-                        "content": content_c
+                        "content": clip_chars(&content_c, MAX_TOOL_RESULT_CHARS_FOR_LLM)
                     }));
                     tx.commit()?;
                     Ok(Ok(Some((run, reply, messages))))
@@ -3771,5 +4045,281 @@ mod stop_tests {
 
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_builders_cap_old_messages_while_preserving_latest_user_prompt() {
+        let path =
+            std::env::temp_dir().join(format!("openbot-hist-cap-{}.db", random_id().unwrap()));
+        let db = Storage::open(&path).unwrap();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO auth_users(id,email,display_name,password_hash) VALUES('u','a@b','A','x');
+                 INSERT INTO auth_organizations(id,slug,name) VALUES('o','o','O');
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) VALUES('b1','o','u','Commander','','help',0),('b2','o','u','Browser','','browse',0);
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) VALUES('c','o','u','t','[\"b1\",\"b2\"]','G',0);",
+            )?;
+            let big = "OLD_CHUNK_".repeat(300); // 3000 chars each
+            for i in 0..6 {
+                let role = if i % 2 == 0 { "person" } else { "bot" };
+                let bot = if role == "bot" { Some("b1") } else { None };
+                c.execute(
+                    "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,'c',?2,'u',?3,?4,'completed',?5)",
+                    params![format!("m{i}"), role, bot, format!("msg{i}:{big}"), i as i64],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES('m_last','c','person','u',NULL,'LATEST_USER_PROMPT: opening youtube for you !','completed',99)",
+                [],
+            )?;
+            let transcript = build_group_transcript(c, "c", "o", None, 700, 1200, 300)?;
+            assert!(
+                transcript.chars().count() <= MAX_GROUP_TRANSCRIPT_CHARS,
+                "group transcript exceeded cap: {}",
+                transcript.chars().count()
+            );
+            assert!(transcript.contains("LATEST_USER_PROMPT: opening youtube for you !"));
+
+            let dm_msgs = build_dm_messages(c, "c", "b1", "System prompt", false)?;
+            let total_dm_chars: usize = dm_msgs[1..]
+                .iter()
+                .filter_map(|m| m.get("content").and_then(Value::as_str))
+                .map(|s| s.chars().count())
+                .sum();
+            assert!(
+                total_dm_chars <= MAX_DM_HISTORY_CHARS,
+                "DM history exceeded cap: {total_dm_chars}"
+            );
+            assert_eq!(
+                dm_msgs.last().unwrap()["content"],
+                "LATEST_USER_PROMPT: opening youtube for you !"
+            );
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn oom_bad_alloc_compacts_and_recovers_once_in_stream_text_and_tool_runs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_http_body(socket: &mut tokio::net::TcpStream) -> String {
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers_str = String::from_utf8_lossy(&raw[..pos]);
+                        for line in headers_str.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(h_end) = header_end {
+                    if raw.len() >= h_end + content_len {
+                        let body = &raw[h_end..h_end + content_len];
+                        return String::from_utf8_lossy(body).into_owned();
+                    }
+                }
+            }
+            String::new()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_ref = captured.clone();
+        let mock = tokio::spawn(async move {
+            // 1. DM stream_text: OOM bad_alloc -> retry succeeds
+            // 2. VC stream_turn: OOM Internal Memory / context size -> retry succeeds
+            // 3. VC stream_turn: OOM bad_alloc -> retry STILL OOM -> surfaces clear PS5LM error
+            let responses = [
+                "data: {\"error\":{\"message\":\"decode() failed std::bad_alloc\"}}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered DM!\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"error\":{\"message\":\"Internal Memory exceeded context size\"}}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered tool turn!\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"error\":{\"message\":\"decode() failed std::bad_alloc\"}}\n\ndata: [DONE]\n\n",
+                "data: {\"error\":{\"message\":\"decode() failed std::bad_alloc\"}}\n\ndata: [DONE]\n\n",
+            ];
+            for sse in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body_str = read_http_body(&mut socket).await;
+                let req_json: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
+                captured_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(req_json);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-oom-retry-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-oom-ws-{}", random_id().unwrap()));
+        let _ = std::fs::remove_dir_all(&ws_root);
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+
+        let state_no_vc =
+            RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap();
+        let state_vc =
+            RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into())
+                .unwrap()
+                .with_virtual_computer(vc);
+
+        let app_no_vc = local_auth::router(auth.clone()).merge(router(state_no_vc));
+        let app_vc = local_auth::router(auth.clone()).merge(router(state_vc));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let setup_res = app_no_vc.clone().oneshot(setup).await.unwrap();
+        let cookie = setup_res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','Be helpful.',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv_dm','default',id,'t_dm','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv_vc','default',id,'t_vc','[\"bot\"]','VC',0 FROM auth_users LIMIT 1;",
+            )?;
+            // Seed 6 prior history messages in both conversations so compaction has work to drop
+            for conv in ["conv_dm", "conv_vc"] {
+                for i in 0..6 {
+                    let role = if i % 2 == 0 { "person" } else { "bot" };
+                    let bid = if role == "bot" { Some("bot") } else { None };
+                    c.execute(
+                        "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) SELECT ?1,?2,?3,id,?4,?5,'completed',?6 FROM auth_users LIMIT 1",
+                        params![format!("{conv}_old_{i}"), conv, role, bid, format!("History_{i}_{}", "x".repeat(400)), i as i64],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let send_msg = |app: Router, conv: &str, id: &str, key: &str, text: &str| {
+            let uri = format!("/api/v2/organizations/default/conversations/{conv}/messages");
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("host", "example.test")
+                .header("origin", "http://example.test")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(json!({"id":id,"text":text,"botId":"bot"}).to_string()))
+                .unwrap();
+            async move { app.oneshot(req).await.unwrap() }
+        };
+
+        let wait_run = |msg_id: &str| {
+            let db = db.clone();
+            let msg_id = msg_id.to_owned();
+            async move {
+                for _ in 0..120 {
+                    if let Ok(status) = db.try_with_connection(|c| {
+                        Ok(c.query_row(
+                            "SELECT status FROM port_runs WHERE user_message_id=?1",
+                            params![msg_id],
+                            |r| r.get::<_, String>(0),
+                        )?)
+                    }) {
+                        if status == "completed" || status == "failed" {
+                            return status;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("timed out waiting for run {msg_id}");
+            }
+        };
+
+        // 1. stream_text OOM recovery
+        assert_eq!(
+            send_msg(app_no_vc, "conv_dm", "dm_1", "k_dm_1", "opening youtube for you !").await.status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(wait_run("dm_1").await, "completed");
+        let dm_events = event_journal::replay(&db, "conv_dm", None, 128).unwrap();
+        assert_eq!(dm_events.iter().filter(|e| e["type"] == "RUN_STARTED").count(), 1);
+        assert_eq!(dm_events.iter().filter(|e| e["type"] == "TEXT_MESSAGE_START").count(), 1);
+        assert!(dm_events.iter().any(|e| e["type"] == "TEXT_MESSAGE_CONTENT" && e["delta"] == "Recovered DM!"));
+        assert_eq!(dm_events.last().unwrap()["type"], "RUN_FINISHED");
+
+        // 2. stream_turn (VC) OOM recovery
+        assert_eq!(
+            send_msg(app_vc.clone(), "conv_vc", "vc_1", "k_vc_1", "opening youtube for you !").await.status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(wait_run("vc_1").await, "completed");
+        let vc_events = event_journal::replay(&db, "conv_vc", None, 128).unwrap();
+        assert!(vc_events.iter().any(|e| e["type"] == "TEXT_MESSAGE_CONTENT" && e["delta"] == "Recovered tool turn!"));
+
+        // 3. Persistent OOM after single retry surfaces clear PS5LM error message
+        assert_eq!(
+            send_msg(app_vc, "conv_vc", "vc_2", "k_vc_2", "still too huge").await.status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(wait_run("vc_2").await, "failed");
+        let vc_events_after = event_journal::replay(&db, "conv_vc", None, 128).unwrap();
+        let last_err = vc_events_after.last().unwrap();
+        assert_eq!(last_err["type"], "RUN_ERROR");
+        assert!(
+            last_err["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PS5LM ran out of memory (std::bad_alloc)"),
+            "unexpected error message: {last_err}"
+        );
+
+        mock.await.unwrap();
+        let reqs = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(reqs.len(), 6);
+        // Attempt 1 had 8 messages (system + 6 history + latest user); Retry had <= 3 compacted messages & max_tokens 512
+        assert!(reqs[0]["messages"].as_array().unwrap().len() > 3);
+        assert!(reqs[1]["messages"].as_array().unwrap().len() <= 3);
+        assert_eq!(reqs[1]["max_tokens"], 512);
+        assert_eq!(reqs[3]["max_tokens"], 512);
+        assert!(reqs[3]["messages"].as_array().unwrap().len() <= 3);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
     }
 }

@@ -41,6 +41,10 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 512;
 const MAX_FETCH_BYTES: usize = 128 * 1024;
+const MAX_PAGE_TEXT_CHARS: usize = 8 * 1024;
+const MAX_PREVIEW_HTML_BYTES: usize = 24 * 1024;
+const MAX_TOOL_OUTPUT_CHARS: usize = 3072;
+const MAX_BRIDGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SHELL_OUTPUT: usize = 256 * 1024;
 const MAX_SHELL_STATEMENTS: usize = 32;
 const MAX_TERMINAL_HISTORY: usize = 32;
@@ -441,20 +445,11 @@ impl VirtualComputerState {
             guard.page_title = fetched.title.clone();
             guard.page_text = fetched.text.clone();
             guard.page_html = fetched.html.clone();
-            guard.bridge_png = fetched.bridge_png;
+            guard.bridge_png = fetched.bridge_png.clone();
             guard.screen_revision = guard.screen_revision.saturating_add(1);
             guard.push_terminal_line(&format!("web_fetch {} -> {}", fetched.status, fetched.url));
             guard.screen_notify.notify_waiters();
-            let model_text: String = fetched.text.chars().take(3072).collect();
-            let model_trunc = fetched.truncated || fetched.text.chars().count() > 3072;
-            return Ok(json!({
-                "ok": true,
-                "url": fetched.url,
-                "status": fetched.status,
-                "title": fetched.title,
-                "text": model_text,
-                "truncated": model_trunc,
-            }));
+            return Ok(bounded_web_fetch_tool_output(&fetched));
         }
 
         let engine = self.workspace_for_verified_bot(bot_id)?;
@@ -2105,7 +2100,7 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
         })
         .unwrap_or(true);
 
-    let mut raw = Vec::new();
+    let mut raw = Vec::with_capacity(16 * 1024);
     let mut truncated = false;
     while let Some(chunk) = resp
         .chunk()
@@ -2121,39 +2116,114 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
         raw.extend_from_slice(&chunk);
     }
 
-    let body_str = String::from_utf8_lossy(&raw);
     let final_url = resp.url().to_string();
-    let (title, text, visual_html) = if is_html {
+    drop(resp);
+    let result = process_fetched_bytes(
+        final_url,
+        url.host_str().unwrap_or(""),
+        status,
+        is_html,
+        &raw,
+        truncated,
+    );
+    drop(raw);
+    Ok(result)
+}
+
+fn clip_str_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => s[..idx].to_owned(),
+        None => s.to_owned(),
+    }
+}
+
+fn clip_str_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn bounded_web_fetch_tool_output(fetched: &FetchResult) -> Value {
+    let safe_url = clip_str_chars(&fetched.url, 512);
+    let safe_title = clip_str_chars(&fetched.title, 256);
+    let total_text_chars = fetched.text.chars().count();
+    let mut text_limit = total_text_chars.min(2600);
+    loop {
+        let model_text = clip_str_chars(&fetched.text, text_limit);
+        let model_trunc = fetched.truncated || text_limit < total_text_chars;
+        let payload = json!({
+            "ok": true,
+            "url": safe_url,
+            "status": fetched.status,
+            "title": safe_title,
+            "text": model_text,
+            "truncated": model_trunc,
+        });
+        let encoded_chars = serde_json::to_string(&payload)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        if encoded_chars <= MAX_TOOL_OUTPUT_CHARS || text_limit == 0 {
+            return payload;
+        }
+        let excess = encoded_chars - MAX_TOOL_OUTPUT_CHARS;
+        text_limit = text_limit.saturating_sub(excess.max(32));
+    }
+}
+
+fn process_fetched_bytes(
+    final_url: String,
+    fallback_host: &str,
+    status: u16,
+    is_html: bool,
+    raw: &[u8],
+    mut truncated: bool,
+) -> FetchResult {
+    let capped_url = clip_str_chars(&final_url, 1024);
+    let body_str = String::from_utf8_lossy(raw);
+    let (raw_title, text, visual_html) = if is_html {
         let (t, txt) = extract_html_title_and_text(&body_str);
-        let preview = build_visual_html_preview(&final_url, &body_str);
+        let preview = build_visual_html_preview(&capped_url, &body_str);
         (t, txt, preview)
     } else {
-        let host_title = url.host_str().unwrap_or("").to_owned();
-        let escaped = body_str
+        let host_title = fallback_host.to_owned();
+        let plain_text = clip_str_chars(&body_str, MAX_PAGE_TEXT_CHARS);
+        if body_str.chars().count() > MAX_PAGE_TEXT_CHARS {
+            truncated = true;
+        }
+        let escaped_src = clip_str_chars(&plain_text, 6 * 1024);
+        let escaped = escaped_src
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
-        let preview = format!(
-            "<!doctype html><html><body style=\"font-family:ui-monospace,monospace;white-space:pre-wrap;padding:16px;background:#0f172a;color:#e2e8f0\">{escaped}</body></html>"
-        );
-        (host_title, body_str.into_owned(), preview)
+        let prefix = "<!doctype html><html><body style=\"font-family:ui-monospace,monospace;white-space:pre-wrap;padding:16px;background:#0f172a;color:#e2e8f0\">";
+        let suffix = "</body></html>";
+        let max_inner = MAX_PREVIEW_HTML_BYTES.saturating_sub(prefix.len() + suffix.len());
+        let inner = clip_str_bytes(&escaped, max_inner);
+        let preview = format!("{prefix}{inner}{suffix}");
+        (host_title, plain_text, preview)
     };
-    let final_text = if text.len() > 32 * 1024 {
+    let title = clip_str_chars(&raw_title, 256);
+    let final_text = if text.chars().count() > MAX_PAGE_TEXT_CHARS {
         truncated = true;
-        text.chars().take(32 * 1024).collect()
+        clip_str_chars(&text, MAX_PAGE_TEXT_CHARS)
     } else {
         text
     };
 
-    Ok(FetchResult {
-        url: final_url,
+    FetchResult {
+        url: capped_url,
         status,
         title,
         text: final_text,
         html: visual_html,
         bridge_png: None,
         truncated,
-    })
+    }
 }
 
 async fn web_fetch_or_bridge(
@@ -2170,7 +2240,7 @@ async fn web_fetch_or_bridge(
                 .no_proxy()
                 .build()
                 .map_err(|e| format!("bridge client error: {e}"))?;
-            if let Ok(resp) = client
+            if let Ok(mut resp) = client
                 .post(format!("{trimmed}/navigate"))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(json!({ "botId": bot_id, "url": raw_url }).to_string())
@@ -2178,25 +2248,47 @@ async fn web_fetch_or_bridge(
                 .await
             {
                 if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
+                    let mut bytes = Vec::with_capacity(16 * 1024);
+                    let mut within_limit = true;
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        if bytes.len().saturating_add(chunk.len()) > MAX_BRIDGE_RESPONSE_BYTES {
+                            within_limit = false;
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if within_limit {
                         if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
-                        let url = val.get("url").and_then(Value::as_str).unwrap_or(raw_url).to_owned();
-                        let title = val.get("title").and_then(Value::as_str).unwrap_or("").to_owned();
-                        let text = val.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
-                        let html = val.get("html").and_then(Value::as_str).unwrap_or("").to_owned();
-                        let bridge_png = val
-                            .get("screenshotBase64")
-                            .and_then(Value::as_str)
-                            .and_then(|b64| B64.decode(b64).ok());
-                        return Ok(FetchResult {
-                            url,
-                            status: 200,
-                            title,
-                            text,
-                            html,
-                            bridge_png,
-                            truncated: false,
-                        });
+                            let url = clip_str_chars(
+                                val.get("url").and_then(Value::as_str).unwrap_or(raw_url),
+                                1024,
+                            );
+                            let title = clip_str_chars(
+                                val.get("title").and_then(Value::as_str).unwrap_or(""),
+                                256,
+                            );
+                            let raw_text = val.get("text").and_then(Value::as_str).unwrap_or("");
+                            let truncated = raw_text.chars().count() > MAX_PAGE_TEXT_CHARS;
+                            let text = clip_str_chars(raw_text, MAX_PAGE_TEXT_CHARS);
+                            let raw_html = val.get("html").and_then(Value::as_str).unwrap_or("");
+                            let html = if raw_html.is_empty() {
+                                String::new()
+                            } else {
+                                build_visual_html_preview(&url, raw_html)
+                            };
+                            let bridge_png = val
+                                .get("screenshotBase64")
+                                .and_then(Value::as_str)
+                                .and_then(|b64| B64.decode(b64).ok());
+                            return Ok(FetchResult {
+                                url,
+                                status: 200,
+                                title,
+                                text,
+                                html,
+                                bridge_png,
+                                truncated,
+                            });
                         }
                     }
                 }
@@ -2206,47 +2298,90 @@ async fn web_fetch_or_bridge(
     web_fetch_ssrf_safe(raw_url, dns_jobs).await
 }
 
-fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
-    // Strip <script>...</script> blocks and <noscript> so static visual preview cannot run scripts
-    // inside OpenBot even before CSP + sandbox attributes apply.
-    let mut cleaned = String::with_capacity(raw_html.len());
-    let bytes = raw_html.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'<' && starts_with_ascii_ci(&bytes[i..], b"<script") {
-            let mut j = i + 7;
-            while j < bytes.len() {
-                if bytes[j] == b'<' && starts_with_ascii_ci(&bytes[j..], b"</script") {
-                    while j < bytes.len() && bytes[j] != b'>' {
-                        j += 1;
-                    }
-                    if j < bytes.len() {
-                        j += 1;
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        cleaned.push(raw_html[i..].chars().next().unwrap_or(' '));
-        i += raw_html[i..].chars().next().map_or(1, char::len_utf8);
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
-    let safe_base = base_url
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
+    // Strip <script>...</script> and <noscript>...</noscript> blocks so static visual preview
+    // cannot run scripts or bloat PS5 memory with massive inline JSON/JS payloads.
+    let safe_base = clip_str_chars(base_url, 1024)
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let base_tag = format!("<base href=\"{safe_base}\" target=\"_blank\">");
-    let lower = cleaned.to_ascii_lowercase();
-    if let Some(pos) = lower.find("<head>") {
+    let budget = MAX_PREVIEW_HTML_BYTES.saturating_sub(base_tag.len() + 32);
+    let mut cleaned = String::with_capacity(raw_html.len().min(budget));
+    let bytes = raw_html.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && cleaned.len() < budget {
+        if bytes[i] == b'<' {
+            let rest = &bytes[i..];
+            let end_tag: Option<(&'static [u8], usize)> = if starts_with_ascii_ci(rest, b"<script") {
+                Some((b"</script", 7))
+            } else if starts_with_ascii_ci(rest, b"<noscript") {
+                Some((b"</noscript", 9))
+            } else {
+                None
+            };
+            if let Some((closing, skip_len)) = end_tag {
+                let mut j = i + skip_len;
+                while j < bytes.len() {
+                    if bytes[j] == b'<' && starts_with_ascii_ci(&bytes[j..], closing) {
+                        while j < bytes.len() && bytes[j] != b'>' {
+                            j += 1;
+                        }
+                        if j < bytes.len() {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            let next_gt = bytes[i..].iter().position(|&b| b == b'>');
+            let seg_end = match next_gt {
+                Some(rel) => i + rel + 1,
+                None => break,
+            };
+            let rem = budget.saturating_sub(cleaned.len());
+            if seg_end - i > rem {
+                break;
+            }
+            cleaned.push_str(&raw_html[i..seg_end]);
+            i = seg_end;
+        } else {
+            let next_lt = bytes[i..]
+                .iter()
+                .position(|&b| b == b'<')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            let rem = budget.saturating_sub(cleaned.len());
+            let slice = clip_str_bytes(&raw_html[i..next_lt], rem);
+            cleaned.push_str(slice);
+            if slice.len() < next_lt - i {
+                break;
+            }
+            i = next_lt;
+        }
+    }
+
+    let cleaned_bytes = cleaned.as_bytes();
+    if let Some(pos) = find_ascii_ci(cleaned_bytes, b"<head>") {
         let mut out = String::with_capacity(cleaned.len() + base_tag.len());
         out.push_str(&cleaned[..pos + 6]);
         out.push_str(&base_tag);
         out.push_str(&cleaned[pos + 6..]);
         out
-    } else if let Some(pos) = lower.find("<head ") {
+    } else if let Some(pos) = find_ascii_ci(cleaned_bytes, b"<head ") {
         if let Some(rel_end) = cleaned[pos..].find('>') {
             let split = pos + rel_end + 1;
             let mut out = String::with_capacity(cleaned.len() + base_tag.len());
@@ -2263,12 +2398,15 @@ fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
 }
 
 fn extract_html_title_and_text(html: &str) -> (String, String) {
-    let lower = html.to_ascii_lowercase();
-    let title = if let (Some(ts), Some(te)) = (lower.find("<title"), lower.find("</title>")) {
-        if let Some(gt) = lower[ts..].find('>') {
+    let bytes = html.as_bytes();
+    let title = if let (Some(ts), Some(te)) = (
+        find_ascii_ci(bytes, b"<title"),
+        find_ascii_ci(bytes, b"</title>"),
+    ) {
+        if let Some(gt) = html[ts..].find('>') {
             let start = ts + gt + 1;
             if start <= te {
-                collapse_ws(&decode_entities(&html[start..te]))
+                clip_str_chars(&collapse_ws(&decode_entities(&html[start..te])), 256)
             } else {
                 String::new()
             }
@@ -2279,12 +2417,12 @@ fn extract_html_title_and_text(html: &str) -> (String, String) {
         String::new()
     };
 
-    let mut out = String::with_capacity(html.len().min(32 * 1024));
-    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len().min(MAX_PAGE_TEXT_CHARS));
     let mut i = 0usize;
     let mut skip_until: Option<&'static [u8]> = None;
+    let max_raw_text_bytes = MAX_PAGE_TEXT_CHARS.saturating_mul(2);
 
-    while i < bytes.len() {
+    while i < bytes.len() && out.len() < max_raw_text_bytes {
         if let Some(end_tag) = skip_until {
             if bytes[i] == b'<' && starts_with_ascii_ci(&bytes[i..], end_tag) {
                 while i < bytes.len() && bytes[i] != b'>' {
@@ -2321,14 +2459,18 @@ fn extract_html_title_and_text(html: &str) -> (String, String) {
                 i += 1;
             }
         } else {
-            let next_tag = bytes[i..].iter().position(|b| *b == b'<').map(|p| i + p).unwrap_or(bytes.len());
+            let next_tag = bytes[i..]
+                .iter()
+                .position(|b| *b == b'<')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
             let chunk = String::from_utf8_lossy(&bytes[i..next_tag]);
             out.push_str(&decode_entities(&chunk));
             i = next_tag;
         }
     }
 
-    (title, collapse_multiline(&out))
+    (title, clip_str_chars(&collapse_multiline(&out), MAX_PAGE_TEXT_CHARS))
 }
 
 fn starts_with_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
@@ -4955,5 +5097,66 @@ mod tests {
         drop(db);
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_dir_all(ws_root);
+    }
+
+    #[test]
+    fn massive_youtube_like_html_fetch_stays_strictly_bounded() {
+        // Simulate a massive page like YouTube with 250KB of inline JSON/JS in <head> before <body>
+        // plus multi-byte UTF-8 body content exceeding MAX_PAGE_TEXT_CHARS and MAX_PREVIEW_HTML_BYTES.
+        let huge_js = "var ytInitialData={\"k\":\"x\"};".repeat(9000); // ~252 KB
+        let huge_noscript = "<noscript>Enable JavaScript to run YouTube</noscript>".repeat(200);
+        let huge_body = "<p>Watch trending videos — Zażółć gęślą jaźń 🎵</p>".repeat(1200);
+        let huge_html = format!(
+            "<!doctype html><html><head><title>YouTube — {}</title><script>{}</script>{}</head><body>{}</body></html>",
+            "VeryLongTitle".repeat(40),
+            huge_js,
+            huge_noscript,
+            huge_body,
+        );
+        assert!(huge_html.len() > 300 * 1024);
+
+        let capped_input = &huge_html.as_bytes()[..MAX_FETCH_BYTES.min(huge_html.len())];
+        let fetched = process_fetched_bytes(
+            format!("https://www.youtube.com/watch?v={}", "a".repeat(800)),
+            "www.youtube.com",
+            200,
+            true,
+            capped_input,
+            true,
+        );
+        assert!(fetched.truncated);
+        assert!(fetched.title.chars().count() <= 256);
+        assert!(fetched.text.chars().count() <= MAX_PAGE_TEXT_CHARS);
+        assert!(fetched.html.len() <= MAX_PREVIEW_HTML_BYTES);
+        assert!(!fetched.html.contains("ytInitialData"));
+
+        // Ensure multi-byte UTF-8 body + long URL/title still yields bounded preview and <= 3072 char tool output
+        let body_heavy_html = format!(
+            "<html><head><title>{}</title></head><body>{}</body></html>",
+            "Title🔥".repeat(80),
+            huge_body
+        );
+        let fetched_body = process_fetched_bytes(
+            format!("https://www.youtube.com/results?search_query={}", "q".repeat(700)),
+            "www.youtube.com",
+            200,
+            true,
+            body_heavy_html.as_bytes(),
+            false,
+        );
+        assert!(fetched_body.html.len() <= MAX_PREVIEW_HTML_BYTES);
+        assert!(fetched_body.text.chars().count() <= MAX_PAGE_TEXT_CHARS);
+        assert!(fetched_body.text.contains("Watch trending videos"));
+
+        let tool_out = bounded_web_fetch_tool_output(&fetched_body);
+        let encoded = serde_json::to_string(&tool_out).unwrap();
+        assert!(
+            encoded.chars().count() <= MAX_TOOL_OUTPUT_CHARS,
+            "tool output exceeded {} chars: {}",
+            MAX_TOOL_OUTPUT_CHARS,
+            encoded.chars().count()
+        );
+        assert_eq!(tool_out["ok"], true);
+        assert_eq!(tool_out["truncated"], true);
     }
 }

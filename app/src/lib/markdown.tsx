@@ -7,6 +7,9 @@ import {
 import { useRouter } from "@tanstack/react-router";
 import {
   type ComponentProps,
+  cloneElement,
+  isValidElement,
+  type ReactElement,
   useEffect,
   useMemo,
   useSyncExternalStore,
@@ -19,6 +22,13 @@ import {
   Streamdown,
   type StreamdownProps,
 } from "streamdown";
+import {
+  buildPreviewDocument,
+  extractCodeLanguage,
+  extractCodeText,
+  isPreviewableCode,
+  PreviewableCodeBlock,
+} from "@/lib/code-preview";
 import { hasMaths, withMathDelimiters } from "@/lib/maths";
 import {
   NO_SLACK_NAMES,
@@ -151,6 +161,8 @@ function AppLink({
   );
 }
 
+export { buildPreviewDocument, isPreviewableCode };
+
 export const markdownComponents = {
   a: ({ href, children, ...rest }: ComponentProps<"a">) => {
     const path = inAppPath(href);
@@ -199,6 +211,34 @@ export const markdownComponents = {
       >
         {children}
       </a>
+    );
+  },
+  pre: ({ children, ...rest }: ComponentProps<"pre"> & { node?: unknown }) => {
+    if (!isValidElement(children)) {
+      return <pre {...rest}>{children}</pre>;
+    }
+    const childProps = children.props as {
+      className?: string;
+      children?: unknown;
+      node?: { properties?: { metastring?: string } };
+    };
+    const language = extractCodeLanguage(childProps.className);
+    const code = extractCodeText(childProps.children);
+    const previewKind = isPreviewableCode(language, code);
+    if (!previewKind) {
+      return cloneElement(
+        children as ReactElement<{ "data-block"?: string }>,
+        { "data-block": "true" },
+      );
+    }
+    return (
+      <PreviewableCodeBlock
+        className={childProps.className}
+        code={code}
+        language={language}
+        metastring={childProps.node?.properties?.metastring}
+        previewKind={previewKind}
+      />
     );
   },
 };

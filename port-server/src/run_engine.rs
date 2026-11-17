@@ -21,11 +21,43 @@ pub enum RunError {
     ConsumerClosed,
     Protocol(&'static str),
 }
+
+pub(crate) fn is_memory_or_context_error_msg(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("bad_alloc")
+        || lower.contains("internal memory")
+        || lower.contains("context size")
+        || lower.contains("out of memory")
+        || lower.contains("ran out of memory")
+}
+
+impl RunError {
+    pub fn is_oom_or_context_error(&self) -> bool {
+        match self {
+            Self::Upstream(msg) => is_memory_or_context_error_msg(msg),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(e) => write!(f, "{e}"),
-            Self::Upstream(msg) => f.write_str(msg),
+            Self::Upstream(msg) => {
+                if is_memory_or_context_error_msg(msg) {
+                    if msg.starts_with("PS5LM ran out of memory") {
+                        f.write_str(msg)
+                    } else {
+                        write!(
+                            f,
+                            "PS5LM ran out of memory (std::bad_alloc): {msg}. Load a smaller model (e.g. 9B/2B) or start a shorter chat."
+                        )
+                    }
+                } else {
+                    f.write_str(msg)
+                }
+            }
             Self::Cancelled => f.write_str("run cancelled"),
             Self::ConsumerClosed => f.write_str("run consumer closed"),
             Self::Protocol(e) => f.write_str(e),
@@ -74,11 +106,6 @@ fn extract_choice_delta<'a>(
             .unwrap_or("model reported an error")
             .trim()
             .to_owned();
-        if msg.contains("bad_alloc") {
-            return Err(RunError::Upstream(
-                "PS5LM ran out of memory (std::bad_alloc). Load a smaller model (e.g. 9B/2B) or start a shorter chat.".to_owned(),
-            ));
-        }
         return Err(RunError::Upstream(msg));
     }
     let choices = chunk
@@ -919,5 +946,25 @@ mod tests {
             ag_ui_interrupt_finished("t", "r", "i", "c", None, json!("invalid")).is_err()
         );
         assert!(ag_ui_tool_result("", "c", "{}").is_err());
+    }
+
+    #[test]
+    fn oom_and_context_errors_are_detected_and_formatted_clearly() {
+        for raw in [
+            "decode() failed std::bad_alloc",
+            "Internal Memory allocation failed",
+            "Prompt exceeds context size limit",
+        ] {
+            let err = RunError::Upstream(raw.to_owned());
+            assert!(err.is_oom_or_context_error(), "expected OOM detection for {raw}");
+            let rendered = err.to_string();
+            assert!(
+                rendered.starts_with("PS5LM ran out of memory (std::bad_alloc)"),
+                "unexpected Display for {raw}: {rendered}"
+            );
+        }
+        let normal = RunError::Upstream("rate limit reached".to_owned());
+        assert!(!normal.is_oom_or_context_error());
+        assert_eq!(normal.to_string(), "rate limit reached");
     }
 }
