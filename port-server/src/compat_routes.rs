@@ -32,6 +32,35 @@ pub fn migration_sql() -> &'static str {
 
 /// Builds the router for all compatibility and missing frontend REST endpoints.
 pub fn router(state: AuthState) -> Router {
+    router_with_context(
+        state,
+        crate::context_manager::ContextManager::offline(
+            crate::context_manager::DEFAULT_CONTEXT_LIMIT,
+        ),
+    )
+}
+
+#[derive(Clone)]
+struct CompatContextState {
+    auth: AuthState,
+    context: crate::context_manager::ContextManager,
+}
+
+/// Builds the compatibility router wired with a shared `ContextManager`.
+pub fn router_with_context(
+    state: AuthState,
+    context: crate::context_manager::ContextManager,
+) -> Router {
+    let context_router = Router::new()
+        .route(
+            "/api/v2/organizations/{organization}/conversations/{id}/context",
+            get(get_conversation_context),
+        )
+        .with_state(CompatContextState {
+            auth: state.clone(),
+            context,
+        });
+
     Router::new()
         .route(
             "/api/v2/organizations/{organization}/shortened-tool-names",
@@ -93,6 +122,7 @@ pub fn router(state: AuthState) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone())
+        .merge(context_router)
         .merge(crate::compat_extra::router(state))
 }
 
@@ -1583,6 +1613,98 @@ async fn list_app_access_requests(
     )
 }
 
+async fn get_conversation_context(
+    State(s): State<CompatContextState>,
+    Path((org, id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let actor = match authorize(&s.auth, &h, &org, false).await {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if !valid_non_empty_param(&id, 200) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Invalid conversation ID.",
+        );
+    }
+
+    let need_fallback = !s.context.has_conversation_state(&id);
+    let org_id = actor.organization.clone();
+    let owner_id = actor.id.clone();
+    let conv_id = id.clone();
+
+    let conv_check = run_db(&s.auth, move |c| {
+        let bot_ids_raw: Option<String> = c
+            .query_row(
+                "SELECT bot_ids_json FROM port_conversations WHERE id=?1 AND organization_id=?2 AND owner_id=?3 AND deleted=0",
+                params![conv_id, org_id, owner_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(bot_ids_raw) = bot_ids_raw else {
+            return Ok(None);
+        };
+        if !need_fallback {
+            return Ok(Some(None));
+        }
+
+        let mut msgs: Vec<Value> = Vec::new();
+        let bots: Vec<String> = serde_json::from_str(&bot_ids_raw).unwrap_or_default();
+        if let Some(first_bot) = bots.first() {
+            if let Some(sys) = c
+                .query_row(
+                    "SELECT role_description FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",
+                    params![first_bot, org_id, owner_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if !sys.trim().is_empty() {
+                    msgs.push(json!({"role": "system", "content": sys}));
+                }
+            }
+        }
+        let mut st = c.prepare(
+            "SELECT role, text FROM port_conversation_messages WHERE conversation_id=?1 AND text!='' ORDER BY rowid DESC LIMIT 12",
+        )?;
+        let mut rows = st
+            .query_map(params![conv_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        for (role, text) in rows {
+            let api_role = if role == "person" { "user" } else { "assistant" };
+            msgs.push(json!({"role": api_role, "content": text}));
+        }
+        Ok(Some(Some(json!({"messages": msgs}))))
+    })
+    .await;
+
+    let fallback_req = match conv_check {
+        Ok(Some(req_opt)) => req_opt,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "CONVERSATION_NOT_FOUND",
+                "Conversation not found.",
+            )
+        }
+        Err(e) => return e,
+    };
+
+    let snapshot = s
+        .context
+        .get_conversation_snapshot(&id, fallback_req.as_ref())
+        .await;
+    respond_json(
+        StatusCode::OK,
+        serde_json::to_value(snapshot).unwrap_or_else(|_| json!({})),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2226,6 +2348,157 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wrong_org.status(), StatusCode::NOT_FOUND);
+
+        drop(app);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn conversation_context_endpoint_enforces_auth_ownership_and_returns_snapshot() {
+        let mut rand = [0u8; 8];
+        getrandom::getrandom(&mut rand).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("openbot-ctx-route-{:x}.db", u64::from_le_bytes(rand)));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        db.try_with_connection(|c| {
+            let exists: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='port_components')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                c.execute_batch(migration_sql())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let state = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let ctx_mgr = crate::context_manager::ContextManager::offline(16384);
+        let app = crate::local_auth::router(state.clone())
+            .merge(crate::bots::router(state.clone()))
+            .merge(crate::conversations::router(state.clone()))
+            .merge(router_with_context(state, ctx_mgr.clone()));
+
+        let unauth = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/api/v2/organizations/default/conversations/c1/context",
+                "",
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = setup_owner(&app).await;
+        let bot_res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/bots",
+                &cookie,
+                "ctx-bot-1",
+                r#"{"name":"Helper","title":"Helper","roleDescription":"Be concise.","visibility":"private"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bot_res.status(), StatusCode::CREATED);
+        let bot_id = read_json(bot_res).await["bot"]["id"].as_str().unwrap().to_owned();
+
+        let conv_res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v2/organizations/default/conversations",
+                &cookie,
+                "ctx-conv-1",
+                &json!({"botIds": [bot_id]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conv_res.status(), StatusCode::CREATED);
+        let conv_id = read_json(conv_res).await["conversation"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let missing = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/api/v2/organizations/default/conversations/does-not-exist/context",
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let initial = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/api/v2/organizations/default/conversations/{conv_id}/context"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_json = read_json(initial).await;
+        assert_eq!(initial_json["context_limit"], 16384);
+        assert_eq!(initial_json["compacted"], false);
+        assert!(initial_json["used_tokens"].as_u64().unwrap() > 0);
+
+        ctx_mgr.record_conversation_state(
+            &conv_id,
+            crate::context_manager::TokenBreakdown {
+                total_tokens: 4200,
+                system_tokens: 600,
+                history_tokens: 3000,
+                tools_tokens: 600,
+            },
+            Some(&crate::context_manager::CompactionResult {
+                compacted: true,
+                before_tokens: 13000,
+                after_tokens: 4200,
+                threshold_tokens: 12288,
+                context_limit: 16384,
+                dropped_turns: 3,
+                summarized_messages: 6,
+            }),
+        );
+
+        let recorded = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/api/v2/organizations/default/conversations/{conv_id}/context"),
+                &cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recorded.status(), StatusCode::OK);
+        let recorded_json = read_json(recorded).await;
+        assert_eq!(recorded_json["used_tokens"], 4200);
+        assert_eq!(recorded_json["context_limit"], 16384);
+        assert_eq!(recorded_json["remaining_tokens"], 12184);
+        assert_eq!(recorded_json["compacted"], true);
+        assert_eq!(recorded_json["compacted_before_tokens"], 13000);
+        assert_eq!(recorded_json["compacted_after_tokens"], 4200);
+        assert_eq!(recorded_json["dropped_turns"], 3);
 
         drop(app);
         drop(db);

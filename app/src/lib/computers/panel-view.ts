@@ -15,7 +15,7 @@ import { useEffect, useRef } from "react";
  * what the person asked to see.
  */
 
-export type PanelView = "screen" | "terminal";
+export type PanelView = "screen" | "terminal" | "files";
 
 /** The tools that act on the computer behind the screen without showing anything on it. */
 const OFF_SCREEN = new Set([
@@ -78,14 +78,24 @@ export function subscribeToViews(listener: () => void): () => void {
 
 /** What the person asked to see, kept until the panel takes it, so a panel that opens for it finds it. */
 const requested = new Map<string, PanelView>();
+const requestedFile = new Map<string, string>();
 const requestListeners = new Set<
-  (request: { computerId: string; view: PanelView }) => void
+  (request: { computerId: string; view: PanelView; filePath?: string }) => void
 >();
 
 /** The person asked to see this view: a command in the chat clicked, for one. Opens the panel on it. */
 export function showComputerView(computerId: string, view: PanelView): void {
   requested.set(computerId, view);
   for (const listener of requestListeners) listener({ computerId, view });
+}
+
+/** The person clicked a workspace file in chat. Opens the Computer panel to its Files tab and selects it. */
+export function showComputerFile(computerId: string, filePath: string): void {
+  requestedFile.set(computerId, filePath);
+  requested.set(computerId, "files");
+  for (const listener of requestListeners) {
+    listener({ computerId, view: "files", filePath });
+  }
 }
 
 /** The view the person asked for and the panel has not shown yet, taken once. */
@@ -95,8 +105,19 @@ export function takeRequestedView(computerId: string): PanelView | undefined {
   return view;
 }
 
+/** The file the person clicked in chat and the Files tab has not loaded yet, taken once. */
+export function takeRequestedFile(computerId: string): string | undefined {
+  const filePath = requestedFile.get(computerId);
+  requestedFile.delete(computerId);
+  return filePath;
+}
+
 export function onComputerViewRequest(
-  listener: (request: { computerId: string; view: PanelView }) => void,
+  listener: (request: {
+    computerId: string;
+    view: PanelView;
+    filePath?: string;
+  }) => void,
 ): () => void {
   requestListeners.add(listener);
   return () => {

@@ -8,6 +8,7 @@ import {
   botBrowserKeys,
   botBrowserStateQueryOptions,
 } from "@/lib/bot-browser/queries";
+import { onComputerBrowsed } from "@/lib/computers/activity";
 import { botsReason, supplySecret } from "@/lib/computers/control";
 import {
   type ComputerState,
@@ -19,8 +20,8 @@ import {
   readComputerPageSnapshot,
   readPageFrame,
   readScreenshot,
-  startComputer,
   type Screenshot,
+  startComputer,
 } from "@/lib/computers/screen";
 import { useComputerControl } from "@/lib/computers/use-control";
 import { queryClient } from "@/query-client";
@@ -355,6 +356,94 @@ type Props = {
   startupGraceMs?: number;
 };
 
+type PageViewMode = "visual" | "reader" | "screen";
+
+const PAGE_VIEW_TABS: readonly { id: PageViewMode; label: string }[] = [
+  { id: "visual", label: "Page" },
+  { id: "reader", label: "Reader" },
+  { id: "screen", label: "Screen" },
+];
+
+/** Segmented Page | Reader | Screen switcher shared by the inline card and full-size modal. */
+function PageViewSwitcher({
+  value,
+  onChange,
+  compact = false,
+}: {
+  value: PageViewMode;
+  onChange: (mode: PageViewMode) => void;
+  compact?: boolean;
+}) {
+  return (
+    <fieldset
+      aria-label="Page view mode"
+      className="m-0 flex items-center gap-1 rounded-md border bg-background p-0.5"
+    >
+      {PAGE_VIEW_TABS.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          aria-pressed={value === tab.id}
+          onClick={() => onChange(tab.id)}
+          className={`rounded font-medium transition-colors ${
+            compact ? "px-1.5 py-0.5 text-[11px]" : "px-2 py-1 text-xs"
+          } ${
+            value === tab.id
+              ? "bg-primary text-primary-foreground"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </fieldset>
+  );
+}
+
+/** Static reader view shared by the inline panel and full-size modal. */
+function ReaderView({
+  snap,
+  compact = false,
+  style,
+}: {
+  snap: ComputerPageSnapshot;
+  compact?: boolean;
+  style?: React.CSSProperties;
+}) {
+  const hasText = snap.text.trim().length > 0;
+  return (
+    <div
+      className={`relative w-full overflow-y-auto bg-background ${
+        compact ? "p-3 text-xs" : "p-5 text-sm"
+      }`}
+      style={style}
+    >
+      <div className={compact ? "mb-2 border-b pb-1.5" : "mb-3 border-b pb-2"}>
+        <div
+          className={
+            compact ? "font-semibold text-xs" : "font-semibold text-base"
+          }
+        >
+          {snap.title || "Untitled page"}
+        </div>
+        <div className="break-all text-xs text-muted-foreground">
+          {snap.url}
+        </div>
+      </div>
+      {hasText ? (
+        <pre className="whitespace-pre-wrap font-sans leading-relaxed text-foreground">
+          {snap.text}
+        </pre>
+      ) : (
+        <p className="leading-relaxed text-muted-foreground">
+          No static text was extracted from this page (it may require JavaScript
+          to render). Try Screen view.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function ComputerView({
   computerId,
   active = true,
@@ -413,9 +502,7 @@ export function ComputerView({
   /** Bumped when a frame arrives, because the store it lands in is not React state. */
   const [, setFrameArrived] = useState(0);
   const [pageSnap, setPageSnap] = useState<ComputerPageSnapshot | null>(null);
-  const [pageViewMode, setPageViewMode] = useState<
-    "visual" | "reader" | "screen"
-  >("visual");
+  const [pageViewMode, setPageViewMode] = useState<PageViewMode>("visual");
   const [navUrlInput, setNavUrlInput] = useState("");
   const [navPending, setNavPending] = useState(false);
   const [navError, setNavError] = useState<string | null>(null);
@@ -772,6 +859,7 @@ export function ComputerView({
   /** What the Bot asked for the wheel for, when it asked. Never the person's own take. */
   const reason = botsReason(control);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: shot?.url triggers a page snapshot refresh when the browser navigates.
   useEffect(() => {
     if (settled) return;
     let active = true;
@@ -791,12 +879,21 @@ export function ComputerView({
       }
     };
     void syncPage();
-    if (!visualVisible) return () => { active = false; };
+    const stopBrowsed = onComputerBrowsed(computerId, () => {
+      void syncPage();
+    });
+    if (!visualVisible) {
+      return () => {
+        active = false;
+        stopBrowsed();
+      };
+    }
     const id = setInterval(() => {
       void syncPage();
     }, 2000);
     return () => {
       active = false;
+      stopBrowsed();
       clearInterval(id);
     };
   }, [computerId, settled, visualVisible, shot?.url]);
@@ -806,8 +903,7 @@ export function ComputerView({
     pageSnap !== null &&
     pageSnap.mode === "html-preview" &&
     pageSnap.html.trim().length > 0;
-  const activeVisualView =
-    hasVisualHtml && pageViewMode === "visual";
+  const activeVisualView = hasVisualHtml && pageViewMode === "visual";
   const activeReaderView =
     !settled && pageSnap !== null && pageViewMode === "reader";
 
@@ -828,14 +924,16 @@ export function ComputerView({
   ) : null;
 
   /** Where the browser in the picture is, by host: the page drawn now, or the page a finished turn left it on. */
+  const snapUrl =
+    pageSnap?.url && pageSnap.url !== "about:blank" ? pageSnap.url : undefined;
   const pageUrl =
-    hasVisualHtml && pageSnap?.url
-      ? pageSnap.url
+    (hasVisualHtml || activeReaderView) && snapUrl
+      ? snapUrl
       : showScreen
         ? drawn?.url
         : settled
           ? knownPage?.url
-          : undefined;
+          : snapUrl;
   const address = pageUrl ? addressParts(pageUrl) : null;
 
   /*
@@ -897,49 +995,78 @@ export function ComputerView({
             ) : null}
           </figcaption>
         ) : null}
+        {!settled && pageSnap !== null ? (
+          <div
+            className="flex items-center justify-between gap-2 border-b bg-muted/30 px-2.5 py-1.5 text-xs"
+            data-slot="page-view-toolbar"
+          >
+            <PageViewSwitcher
+              compact
+              onChange={setPageViewMode}
+              value={pageViewMode}
+            />
+            {activeReaderView ? (
+              <button
+                type="button"
+                onClick={openExpanded}
+                ref={expandButton}
+                aria-label="Open the Bot's screen full size"
+                className="rounded px-2 py-0.5 font-medium text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                Expand
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {/*
           The picture, and over its foot, while the Bot holds the wheel, a status with Take control: the one
           thing a person watching may want to do, on the thing they are watching. A sibling of the picture's button
           rather than inside it, because a control cannot sit inside another control.
         */}
         <div className="relative">
-          {/* Inline preview remains in transcript; click opens a readable full-size view. */}
-          <button
-            type="button"
-            onClick={openExpanded}
-            ref={expandButton}
-            /*
-             * Opens whether or not there is a picture in it. It used to be disabled without one, and
-             * the wheel is down there: a blank browser, a screen that had not arrived yet, or a
-             * computer that could not be reached left a person with no way to take control at all —
-             * the states where they most want it. With nothing to draw the full-size view shows these
-             * same words, and the wheel below them.
-             */
-            className="relative block w-full cursor-pointer bg-muted"
-            style={frameStyle}
-            aria-label="Open the Bot's screen full size"
-          >
-            {polledScreen}
+          {activeReaderView && pageSnap ? (
+            <ReaderView compact snap={pageSnap} style={frameStyle} />
+          ) : (
+            /* Inline preview remains in transcript; click opens a readable full-size view. */
+            <button
+              type="button"
+              onClick={openExpanded}
+              ref={expandButton}
+              /*
+               * Opens whether or not there is a picture in it. It used to be disabled without one, and
+               * the wheel is down there: a blank browser, a screen that had not arrived yet, or a
+               * computer that could not be reached left a person with no way to take control at all —
+               * the states where they most want it. With nothing to draw the full-size view shows these
+               * same words, and the wheel below them.
+               */
+              className="relative block w-full cursor-pointer bg-muted"
+              style={frameStyle}
+              aria-label="Open the Bot's screen full size"
+            >
+              {polledScreen}
 
-            {/* Whose hands are on it, said on the picture itself. Whose computer it is, the frame above says. */}
-            {wheelHere ? (
-              <span className="absolute right-2 bottom-2 rounded-full border bg-popover px-2.5 py-1 font-medium text-popover-foreground text-xs shadow-sm">
-                You have control
-              </span>
-            ) : null}
+              {/* Whose hands are on it, said on the picture itself. Whose computer it is, the frame above says. */}
+              {wheelHere ? (
+                <span className="absolute right-2 bottom-2 rounded-full border bg-popover px-2.5 py-1 font-medium text-popover-foreground text-xs shadow-sm">
+                  You have control
+                </span>
+              ) : null}
 
-            {showScreen || activeVisualView ? null : (
-              <NothingToSee
-                blankBrowser={blankBrowser}
-                owner={owner}
-                page={knownPage}
-                problem={shownProblem}
-                settled={settled}
-                waiting={waiting}
-              />
-            )}
-          </button>
-          {!settled && !(driving && !control?.transitioning) ? (
+              {showScreen || activeVisualView ? null : (
+                <NothingToSee
+                  blankBrowser={blankBrowser}
+                  owner={owner}
+                  page={knownPage}
+                  problem={shownProblem}
+                  settled={settled}
+                  waiting={waiting}
+                />
+              )}
+            </button>
+          )}
+          {!settled &&
+          !activeReaderView &&
+          !(driving && !control?.transitioning) ? (
             // Solid, not frosted: a blur over a screen that keeps changing is redrawn with every frame of it.
             <div
               className="absolute inset-x-2 bottom-2 flex items-center justify-between gap-2 rounded-xl border bg-popover py-1.5 pr-1.5 pl-3 text-popover-foreground shadow-lg"
@@ -1233,28 +1360,10 @@ export function ComputerView({
                         {navPending ? "Opening…" : "Go"}
                       </button>
                     </form>
-                    <div className="flex items-center gap-1 rounded-md border bg-background p-0.5">
-                      {(
-                        [
-                          { id: "visual", label: "Page" },
-                          { id: "reader", label: "Reader" },
-                          { id: "screen", label: "Screen" },
-                        ] as const
-                      ).map((tab) => (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          onClick={() => setPageViewMode(tab.id)}
-                          className={`rounded px-2 py-1 font-medium transition-colors ${
-                            pageViewMode === tab.id
-                              ? "bg-primary text-primary-foreground"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                        >
-                          {tab.label}
-                        </button>
-                      ))}
-                    </div>
+                    <PageViewSwitcher
+                      onChange={setPageViewMode}
+                      value={pageViewMode}
+                    />
                     {navError ? (
                       <span className="text-destructive">{navError}</span>
                     ) : null}
@@ -1297,22 +1406,7 @@ export function ComputerView({
                       />
                     </div>
                   ) : activeReaderView && pageSnap ? (
-                    <div
-                      className="relative w-full overflow-y-auto bg-background p-5 text-sm"
-                      style={{ aspectRatio }}
-                    >
-                      <div className="mb-3 border-b pb-2">
-                        <div className="font-semibold text-base">
-                          {pageSnap.title || "Untitled page"}
-                        </div>
-                        <div className="break-all text-xs text-muted-foreground">
-                          {pageSnap.url}
-                        </div>
-                      </div>
-                      <pre className="whitespace-pre-wrap font-sans leading-relaxed text-foreground">
-                        {pageSnap.text}
-                      </pre>
-                    </div>
+                    <ReaderView snap={pageSnap} style={{ aspectRatio }} />
                   ) : showLiveScreen ? (
                     <div className="relative w-full" style={{ aspectRatio }}>
                       <LiveScreen

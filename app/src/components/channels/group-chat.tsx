@@ -1,7 +1,9 @@
+import { ownToolLabel } from "@openbot/shared/tool-name";
 import { IconDownload, IconFile } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { ConversationApprovals } from "@/components/approvals/inline-approval";
 import {
   QuestionNotice,
   type WaitingQuestion,
@@ -17,13 +19,13 @@ import { agentListQueryOptions } from "@/lib/agents/queries";
 import type { Attachment } from "@/lib/api/generated/model";
 import {
   type ApprovalInboxData,
+  activeApprovalsInThread,
   answerPersonQuestionMutationOptions,
   approvalInboxOptions,
 } from "@/lib/approvals";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
 import { attachmentUrl } from "@/lib/channels/attachments";
-import { modelCatalogueQueryOptions } from "@/lib/models/queries";
-import { useConversationModel } from "@/lib/models/run-model";
+import { recordGroupApprovalActivity } from "@/lib/computers/activity";
 import {
   type GroupMessage,
   groupKeys,
@@ -37,7 +39,10 @@ import {
   markdownPlugins,
   replyRemarkPlugins,
 } from "@/lib/markdown";
+import { modelCatalogueQueryOptions } from "@/lib/models/queries";
+import { useConversationModel } from "@/lib/models/run-model";
 import { newId } from "@/lib/new-id";
+import { ContextMeter } from "../chat/context-meter";
 import { ChannelAvatar } from "./avatar";
 import { RestoringTranscript } from "./chat-transcript";
 import { Composer, toAgentOptions } from "./composer";
@@ -57,7 +62,13 @@ import { TeamBotConsentCard } from "./team-bot-consent";
  * unless they address another Bot. The server puts the answer in the transcript and runs the Bot
  * that asked on it (`approvals/questions.ts`).
  */
-export function GroupChat({ channelId }: { channelId: string }) {
+export function GroupChat({
+  channelId,
+  threadId,
+}: {
+  channelId: string;
+  threadId?: string;
+}) {
   const queryClient = useQueryClient();
   const group = useQuery(groupQueryOptions(channelId));
   const me = useQuery(currentUserQueryOptions()).data;
@@ -73,7 +84,17 @@ export function GroupChat({ channelId }: { channelId: string }) {
     (message) => message.status === "running" || message.status === "queued",
   );
 
-  const inbox = useQuery(approvalInboxOptions());
+  const inbox = useQuery({
+    ...approvalInboxOptions(),
+    refetchInterval: (query) =>
+      threadId && activeApprovalsInThread(query.state.data, threadId).length > 0
+        ? 2_000
+        : 10_000,
+  });
+  const activeApprovals = threadId
+    ? activeApprovalsInThread(inbox.data, threadId)
+    : [];
+  const carryingOn = activeApprovals.length > 0;
   const question = groupQuestion(inbox.data, channelId);
   // The Bot whose conversation it is: for a hand-off, the one that handed the work on.
   const askerId = question?.conversationBotId ?? question?.botId;
@@ -88,6 +109,27 @@ export function GroupChat({ channelId }: { channelId: string }) {
       queryKey: groupKeys.detail(channelId),
     });
   };
+  useEffect(() => {
+    recordGroupApprovalActivity(inbox.data, threadId);
+  }, [inbox.data, threadId]);
+  useEffect(() => {
+    if (!carryingOn) return;
+    const id = setInterval(() => {
+      void queryClient.invalidateQueries({
+        queryKey: groupKeys.detail(channelId),
+      });
+    }, 1_500);
+    return () => clearInterval(id);
+  }, [carryingOn, channelId, queryClient]);
+  const wasCarryingOn = useRef(carryingOn);
+  useEffect(() => {
+    if (wasCarryingOn.current && !carryingOn) {
+      void queryClient.invalidateQueries({
+        queryKey: groupKeys.detail(channelId),
+      });
+    }
+    wasCarryingOn.current = carryingOn;
+  }, [carryingOn, channelId, queryClient]);
   /*
    * The inbox is read every 10 s, and a Bot that asks ends its turn on the question. Read again the
    * moment the Bots stop, so the question is above the composer when the reply that asks it is.
@@ -175,8 +217,8 @@ export function GroupChat({ channelId }: { channelId: string }) {
           {messages.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Say something to {bots.map((bot) => bot.name).join(" and ")}.{" "}
-              Start with @Name to message one Bot directly, or send a message for
-              the group lead to handle or delegate.
+              Start with @Name to message one Bot directly, or send a message
+              for the group lead to handle or delegate.
             </p>
           ) : null}
           {messages.map((message) => (
@@ -198,6 +240,12 @@ export function GroupChat({ channelId }: { channelId: string }) {
               mine={message.ownerUserId === me?.id}
             />
           ))}
+          {!working && activeApprovals[0] ? (
+            <GroupApprovalStatus
+              botName={names.get(activeApprovals[0].action.botId) ?? "A Bot"}
+              request={activeApprovals[0]}
+            />
+          ) : null}
         </div>
       </div>
       {/* The same column and the same compact composer as a conversation with one Bot. */}
@@ -211,6 +259,11 @@ export function GroupChat({ channelId }: { channelId: string }) {
           <p className="pb-2 text-sm text-destructive" role="alert">
             {answer.error.message}
           </p>
+        ) : null}
+        {threadId ? (
+          <div className="mx-5 mb-3 empty:hidden">
+            <ConversationApprovals threadId={threadId} />
+          </div>
         ) : null}
         {/* The same drawer a conversation with one Bot draws its question in. */}
         {question ? (
@@ -236,20 +289,29 @@ export function GroupChat({ channelId }: { channelId: string }) {
           compact
           disabled={bots.length === 0}
           modelPicker={
-            <ModelPicker
-              catalogue={models.data}
-              disabled={bots.length === 0}
-              onChange={runModel.choose}
-              saving={runModel.saving}
-              value={runModel.value}
-            />
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <ModelPicker
+                catalogue={models.data}
+                disabled={bots.length === 0}
+                onChange={runModel.choose}
+                saving={runModel.saving}
+                value={runModel.value}
+              />
+              <ContextMeter
+                active={working || send.isPending || carryingOn}
+                conversationId={channelId}
+                refreshKey={messages.length}
+              />
+            </div>
           }
-          pending={send.isPending || answer.isPending || working || runModel.saving}
-          routine={
-            bots[0]
-              ? { agentId: bots[0].id, channelId }
-              : undefined
+          pending={
+            send.isPending ||
+            answer.isPending ||
+            working ||
+            carryingOn ||
+            runModel.saving
           }
+          routine={bots[0] ? { agentId: bots[0].id, channelId } : undefined}
           autoFocus
           onSubmit={async (draft) => {
             await runModel.beforeSend();
@@ -435,6 +497,8 @@ function GroupLine({
             <BubbleContent className="w-full">
               <BotMarkdown
                 components={markdownComponents}
+                isAnimating={message.status === "running"}
+                mode={message.status === "running" ? "streaming" : "static"}
                 plugins={markdownPlugins}
                 remarkPlugins={replyRemarkPlugins}
               >
@@ -443,6 +507,52 @@ function GroupLine({
             </BubbleContent>
           </Bubble>
         )}
+      </MessageContent>
+    </MessageRow>
+  );
+}
+
+function GroupApprovalStatus({
+  botName,
+  request,
+}: {
+  botName: string;
+  request: ApprovalInboxData["requests"][number];
+}) {
+  const args =
+    request.action.args &&
+    typeof request.action.args === "object" &&
+    !Array.isArray(request.action.args)
+      ? (request.action.args as Record<string, unknown>)
+      : {};
+  const label =
+    request.decision === "deny"
+      ? "Finishing reply"
+      : (ownToolLabel(request.action.toolRef, true) ?? "Running action");
+  const rawSubject =
+    typeof args.url === "string"
+      ? args.url
+      : typeof args.path === "string"
+        ? args.path
+        : typeof args.command === "string"
+          ? args.command
+          : "";
+  const subject = rawSubject.trim();
+  return (
+    <MessageRow align="start" data-speaker={request.action.botId}>
+      <div className="shrink-0 pt-0.5">
+        <ChannelAvatar participantIds={[request.action.botId]} size={24} />
+      </div>
+      <MessageContent>
+        <MessageHeader className="text-xs font-medium text-muted-foreground">
+          {botName}
+        </MessageHeader>
+        <p
+          className="tool-line-running text-sm text-muted-foreground"
+          role="status"
+        >
+          {subject ? `${label} · ${subject}` : label}
+        </p>
       </MessageContent>
     </MessageRow>
   );

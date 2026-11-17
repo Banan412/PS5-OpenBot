@@ -6,6 +6,7 @@ mod bootstrap;
 mod bots;
 mod compat_extra;
 mod compat_routes;
+mod context_manager;
 mod conversations;
 mod copilot;
 mod direct_threads;
@@ -73,6 +74,12 @@ fn app(
             root: Arc::new(root),
         })
         .merge(bootstrap::router());
+    let context_mgr = runs
+        .as_ref()
+        .map(runs::RunState::context_manager)
+        .unwrap_or_else(|| {
+            context_manager::ContextManager::offline(context_manager::DEFAULT_CONTEXT_LIMIT)
+        });
     let router = match auth {
         Some(state) => {
             let vc_state = runs
@@ -89,7 +96,7 @@ fn app(
                 .merge(direct_threads::router(state.clone()))
                 .merge(preferences::router(state.clone()))
                 .merge(notifications::router(state.clone()))
-                .merge(compat_routes::router(state.clone()))
+                .merge(compat_routes::router_with_context(state.clone(), context_mgr))
                 .merge(routines::router(state.clone(), runs.clone()))
                 .merge(approvals_api::router_with_runs(state.clone(), runs.clone()))
                 .merge(virtual_computer::router(vc_state))
@@ -603,7 +610,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             let vc_root = workspace_root
                 .clone()
                 .unwrap_or_else(|| std::env::temp_dir().join("openbot-workspaces"));
-            let rs = runs::RunState::new(a.clone(), &url, model)?;
+            let rs = runs::RunState::new(a.clone(), &url, model)?.with_live_context_probe();
             let rs = if cfg_value("OPENBOT_ENABLE_TOOLS", &file_cfg, Some("1")).as_deref() != Some("0") {
                 rs.with_virtual_computer(virtual_computer::VirtualComputerState::new(a, vc_root))
             } else {

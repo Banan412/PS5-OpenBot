@@ -18,6 +18,8 @@ export function ToolLine({
   label,
   attempted,
   detail,
+  onDetailClick,
+  detailTitle,
   running,
   refused,
   failed,
@@ -39,6 +41,10 @@ export function ToolLine({
   attempted?: string;
   /** What it was done to. Muted, and truncated rather than wrapped. */
   detail?: string;
+  /** Optional click handler for `detail` (e.g. jump to a workspace file in the Computer panel). */
+  onDetailClick?: () => void;
+  /** Tooltip for clickable `detail`. */
+  detailTitle?: string;
   running?: boolean;
   /** A policy or a boundary said no. Final: nothing the Bot does differently will help. */
   refused?: boolean;
@@ -113,9 +119,23 @@ export function ToolLine({
                   : label}
       </span>
       {detail ? (
-        <span className="min-w-0 shrink-[100] truncate opacity-70">
-          {detail}
-        </span>
+        onDetailClick ? (
+          <button
+            className="min-w-0 shrink-[100] cursor-pointer truncate underline decoration-muted-foreground/45 underline-offset-2 opacity-80 transition-opacity hover:opacity-100"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDetailClick();
+            }}
+            title={detailTitle}
+            type="button"
+          >
+            {detail}
+          </button>
+        ) : (
+          <span className="min-w-0 shrink-[100] truncate opacity-70">
+            {detail}
+          </span>
+        )
       ) : null}
     </span>
   );

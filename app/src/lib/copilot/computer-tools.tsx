@@ -18,6 +18,7 @@ import {
   runHelpRequest,
   runNavigation,
 } from "@/lib/computers/handoff";
+import { showComputerFile } from "@/lib/computers/panel-view";
 import { secretAnswer, secretRequestOver } from "@/lib/computers/secret";
 import {
   type ToolCallContext,
@@ -133,6 +134,8 @@ function ActionLine({
   label,
   attempted,
   detail,
+  onDetailClick,
+  detailTitle,
   running,
   refused,
   failed,
@@ -146,6 +149,8 @@ function ActionLine({
   /** What a failed step says instead of "<label>, didn't work". See `ToolLine`. */
   failedLabel?: string;
   detail?: string;
+  onDetailClick?: () => void;
+  detailTitle?: string;
   running?: boolean;
   /** A policy or a boundary said no. Final: nothing the Bot does differently will help. */
   refused?: boolean;
@@ -161,10 +166,12 @@ function ActionLine({
       attempted={attempted}
       byYou={byYou}
       detail={notYet ? STILL_STARTING_DETAIL : detail}
+      detailTitle={notYet ? undefined : detailTitle}
       failed={failed}
       failedLabel={failedLabel}
       label={label}
       notYet={notYet}
+      onDetailClick={notYet ? undefined : onDetailClick}
       refused={refused}
       running={running}
     />
@@ -202,6 +209,44 @@ function didNotWork(outcome: ComputerOutcome): boolean {
  */
 function stillStarting(outcome: ComputerOutcome): boolean {
   return outcome.ok === false && outcome.starting === true;
+}
+
+function safeFilePath(args: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const path = (args as { path?: unknown }).path;
+  return typeof path === "string" && path.trim() ? path.trim() : undefined;
+}
+
+function fileLineDetail(
+  path: string | undefined,
+  outcome: ComputerOutcome,
+): string | undefined {
+  if (outcome.refused === true) return refusedDetail(path, outcome);
+  if (path) return path;
+  if (didNotWork(outcome) || outcome.truncated === true) {
+    return (
+      outcomeForPerson(String(outcome.reason ?? "")) ||
+      "call was truncated before finishing"
+    );
+  }
+  return undefined;
+}
+
+function canOpenWorkspaceFile(
+  path: string | undefined,
+  botId: string,
+  status: string,
+  outcome: ComputerOutcome,
+): path is string {
+  return (
+    status === "complete" &&
+    !!path &&
+    !!botId &&
+    outcome.refused !== true &&
+    !didNotWork(outcome) &&
+    !stillStarting(outcome) &&
+    !byPerson(outcome)
+  );
 }
 
 /** Whether the step was handed to the person and they did it themselves, so the Bot did not. */
@@ -313,6 +358,7 @@ function NavigationStep({
  */
 const OFFERED: Readonly<Record<string, OfferRule>> = {
   computer_navigate: offeredNavigate,
+  computer_web_fetch: offeredNavigate,
   computer_read: offeredBrowser,
   computer_snapshot: offeredBrowser,
   computer_type: offeredBrowser,
@@ -340,6 +386,39 @@ export function ComputerTools() {
   const bot = useActiveBotHolder();
   useOfferedTo(OFFERED);
 
+  const navigationParameters = z.object({
+    url: z.string().describe("Full web address to open, including https://"),
+  });
+  const navigationHandler = async (
+    { url }: { url: string },
+    // Context is optional in the SDK.
+    { signal, toolCall, agent }: ToolCallContext = {},
+  ) => {
+    const computerId = botOf(agent);
+    const result = await runNavigation(computerId, url, toolCall?.id, signal);
+    if (result.ok) noteBrowsed(computerId);
+    return result;
+  };
+  const renderNavigation = ({
+    args,
+    result,
+    status,
+    toolCallId,
+  }: {
+    args?: { url?: string };
+    result?: string;
+    status: string;
+    toolCallId?: string;
+  }) => (
+    <NavigationStep
+      computerId={bot.current}
+      url={args?.url}
+      result={result}
+      status={status}
+      toolCallId={toolCallId}
+    />
+  );
+
   useFrontendTool({
     name: "computer_navigate",
     description:
@@ -347,28 +426,21 @@ export function ComputerTools() {
       "visit or read a particular website. It is not a web search: never open a search engine with " +
       "it to look something up. Returns the page title and its readable text, so answer from what " +
       "comes back rather than telling the person to go and look.",
-    parameters: z.object({
-      url: z.string().describe("Full web address to open, including https://"),
-    }),
-    handler: async (
-      { url }: { url: string },
-      // Context is optional in the SDK.
-      { signal, toolCall, agent }: ToolCallContext = {},
-    ) => {
-      const computerId = botOf(agent);
-      const result = await runNavigation(computerId, url, toolCall?.id, signal);
-      if (result.ok) noteBrowsed(computerId);
-      return result;
-    },
-    render: ({ args, result, status, toolCallId }) => (
-      <NavigationStep
-        computerId={bot.current}
-        url={args?.url}
-        result={result}
-        status={status}
-        toolCallId={toolCallId}
-      />
-    ),
+    parameters: navigationParameters,
+    handler: navigationHandler,
+    render: renderNavigation,
+  });
+
+  useFrontendTool({
+    name: "computer_web_fetch",
+    description:
+      "Open a web page on your own computer so the person can watch. Use this when asked to open, " +
+      "visit or read a particular website. It is not a web search: never open a search engine with " +
+      "it to look something up. Returns the page title and its readable text, so answer from what " +
+      "comes back rather than telling the person to go and look.",
+    parameters: navigationParameters,
+    handler: navigationHandler,
+    render: renderNavigation,
   });
 
   useFrontendTool({
@@ -773,20 +845,24 @@ export function ComputerTools() {
       }),
     render: ({ args, result, status }) => {
       const outcome = outcomeOf(result);
+      const path = safeFilePath(args);
+      const clickable = canOpenWorkspaceFile(
+        path,
+        bot.current,
+        status,
+        outcome,
+      );
       return (
         <ActionLine
           running={status !== "complete"}
           label="Read file"
           attempted="Read file"
-          detail={
-            outcome.refused === true
-              ? refusedDetail(
-                  typeof args?.path === "string" ? args.path : undefined,
-                  outcome,
-                )
-              : typeof args?.path === "string"
-                ? args.path
-                : undefined
+          detail={fileLineDetail(path, outcome)}
+          detailTitle={
+            clickable ? `Open ${path} in Workspace Files` : undefined
+          }
+          onDetailClick={
+            clickable ? () => showComputerFile(bot.current, path) : undefined
           }
           refused={outcome.refused === true}
           failed={didNotWork(outcome)}
@@ -911,6 +987,13 @@ export function ComputerTools() {
       }),
     render: ({ args, result, status }) => {
       const outcome = outcomeOf(result);
+      const path = safeFilePath(args);
+      const clickable = canOpenWorkspaceFile(
+        path,
+        bot.current,
+        status,
+        outcome,
+      );
       return (
         <ActionLine
           running={status !== "complete"}
@@ -924,15 +1007,12 @@ export function ComputerTools() {
               : "Didn't save a file"
           }
           // Show the path, never file contents.
-          detail={
-            outcome.refused === true
-              ? refusedDetail(
-                  typeof args?.path === "string" ? args.path : undefined,
-                  outcome,
-                )
-              : typeof args?.path === "string"
-                ? args.path
-                : undefined
+          detail={fileLineDetail(path, outcome)}
+          detailTitle={
+            clickable ? `Open ${path} in Workspace Files` : undefined
+          }
+          onDetailClick={
+            clickable ? () => showComputerFile(bot.current, path) : undefined
           }
           refused={outcome.refused === true}
           failed={didNotWork(outcome)}

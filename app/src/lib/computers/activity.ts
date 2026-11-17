@@ -1,4 +1,4 @@
-import type { Message } from "@ag-ui/core";
+import { EventType, type Message } from "@ag-ui/core";
 import { useCopilotKit } from "@copilotkit/react-core/v2";
 import {
   DECLINED_BY_PERSON,
@@ -8,14 +8,19 @@ import {
 } from "@openbot/shared/approval-outcomes";
 import type { DecisionToolName } from "@openbot/shared/decision-tools";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   type ApprovalDecision,
   type ApprovalInboxData,
   approvalInboxOptions,
 } from "@/lib/approvals";
+import { botOfAgent } from "@/lib/copilot/active-bot";
+import {
+  reportComputerActivity,
+  withdrawComputerActivity,
+} from "@/lib/copilot/computer-activity";
 import type { ToolOutcome } from "./call";
-import { followView, latestView } from "./panel-view";
+import { followView, latestView, viewOfTool } from "./panel-view";
 
 /**
  * What a Bot has been doing on its computer: the pages it opened and acted on, the commands it ran,
@@ -438,9 +443,12 @@ export function noteWatched(toolCallId: string): void {
   asked.add(toolCallId);
 }
 
+const answeredBrowserCalls = new Set<string>();
+
 /** A step held for the person, answered by them here, now. Watched, and timed by the answer. */
 export function noteAnswered(toolCallId: string): void {
   asked.add(toolCallId);
+  answeredBrowserCalls.add(toolCallId);
   answeredHere.set(toolCallId, Date.now());
 }
 
@@ -464,6 +472,7 @@ const KINDS: Record<string, ComputerActivity["kind"]> = {
  */
 const BROWSER_STEPS = [
   "computer_navigate",
+  "computer_web_fetch",
   "computer_read",
   "computer_snapshot",
   "computer_screenshot",
@@ -477,6 +486,10 @@ const BROWSER: ReadonlySet<string> = new Set(BROWSER_STEPS);
 
 function isBrowserStep(name: string): name is BrowserStepName {
   return BROWSER.has(name);
+}
+
+function isPageOpenStep(step: string): boolean {
+  return step === "computer_navigate" || step === "computer_web_fetch";
 }
 
 /**
@@ -534,23 +547,23 @@ export function browserDetails(
     result.refused !== true &&
     result.doneByPerson !== true;
   const page = textOf(result.url);
-  const subject =
-    step === "computer_navigate"
-      ? (page ?? textOf(args.url) ?? "")
-      : step === "computer_click" || step === "computer_type"
-        ? (elementName(result) ?? label ?? textOf(args.ref) ?? "")
-        : step === "computer_key"
-          ? (textOf(args.key) ?? "")
-          : step === "computer_scroll"
-            ? typeof args.deltaY === "number" && args.deltaY < 0
-              ? "up"
-              : "down"
-            : (page ?? "");
+  const pageOpen = isPageOpenStep(step);
+  const subject = pageOpen
+    ? (page ?? textOf(args.url) ?? "")
+    : step === "computer_click" || step === "computer_type"
+      ? (elementName(result) ?? label ?? textOf(args.ref) ?? "")
+      : step === "computer_key"
+        ? (textOf(args.key) ?? "")
+        : step === "computer_scroll"
+          ? typeof args.deltaY === "number" && args.deltaY < 0
+            ? "up"
+            : "down"
+          : (page ?? "");
   // A step that did not happen says why. One that did says nothing more, except the title of a page opened.
   const output =
     failed || result.refused === true || result.doneByPerson === true
       ? outputOf(result)
-      : step === "computer_navigate"
+      : pageOpen
         ? (textOf(result.title) ?? "")
         : "";
   return {
@@ -597,6 +610,22 @@ export function readOutcome(content: unknown): ToolOutcome | null {
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const outcome = parsed as Record<string, unknown>;
     if (outcome.waiting === true) return null;
+    if (outcome.denied === true && outcome.ok !== true) {
+      return {
+        ...outcome,
+        ok: false,
+        refused: true,
+        declined: true,
+      };
+    }
+    if (typeof outcome.error === "string" && outcome.ok !== true) {
+      return {
+        ...outcome,
+        ok: false,
+        reason:
+          typeof outcome.reason === "string" ? outcome.reason : outcome.error,
+      };
+    }
     return { ...outcome, ok: outcome.ok !== false };
   }
   if (doneByPerson(text)) return { ok: true, doneByPerson: true, reason: text };
@@ -1040,26 +1069,99 @@ export function useConversationActivity(
     ...approvalInboxOptions(),
     select: decisionsIn,
   }).data;
-  useEffect(
-    () =>
-      copilotkit.subscribe({
-        onToolExecutionStart: ({ toolCallId, toolName }) => {
-          // A card's handler starts when it is drawn to be answered, here.
-          if (
-            KINDS[toolName] ||
-            isBrowserStep(toolName) ||
-            toolName === ASK_APPROVAL
-          )
-            noteWatched(toolCallId);
-        },
-      }).unsubscribe,
-    [copilotkit],
+  const announcedRef = useRef(
+    new Map<string, { announcement: number; toolName: string }>(),
   );
   useEffect(() => {
-    recordActivity(
-      computerId,
-      conversationActivity(messages, decisions ?? NO_DECISIONS),
-    );
+    const agentSubs = new Set<() => void>();
+    const coreSub = copilotkit.subscribe({
+      onToolExecutionStart: ({ toolCallId, toolName }) => {
+        // A card's handler starts when it is drawn to be answered, here.
+        if (
+          KINDS[toolName] ||
+          isBrowserStep(toolName) ||
+          toolName === ASK_APPROVAL
+        )
+          noteWatched(toolCallId);
+      },
+      onAgentRunStarted: ({ agent }) => {
+        if ((botOfAgent(agent) ?? computerId) !== computerId) return;
+        if (typeof agent?.subscribe !== "function") return;
+        let isReplay = false;
+        const sub = agent.subscribe({
+          onEvent: ({ event }) => {
+            if (event.type === EventType.RUN_STARTED) {
+              isReplay = "input" in event && event.input !== undefined;
+              return;
+            }
+            if (event.type === EventType.TOOL_CALL_START) {
+              if (isReplay) return;
+              const { toolCallId, toolCallName } = event as {
+                toolCallId?: string;
+                toolCallName?: string;
+              };
+              if (!toolCallId || !toolCallName) return;
+              if (
+                KINDS[toolCallName] ||
+                isBrowserStep(toolCallName) ||
+                toolCallName === ASK_APPROVAL
+              )
+                noteWatched(toolCallId);
+              if (isBrowserStep(toolCallName)) {
+                const announcement = reportComputerActivity(computerId);
+                announcedRef.current.set(toolCallId, {
+                  announcement,
+                  toolName: toolCallName,
+                });
+              }
+              return;
+            }
+            if (event.type === EventType.TOOL_CALL_RESULT) {
+              const { toolCallId, content } = event as {
+                toolCallId?: string;
+                content?: unknown;
+              };
+              if (!toolCallId) return;
+              const tracked = announcedRef.current.get(toolCallId);
+              if (!tracked) return;
+              announcedRef.current.delete(toolCallId);
+              const outcome = readOutcome(content);
+              if (outcome?.refused === true || outcome?.declined === true) {
+                withdrawComputerActivity(computerId, tracked.announcement);
+              } else if (
+                outcome?.ok === true &&
+                isPageOpenStep(tracked.toolName)
+              ) {
+                noteBrowsed(computerId);
+              }
+            }
+          },
+        });
+        agentSubs.add(() => sub.unsubscribe());
+      },
+    });
+    return () => {
+      coreSub.unsubscribe();
+      for (const unsub of agentSubs) unsub();
+      agentSubs.clear();
+    };
+  }, [copilotkit, computerId]);
+  useEffect(() => {
+    const calls = conversationActivity(messages, decisions ?? NO_DECISIONS);
+    recordActivity(computerId, calls);
+    for (const call of calls) {
+      if (
+        call.did?.kind === "browser" &&
+        call.did.step &&
+        isPageOpenStep(call.did.step) &&
+        !call.did.refused &&
+        !call.did.failed &&
+        answeredBrowserCalls.delete(call.id)
+      ) {
+        noteBrowsed(computerId);
+        reportComputerActivity(computerId);
+      }
+    }
     // And which of the panel's views the Bot is working in: see panel-view.ts.
     followView(computerId, latestView(messages));
   });
@@ -1078,11 +1180,27 @@ export function useConversationActivity(
  * losing it would mean re-deriving it from a screenshot, which cannot answer it.
  */
 const browsed = new Set<string>();
+const browsedListeners = new Set<(computerId: string) => void>();
 
 export function noteBrowsed(computerId: string): void {
-  if (browsed.has(computerId)) return;
-  browsed.add(computerId);
-  notify();
+  if (!browsed.has(computerId)) {
+    browsed.add(computerId);
+    notify();
+  }
+  for (const listener of browsedListeners) listener(computerId);
+}
+
+export function onComputerBrowsed(
+  computerId: string,
+  listener: () => void,
+): () => void {
+  const wrapped = (id: string) => {
+    if (id === computerId) listener();
+  };
+  browsedListeners.add(wrapped);
+  return () => {
+    browsedListeners.delete(wrapped);
+  };
 }
 
 export function subscribeToActivity(listener: () => void): () => void {
@@ -1112,4 +1230,92 @@ export function clearActivity(computerId: string): void {
   byComputer.delete(computerId);
   browsed.delete(computerId);
   notify();
+}
+
+/**
+ * Populate Activity & followed panel view for each Bot in a group conversation from its
+ * approval-gated computer tool calls (`inbox.requests` matching `threadId`).
+ */
+export function recordGroupApprovalActivity(
+  inbox: ApprovalInboxData | undefined,
+  threadId: string | undefined,
+): void {
+  if (!inbox || !threadId) return;
+  const decisions = decisionsIn(inbox);
+  const byBot = new Map<
+    string,
+    {
+      createdAt: number;
+      call: ConversationCall;
+      toolName: string;
+    }[]
+  >();
+  for (const req of inbox.requests) {
+    if (req.action.threadId !== threadId || req.status === "pending") continue;
+    const toolName = req.action.toolRef;
+    const browser = isBrowserStep(toolName);
+    const kind = KINDS[toolName];
+    if (!browser && !kind) continue;
+    const id = req.action.toolCallId ?? req.id;
+    const args =
+      req.action.args &&
+      typeof req.action.args === "object" &&
+      !Array.isArray(req.action.args)
+        ? (req.action.args as Record<string, unknown>)
+        : {};
+    let outcome: ToolOutcome | null = null;
+    if (req.decision === "deny") {
+      outcome = {
+        ok: false,
+        refused: true,
+        declined: true,
+        reason: DECLINED_BY_PERSON,
+      };
+    } else if (req.result !== undefined && req.result !== null) {
+      const raw =
+        typeof req.result === "string"
+          ? req.result
+          : JSON.stringify(req.result);
+      outcome = readOutcome(raw);
+    } else if (req.status === "completed") {
+      outcome = { ok: true };
+    }
+    const baseDid = !outcome
+      ? null
+      : browser
+        ? browserDetails(toolName, args, outcome)
+        : detailsOf(kind as ComputerActivity["kind"], args, outcome);
+    const decision = decisions.get(id);
+    const allowed = allowedBy(decision);
+    const finishedMs = Date.parse(req.completedAt ?? req.decidedAt ?? "");
+    const call: ConversationCall = {
+      id,
+      did: baseDid && allowed ? { ...baseDid, allowed } : baseDid,
+      ...(Number.isFinite(finishedMs) ? { finishedAt: finishedMs } : {}),
+      ...(decision?.at === undefined ? {} : { decidedAt: decision.at }),
+    };
+    const list = byBot.get(req.action.botId) ?? [];
+    list.push({
+      createdAt: Date.parse(req.createdAt) || 0,
+      call,
+      toolName,
+    });
+    byBot.set(req.action.botId, list);
+  }
+  for (const [botId, items] of byBot) {
+    items.sort((a, b) => a.createdAt - b.createdAt);
+    recordActivity(
+      botId,
+      items.map((item) => item.call),
+    );
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const item = items[i];
+      if (!item) continue;
+      const view = viewOfTool(item.toolName);
+      if (view) {
+        followView(botId, { view, callId: item.call.id });
+        break;
+      }
+    }
+  }
 }

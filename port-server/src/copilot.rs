@@ -826,6 +826,254 @@ async fn stream_run(
     }
 }
 
+struct ReconstructedToolCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+struct ReconstructedRound {
+    msg_id: String,
+    text: String,
+    tool_calls: Vec<ReconstructedToolCall>,
+}
+
+fn ensure_round<'a>(
+    rounds_by_run: &'a mut std::collections::HashMap<String, Vec<ReconstructedRound>>,
+    run_id: &str,
+    msg_id: &str,
+) -> usize {
+    let rounds = rounds_by_run.entry(run_id.to_owned()).or_default();
+    if let Some(idx) = rounds.iter().position(|r| r.msg_id == msg_id) {
+        idx
+    } else {
+        rounds.push(ReconstructedRound {
+            msg_id: msg_id.to_owned(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+        });
+        rounds.len() - 1
+    }
+}
+
+fn load_dm_snapshot_messages(
+    c: &rusqlite::Connection,
+    conversation_id: &str,
+    bot_filter: Option<&str>,
+) -> rusqlite::Result<Vec<Value>> {
+    use std::collections::HashMap;
+
+    let msg_rows: Vec<(String, String, String)> = if let Some(bot_id) = bot_filter {
+        let mut stmt = c.prepare(
+            "SELECT id,role,text FROM port_conversation_messages WHERE conversation_id=?1 AND (role='person' OR (role='bot' AND bot_id=?2 AND status NOT IN ('running','queued'))) AND status!='queued' ORDER BY rowid ASC LIMIT 201",
+        )?;
+        let rows = stmt
+            .query_map(params![conversation_id, bot_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        let mut stmt = c.prepare(
+            "SELECT id,role,text FROM port_conversation_messages WHERE conversation_id=?1 AND status IN ('completed','waiting') ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![conversation_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let mut msg_to_run: HashMap<String, String> = HashMap::new();
+    {
+        let mut run_st = c.prepare(
+            "SELECT id, assistant_message_id FROM port_runs WHERE conversation_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = run_st.query_map(params![conversation_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            msg_to_run.insert(row.1, row.0);
+        }
+    }
+
+    let mut rounds_by_run: HashMap<String, Vec<ReconstructedRound>> = HashMap::new();
+    let mut tc_location: HashMap<String, (String, usize, usize)> = HashMap::new();
+    let mut tool_results: HashMap<String, (String, String)> = HashMap::new();
+    {
+        let mut ev_st = c.prepare(
+            "SELECT event_json FROM port_run_events WHERE conversation_id=?1 ORDER BY sequence ASC",
+        )?;
+        let mut current_run_id: Option<String> = None;
+        let rows = ev_st.query_map(params![conversation_id], |r| r.get::<_, String>(0))?;
+        for raw in rows.flatten() {
+            let Ok(ev) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
+            match kind {
+                "RUN_STARTED" => {
+                    current_run_id = ev
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                "TEXT_MESSAGE_CONTENT" => {
+                    if let (Some(rid), Some(mid), Some(delta)) = (
+                        current_run_id.as_deref(),
+                        ev.get("messageId").and_then(Value::as_str),
+                        ev.get("delta").and_then(Value::as_str),
+                    ) {
+                        let r_idx = ensure_round(&mut rounds_by_run, rid, mid);
+                        if let Some(rounds) = rounds_by_run.get_mut(rid) {
+                            rounds[r_idx].text.push_str(delta);
+                        }
+                    }
+                }
+                "TOOL_CALL_START" => {
+                    if let (Some(rid), Some(tc_id), Some(tc_name), Some(parent_id)) = (
+                        current_run_id.as_deref(),
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("toolCallName").and_then(Value::as_str),
+                        ev.get("parentMessageId").and_then(Value::as_str),
+                    ) {
+                        let r_idx = ensure_round(&mut rounds_by_run, rid, parent_id);
+                        if let Some(rounds) = rounds_by_run.get_mut(rid) {
+                            let tc_idx = rounds[r_idx].tool_calls.len();
+                            rounds[r_idx].tool_calls.push(ReconstructedToolCall {
+                                id: tc_id.to_owned(),
+                                name: tc_name.to_owned(),
+                                args: String::new(),
+                            });
+                            tc_location.insert(tc_id.to_owned(), (rid.to_owned(), r_idx, tc_idx));
+                        }
+                    }
+                }
+                "TOOL_CALL_ARGS" => {
+                    if let (Some(tc_id), Some(delta)) = (
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("delta").and_then(Value::as_str),
+                    ) {
+                        if let Some((rid, r_idx, tc_idx)) = tc_location.get(tc_id) {
+                            if let Some(round) =
+                                rounds_by_run.get_mut(rid).and_then(|rs| rs.get_mut(*r_idx))
+                            {
+                                if let Some(tc) = round.tool_calls.get_mut(*tc_idx) {
+                                    tc.args.push_str(delta);
+                                }
+                            }
+                        }
+                    }
+                }
+                "TOOL_CALL_RESULT" => {
+                    if let (Some(tc_id), Some(content)) = (
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("content").and_then(Value::as_str),
+                    ) {
+                        let res_mid = ev
+                            .get("messageId")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("tool_{tc_id}"));
+                        tool_results.insert(tc_id.to_owned(), (res_mid, content.to_owned()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut messages = Vec::with_capacity(msg_rows.len());
+    for (msg_id, role, text) in msg_rows {
+        if role == "person" {
+            if !text.is_empty() {
+                messages.push(json!({
+                    "id": msg_id,
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+            continue;
+        }
+        let rounds = msg_to_run
+            .get(&msg_id)
+            .and_then(|rid| rounds_by_run.get(rid));
+        let has_tools = rounds.is_some_and(|rs| rs.iter().any(|r| !r.tool_calls.is_empty()));
+        if !has_tools {
+            if !text.is_empty() {
+                messages.push(json!({
+                    "id": msg_id,
+                    "role": "assistant",
+                    "content": text,
+                }));
+            }
+            continue;
+        }
+        let rounds = rounds.unwrap();
+        let mut emitted_any_text = false;
+        for round in rounds {
+            let valid_tcs: Vec<&ReconstructedToolCall> = round
+                .tool_calls
+                .iter()
+                .filter(|tc| {
+                    let trimmed = tc.args.trim();
+                    trimmed.is_empty()
+                        || matches!(serde_json::from_str::<Value>(trimmed), Ok(Value::Object(_)))
+                })
+                .collect();
+            if round.text.is_empty() && valid_tcs.is_empty() {
+                continue;
+            }
+            let mut obj = Map::new();
+            obj.insert("id".into(), json!(round.msg_id));
+            obj.insert("role".into(), json!("assistant"));
+            if !round.text.is_empty() {
+                emitted_any_text = true;
+                obj.insert("content".into(), json!(round.text));
+            }
+            if !valid_tcs.is_empty() {
+                let tcs: Vec<Value> = valid_tcs
+                    .iter()
+                    .map(|tc| {
+                        let args = if tc.args.is_empty() { "{}" } else { &tc.args };
+                        json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": args,
+                            }
+                        })
+                    })
+                    .collect();
+                obj.insert("toolCalls".into(), Value::Array(tcs));
+            }
+            messages.push(Value::Object(obj));
+            for tc in valid_tcs {
+                if let Some((res_mid, res_content)) = tool_results.get(&tc.id) {
+                    messages.push(json!({
+                        "id": res_mid,
+                        "role": "tool",
+                        "toolCallId": tc.id,
+                        "content": res_content,
+                    }));
+                }
+            }
+        }
+        if !emitted_any_text && !text.trim().is_empty() {
+            messages.push(json!({
+                "id": format!("{msg_id}_text"),
+                "role": "assistant",
+                "content": text,
+            }));
+        }
+    }
+
+    Ok(messages)
+}
+
 async fn thread_messages(
     State(s): State<Copilot>,
     Path(thread_id): Path<String>,
@@ -849,21 +1097,7 @@ async fn thread_messages(
         let Some(conv_id) = conv_id else {
             return Ok(None);
         };
-        let mut st = c.prepare(
-            "SELECT id, role, text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND text!='' ORDER BY created_at ASC, rowid ASC",
-        )?;
-        let msgs = st
-            .query_map(params![conv_id], |r| {
-                let id: String = r.get(0)?;
-                let role: String = r.get(1)?;
-                let text: String = r.get(2)?;
-                Ok(json!({
-                    "id": id,
-                    "role": if role == "person" { "user" } else { "assistant" },
-                    "content": text,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let msgs = load_dm_snapshot_messages(c, &conv_id, None)?;
         Ok(Some(msgs))
     })
     .await
@@ -913,9 +1147,20 @@ async fn connect(
    let Some((conversation,bot_json))=row else {return Ok(if direct_threads::can_access(c,&org,&owner,&wanted,&bot_id)? {Some((None,Vec::<Value>::new(),None))} else {None})};
    let bots:Vec<String>=serde_json::from_str(&bot_json).map_err(|_|StorageError::InvalidDatabase("invalid bot list"))?;
    if !bots.contains(&bot_id){return Ok(None)}
-   let mut stmt=c.prepare("SELECT id,role,text FROM port_conversation_messages WHERE conversation_id=?1 AND (role='person' OR (role='bot' AND bot_id=?2 AND status!='running' AND text!='')) AND status!='queued' ORDER BY rowid ASC LIMIT 201")?;
-   let messages=stmt.query_map(params![conversation,bot_id],|r|{let id:String=r.get(0)?;let role:String=r.get(1)?;let text:String=r.get(2)?;Ok(json!({"id":id,"role":if role=="person"{"user"}else{"assistant"},"content":text}))})?.collect::<rusqlite::Result<Vec<_>>>()?;
-   if messages.len()>200 || messages.iter().map(|v|v.to_string().len()).sum::<usize>()>1024*1024{return Err(StorageError::InvalidDatabase("conversation snapshot exceeds limit"))}
+   let mut messages = load_dm_snapshot_messages(c, &conversation, Some(&bot_id))?;
+   let mut total_bytes: usize = messages.iter().map(|v| v.to_string().len()).sum();
+   while (messages.len() > 200 || total_bytes > 1024 * 1024) && !messages.is_empty() {
+       let drop_to = messages
+           .iter()
+           .enumerate()
+           .skip(1)
+           .find(|(_, m)| m.get("role").and_then(Value::as_str) == Some("user"))
+           .map(|(idx, _)| idx)
+           .unwrap_or(1);
+       for removed in messages.drain(0..drop_to) {
+           total_bytes = total_bytes.saturating_sub(removed.to_string().len());
+       }
+   }
    let run:Option<String>=c.query_row("SELECT id FROM port_runs WHERE conversation_id=?1 AND bot_id=?2 AND status='running' ORDER BY rowid DESC LIMIT 1",params![conversation,bot_id],|r|r.get(0)).optional()?;
    Ok(Some((Some(conversation),messages,run)))
  }).await;
@@ -1187,6 +1432,133 @@ mod tests {
         assert!(text.contains("Opened YouTube"));
         assert!(text.contains("RUN_FINISHED"));
         mock.await.unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn thread_messages_and_connect_reconstruct_tool_calls_and_results() {
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "openbot-copilot-tools-snap-{:x}.db",
+            u64::from_le_bytes(random)
+        ));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let runs = RunState::new(auth.clone(), "http://127.0.0.1:9/v1", "mock".into()).unwrap();
+        let app = local_auth::router(auth.clone()).merge(router(Copilot::new(auth, runs)));
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(setup).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let thread = "44444444-4444-4444-8444-444444444444";
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Helper','','Be helpful',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv_snap','default',id,'44444444-4444-4444-8444-444444444444','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) SELECT 'u1','conv_snap','person',id,NULL,'Open example.com','completed',1 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) SELECT 'a1','conv_snap','bot',id,'bot','','completed',2 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) SELECT 'a2','conv_snap','bot',id,'bot','Fetched Example Domain.','completed',3 FROM auth_users LIMIT 1;
+                 INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) SELECT 'run_1','conv_snap',id,'bot','u1','a1','k1',x'01','completed',2 FROM auth_users LIMIT 1;
+                 INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) SELECT 'run_2','conv_snap',id,'bot','app_1','a2','k2',x'02','completed',3 FROM auth_users LIMIT 1;",
+            )?;
+            let events = [
+                json!({"type":"RUN_STARTED","threadId":thread,"runId":"run_1"}),
+                json!({"type":"TOOL_CALL_START","toolCallId":"tc_fetch","toolCallName":"computer_web_fetch","parentMessageId":"a1"}),
+                json!({"type":"TOOL_CALL_ARGS","toolCallId":"tc_fetch","delta":"{\"url\":\"https://example.com\"}"}),
+                json!({"type":"TOOL_CALL_END","toolCallId":"tc_fetch"}),
+                json!({"type":"RUN_FINISHED","threadId":thread,"runId":"run_1","outcome":{"type":"interrupt","interrupts":[{"id":"app_1","toolCallId":"tc_fetch"}]}}),
+                json!({"type":"RUN_STARTED","threadId":thread,"runId":"run_2"}),
+                json!({"type":"TOOL_CALL_RESULT","messageId":"tool_tc_fetch","toolCallId":"tc_fetch","role":"tool","content":"{\"status\":200,\"title\":\"Example Domain\"}"}),
+                json!({"type":"TEXT_MESSAGE_START","messageId":"a2_1","role":"assistant"}),
+                json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"a2_1","delta":"Fetched Example Domain."}),
+                json!({"type":"TEXT_MESSAGE_END","messageId":"a2_1"}),
+                json!({"type":"RUN_FINISHED","threadId":thread,"runId":"run_2"}),
+            ];
+            for (idx, ev) in events.iter().enumerate() {
+                let s = ev.to_string();
+                c.execute(
+                    "INSERT INTO port_run_events(conversation_id,sequence,event_json,bytes) VALUES('conv_snap',?1,?2,?3)",
+                    params![(idx + 1) as i64, s, s.len() as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let thread_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/copilotkit/threads/{thread}/messages"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thread_res.status(), StatusCode::OK);
+        let thread_json: Value =
+            serde_json::from_slice(&to_bytes(thread_res.into_body(), 65536).await.unwrap()).unwrap();
+        let msgs = thread_json["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "expected user + assistant(toolCalls) + tool + assistant: {thread_json}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert!(msgs[1].get("content").is_none());
+        assert_eq!(msgs[1]["toolCalls"][0]["id"], "tc_fetch");
+        assert_eq!(msgs[1]["toolCalls"][0]["function"]["name"], "computer_web_fetch");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["toolCallId"], "tc_fetch");
+        assert!(msgs[2]["content"].as_str().unwrap().contains("Example Domain"));
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"], "Fetched Example Domain.");
+
+        let connect_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/copilotkit/agent/bot/connect")
+                    .header("cookie", &cookie)
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"threadId": thread}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connect_res.status(), StatusCode::OK);
+        let connect_body = String::from_utf8(
+            to_bytes(connect_res.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(connect_body.contains("MESSAGES_SNAPSHOT"));
+        assert!(connect_body.contains("tc_fetch"));
+        assert!(connect_body.contains("computer_web_fetch"));
+        assert!(connect_body.contains("Fetched Example Domain."));
+
         drop(db);
         let _ = std::fs::remove_file(path);
     }

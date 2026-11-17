@@ -79,6 +79,7 @@ pub struct TurnResult {
     pub assistant_text: String,
     pub tool_calls: Vec<CollectedToolCall>,
     pub finish_reason: String,
+    pub truncated_tool_call_ids: Vec<String>,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -159,10 +160,7 @@ impl TextStream {
         let content = parse_text_delta(delta)?.map(str::to_owned);
         match choice.get("finish_reason") {
             None | Some(Value::Null) => {}
-            Some(Value::String(s)) if s == "stop" => self.finished = true,
-            Some(Value::String(s)) if s == "length" => {
-                return Err(RunError::Protocol("model output reached its limit"))
-            }
+            Some(Value::String(s)) if s == "stop" || s == "length" => self.finished = true,
             _ => return Err(RunError::Protocol("unsupported model finish reason")),
         };
         Ok(content)
@@ -183,6 +181,7 @@ struct ToolCallSlot {
 struct TurnStream {
     finished: bool,
     finish_reason: Option<String>,
+    truncated_by_length: bool,
     assistant_text: String,
     text_started: bool,
     tool_calls: BTreeMap<usize, ToolCallSlot>,
@@ -230,17 +229,19 @@ impl TurnStream {
 
         match choice.get("finish_reason") {
             None | Some(Value::Null) => {}
-            Some(Value::String(s)) if s == "stop" || s == "tool_calls" => {
+            Some(Value::String(s)) if s == "stop" || s == "tool_calls" || s == "length" => {
                 if s == "tool_calls" && self.tool_calls.is_empty() {
                     return Err(RunError::Protocol(
                         "tool_calls finish reason without tool calls",
                     ));
                 }
                 self.finished = true;
-                self.finish_reason = Some(s.clone());
-            }
-            Some(Value::String(s)) if s == "length" => {
-                return Err(RunError::Protocol("model output reached its limit"));
+                if s == "length" {
+                    self.truncated_by_length = true;
+                    self.finish_reason = Some("stop".to_owned());
+                } else {
+                    self.finish_reason = Some(s.clone());
+                }
             }
             _ => return Err(RunError::Protocol("unsupported model finish reason")),
         }
@@ -366,9 +367,23 @@ impl TurnStream {
             }));
         }
         let mut collected = Vec::with_capacity(self.tool_calls.len());
+        let mut truncated_tool_call_ids = Vec::new();
         for (_, slot) in self.tool_calls {
             if !slot.started || slot.id.is_empty() || slot.name.is_empty() {
+                if self.truncated_by_length {
+                    continue;
+                }
                 return Err(RunError::Protocol("incomplete tool call in model stream"));
+            }
+            if self.truncated_by_length {
+                let valid_obj = matches!(
+                    serde_json::from_str::<Value>(slot.arguments_json.trim()),
+                    Ok(Value::Object(_))
+                );
+                if !valid_obj {
+                    truncated_tool_call_ids.push(slot.id);
+                    continue;
+                }
             }
             events.push(json!({
                 "type": "TOOL_CALL_END",
@@ -393,6 +408,7 @@ impl TurnStream {
                 assistant_text: self.assistant_text,
                 tool_calls: collected,
                 finish_reason,
+                truncated_tool_call_ids,
             },
         ))
     }
@@ -650,9 +666,15 @@ mod tests {
         assert!(state
             .chunk(&json!({"choices":[{"delta":{"tool_calls":[{"id":"x"}]}}]}))
             .is_err());
-        assert!(TextStream::default()
-            .chunk(&json!({"choices":[{"delta":{},"finish_reason":"length"}]}))
-            .is_err());
+        let mut length_state = TextStream::default();
+        assert_eq!(
+            length_state
+                .chunk(&json!({"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"length"}]}))
+                .unwrap()
+                .as_deref(),
+            Some("partial")
+        );
+        assert!(length_state.finished);
     }
 
     #[tokio::test]
@@ -882,13 +904,17 @@ mod tests {
             )
             .is_err());
 
-        // Rejects length, unknown finish reason, and tool_calls finish with zero tools
-        assert!(TurnStream::default()
+        // Accepts length as a clean stop, rejects unknown finish reason, and rejects tool_calls finish with zero tools
+        let mut len_turn = TurnStream::default();
+        assert!(len_turn
             .chunk(
-                &json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}),
+                &json!({"choices":[{"index":0,"delta":{"content":"truncated"},"finish_reason":"length"}]}),
                 "m1",
             )
-            .is_err());
+            .is_ok());
+        let (_, len_res) = len_turn.finish("t1", "r1", "m1", false).unwrap();
+        assert_eq!(len_res.assistant_text, "truncated");
+        assert_eq!(len_res.finish_reason, "stop");
         assert!(TurnStream::default()
             .chunk(
                 &json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}),
@@ -901,6 +927,90 @@ mod tests {
                 "m1",
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_text_and_turn_close_cleanly_on_length_finish_reason() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Truncated \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (client, mock) = serve_sse_once(sse).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        stream_text(
+            client,
+            json!({"model":"mock","messages":[],"max_tokens":512}),
+            "t-len",
+            "r-len",
+            "m-len",
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        mock.await.unwrap();
+        assert_eq!(events.last().unwrap()["type"], "RUN_FINISHED");
+
+        let (client2, mock2) = serve_sse_once(sse).await;
+        let (tx2, mut rx2) = mpsc::channel(16);
+        let turn = stream_turn(
+            client2,
+            json!({"model":"mock","messages":[],"max_tokens":512}),
+            "t-len2",
+            "r-len2",
+            "m-len2",
+            true,
+            tx2,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut turn_events = Vec::new();
+        while let Some(ev) = rx2.recv().await {
+            turn_events.push(ev);
+        }
+        mock2.await.unwrap();
+        assert_eq!(turn.assistant_text, "Truncated answer");
+        assert_eq!(turn.finish_reason, "stop");
+        assert!(turn.truncated_tool_call_ids.is_empty());
+        assert_eq!(turn_events.last().unwrap()["type"], "RUN_FINISHED");
+
+        // Mid-tool-call truncation at finish_reason=="length" drops invalid JSON tool calls cleanly
+        let sse_trunc_tc = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Writing file...\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_cut\",\"type\":\"function\",\"function\":{\"name\":\"computer_write_file\",\"arguments\":\"{\\\"path\\\":\\\"big.py\\\",\\\"contents\\\":\\\"line1\"}}]},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (client3, mock3) = serve_sse_once(sse_trunc_tc).await;
+        let (tx3, mut rx3) = mpsc::channel(16);
+        let turn3 = stream_turn(
+            client3,
+            json!({"model":"mock","messages":[]}),
+            "t-len3",
+            "r-len3",
+            "m-len3",
+            true,
+            tx3,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut ev3 = Vec::new();
+        while let Some(ev) = rx3.recv().await {
+            ev3.push(ev);
+        }
+        mock3.await.unwrap();
+        assert_eq!(turn3.assistant_text, "Writing file...");
+        assert!(turn3.tool_calls.is_empty());
+        assert_eq!(turn3.truncated_tool_call_ids, vec!["tc_cut".to_owned()]);
+        assert_eq!(turn3.finish_reason, "stop");
+        assert!(!ev3.iter().any(|e| e["type"] == "TOOL_CALL_END" && e["toolCallId"] == "tc_cut"));
+        assert_eq!(ev3.last().unwrap()["type"], "RUN_FINISHED");
     }
 
     #[test]

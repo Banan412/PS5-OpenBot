@@ -40,7 +40,7 @@ pub const SCREEN_HEIGHT: u32 = 400;
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 512;
-const MAX_FETCH_BYTES: usize = 128 * 1024;
+const MAX_FETCH_BYTES: usize = 384 * 1024;
 const MAX_PAGE_TEXT_CHARS: usize = 8 * 1024;
 const MAX_PREVIEW_HTML_BYTES: usize = 24 * 1024;
 const MAX_TOOL_OUTPUT_CHARS: usize = 3072;
@@ -372,7 +372,7 @@ impl VirtualComputerState {
         if !self.verify_bot_exists(bot_id).await? {
             return Err("bot not found".to_owned());
         }
-        self.execute_tool_verified(bot_id, tool_name, args_json)
+        self.execute_tool_verified(bot_id, tool_name, args_json, false)
             .await
     }
 
@@ -403,6 +403,26 @@ impl VirtualComputerState {
         tool_name: &str,
         args_json: Value,
     ) -> Result<Value, String> {
+        self.execute_tool_for_owner_with_control(
+            organization_id,
+            owner_id,
+            bot_id,
+            tool_name,
+            args_json,
+            false,
+        )
+        .await
+    }
+
+    async fn execute_tool_for_owner_with_control(
+        &self,
+        organization_id: &str,
+        owner_id: &str,
+        bot_id: &str,
+        tool_name: &str,
+        args_json: Value,
+        allow_human_control: bool,
+    ) -> Result<Value, String> {
         let ok = self
             .verify_bot_owner(organization_id, owner_id, bot_id)
             .await
@@ -410,7 +430,7 @@ impl VirtualComputerState {
         if !ok {
             return Err("bot not found".to_owned());
         }
-        self.execute_tool_verified(bot_id, tool_name, args_json)
+        self.execute_tool_verified(bot_id, tool_name, args_json, allow_human_control)
             .await
     }
 
@@ -419,13 +439,14 @@ impl VirtualComputerState {
         bot_id: &str,
         tool_name: &str,
         args_json: Value,
+        allow_human_control: bool,
     ) -> Result<Value, String> {
         let handle = self.bot_handle(bot_id)?;
         let cwd = {
             let guard = handle
                 .lock()
                 .map_err(|_| "computer state unavailable".to_owned())?;
-            if guard.holder == ControlHolder::Human {
+            if guard.holder == ControlHolder::Human && !allow_human_control {
                 return Err("a person is currently driving this computer".to_owned());
             }
             guard.cwd.clone()
@@ -1988,8 +2009,42 @@ pub(crate) fn is_forbidden_ip(ip: IpAddr, local_ips: &[Ipv4Addr]) -> bool {
     }
 }
 
+fn has_explicit_scheme_without_slashes(s: &str) -> bool {
+    if s.starts_with('[') {
+        return false;
+    }
+    let authority_end = s.find(['/', '?', '#']).unwrap_or(s.len());
+    let head = &s[..authority_end];
+    if let Some((before, after)) = head.split_once(':') {
+        !before.is_empty() && (after.is_empty() || !after.bytes().all(|b| b.is_ascii_digit()))
+    } else {
+        false
+    }
+}
+
 fn validate_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(raw).map_err(|_| "invalid URL".to_owned())?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") {
+        return Err("invalid URL".to_owned());
+    }
+    let candidate = if trimmed.contains("://") || has_explicit_scheme_without_slashes(trimmed) {
+        trimmed.to_owned()
+    } else {
+        let authority_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+        let authority = &trimmed[..authority_end];
+        let host_part = authority.split(':').next().unwrap_or("");
+        let is_ipv6_bracket = authority.starts_with('[') && authority.contains(']');
+        let lower_host = host_part.to_ascii_lowercase();
+        let is_localhost = lower_host == "localhost"
+            || lower_host.ends_with(".localhost")
+            || lower_host.ends_with(".local");
+        if !is_ipv6_bracket && !is_localhost && !host_part.contains('.') {
+            return Err("invalid URL".to_owned());
+        }
+        format!("https://{trimmed}")
+    };
+
+    let url = reqwest::Url::parse(&candidate).map_err(|_| "invalid URL".to_owned())?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("only http and https URLs are allowed".to_owned());
     }
@@ -2002,6 +2057,40 @@ fn validate_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
         return Err("local hostnames are forbidden".to_owned());
     }
     Ok(url)
+}
+
+pub(crate) fn select_allowed_socket_addrs(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+    local_ips: &[Ipv4Addr],
+) -> Result<Vec<SocketAddr>, String> {
+    if addrs.is_empty() {
+        return Err(format!("DNS resolution for host '{host}' returned no addresses"));
+    }
+    let mut allowed_v4 = Vec::new();
+    let mut allowed_v6 = Vec::new();
+    let mut blocked = Vec::new();
+    for addr in addrs {
+        if is_forbidden_ip(addr.ip(), local_ips) {
+            blocked.push(addr.ip());
+        } else if addr.is_ipv4() {
+            allowed_v4.push(addr);
+        } else {
+            allowed_v6.push(addr);
+        }
+    }
+    allowed_v4.extend(allowed_v6);
+    if allowed_v4.is_empty() {
+        let blocked_list = blocked
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "resolved IP address(es) [{blocked_list}] for host '{host}' are forbidden by SSRF policy"
+        ));
+    }
+    Ok(allowed_v4)
 }
 
 async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<FetchResult, String> {
@@ -2022,7 +2111,7 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
             .try_acquire_owned()
             .map_err(|_| "too many concurrent DNS lookups".to_owned())?;
         let resolve_host = host.clone();
-        let pinned_addr: SocketAddr = tokio::time::timeout(
+        let pinned_addrs: Vec<SocketAddr> = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -2031,24 +2120,18 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
 
                 if let Ok(ip) = resolve_host.parse::<IpAddr>() {
                     if is_forbidden_ip(ip, &local_ips) {
-                        return Err("target IP address is forbidden by SSRF policy".to_owned());
+                        return Err(format!(
+                            "target IP address {ip} for host '{resolve_host}' is forbidden by SSRF policy"
+                        ));
                     }
-                    return Ok(SocketAddr::new(ip, port));
+                    return Ok(vec![SocketAddr::new(ip, port)]);
                 }
 
                 let addrs: Vec<SocketAddr> = (resolve_host.as_str(), port)
                     .to_socket_addrs()
-                    .map_err(|_| "DNS resolution failed".to_owned())?
+                    .map_err(|e| format!("DNS resolution failed for host '{resolve_host}': {e}"))?
                     .collect();
-                if addrs.is_empty() {
-                    return Err("DNS resolution returned no addresses".to_owned());
-                }
-                for addr in &addrs {
-                    if is_forbidden_ip(addr.ip(), &local_ips) {
-                        return Err("resolved IP address is forbidden by SSRF policy".to_owned());
-                    }
-                }
-                Ok(addrs[0])
+                select_allowed_socket_addrs(&resolve_host, addrs, &local_ips)
             }),
         )
         .await
@@ -2061,7 +2144,7 @@ async fn web_fetch_ssrf_safe(raw_url: &str, dns_jobs: Arc<Semaphore>) -> Result<
             .pool_max_idle_per_host(0)
             .redirect(Policy::none())
             .no_proxy()
-            .resolve(&host, pinned_addr)
+            .resolve_to_addrs(&host, &pinned_addrs)
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
 
@@ -2196,10 +2279,7 @@ fn process_fetched_bytes(
             truncated = true;
         }
         let escaped_src = clip_str_chars(&plain_text, 6 * 1024);
-        let escaped = escaped_src
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+        let escaped = escape_html(&escaped_src);
         let prefix = "<!doctype html><html><body style=\"font-family:ui-monospace,monospace;white-space:pre-wrap;padding:16px;background:#0f172a;color:#e2e8f0\">";
         let suffix = "</body></html>";
         let max_inner = MAX_PREVIEW_HTML_BYTES.saturating_sub(prefix.len() + suffix.len());
@@ -2307,14 +2387,401 @@ fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn match_skipped_block_tag(rest: &[u8]) -> Option<(&'static [u8], usize)> {
+    const TAGS: &[(&[u8], &[u8])] = &[
+        (b"<script", b"</script"),
+        (b"<style", b"</style"),
+        (b"<noscript", b"</noscript"),
+    ];
+    for &(open, close) in TAGS {
+        if starts_with_ascii_ci(rest, open)
+            && matches!(
+                rest.get(open.len()).copied(),
+                None | Some(b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/')
+            )
+        {
+            return Some((close, open.len()));
+        }
+    }
+    None
+}
+
+fn extract_attr_ci(tag: &str, attr_name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let needle = attr_name.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if i > 0
+            && bytes[i - 1].is_ascii_whitespace()
+            && starts_with_ascii_ci(&bytes[i..], needle)
+        {
+            let mut j = i + needle.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let start = j + 1;
+                    if let Some(rel_end) = tag[start..].find(quote as char) {
+                        return Some(collapse_ws(&decode_entities(&tag[start..start + rel_end])));
+                    }
+                } else {
+                    let start = j;
+                    while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                        j += 1;
+                    }
+                    if j > start {
+                        return Some(collapse_ws(&decode_entities(&tag[start..j])));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(Default)]
+struct HtmlMetadata {
+    og_title: String,
+    description: String,
+    canonical: String,
+    links: Vec<(String, String)>,
+}
+
+fn extract_html_metadata(raw_html: &str, cleaned_html: &str) -> HtmlMetadata {
+    let mut meta = HtmlMetadata::default();
+    let raw_bytes = raw_html.as_bytes();
+    let mut i = 0usize;
+    while i < raw_bytes.len() {
+        if raw_bytes[i] == b'<' {
+            if let Some((closing, skip_len)) = match_skipped_block_tag(&raw_bytes[i..]) {
+                let mut j = i + skip_len;
+                while j < raw_bytes.len() {
+                    if raw_bytes[j] == b'<' && starts_with_ascii_ci(&raw_bytes[j..], closing) {
+                        while j < raw_bytes.len() && raw_bytes[j] != b'>' {
+                            j += 1;
+                        }
+                        if j < raw_bytes.len() {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            if let Some(rel_gt) = raw_bytes[i..].iter().position(|&b| b == b'>') {
+                let tag = &raw_html[i..i + rel_gt + 1];
+                let tb = tag.as_bytes();
+                if starts_with_ascii_ci(tb, b"<meta")
+                    && matches!(tb.get(5).copied(), Some(b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    let key = extract_attr_ci(tag, "name")
+                        .or_else(|| extract_attr_ci(tag, "property"))
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if let Some(content) = extract_attr_ci(tag, "content") {
+                        if !content.is_empty() {
+                            match key.as_str() {
+                                "og:title" | "twitter:title" if meta.og_title.is_empty() => {
+                                    meta.og_title = clip_str_chars(&content, 256);
+                                }
+                                "description" | "og:description" | "twitter:description"
+                                    if meta.description.is_empty() =>
+                                {
+                                    meta.description = clip_str_chars(&content, 600);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if starts_with_ascii_ci(tb, b"<link")
+                    && matches!(tb.get(5).copied(), Some(b' ' | b'\t' | b'\r' | b'\n'))
+                    && meta.canonical.is_empty()
+                {
+                    let rel = extract_attr_ci(tag, "rel")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if rel.split_whitespace().any(|r| r == "canonical") {
+                        if let Some(href) = extract_attr_ci(tag, "href") {
+                            if !href.is_empty() {
+                                meta.canonical = clip_str_chars(&href, 512);
+                            }
+                        }
+                    }
+                }
+                i += rel_gt + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Collect up to 6 unique safe links from cleaned_html for SPA fallback cards.
+    let cb = cleaned_html.as_bytes();
+    let mut k = 0usize;
+    while k < cb.len() && meta.links.len() < 6 {
+        if cb[k] == b'<'
+            && starts_with_ascii_ci(&cb[k..], b"<a")
+            && matches!(cb.get(k + 2).copied(), Some(b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            if let Some(rel_gt) = cb[k..].iter().position(|&b| b == b'>') {
+                let open_tag = &cleaned_html[k..k + rel_gt + 1];
+                let after_open = k + rel_gt + 1;
+                if let Some(href) = extract_attr_ci(open_tag, "href") {
+                    let href_trim = href.trim();
+                    let lower_href = href_trim.to_ascii_lowercase();
+                    let safe_href = !href_trim.is_empty()
+                        && !lower_href.starts_with("javascript:")
+                        && !lower_href.starts_with("data:")
+                        && !lower_href.starts_with("vbscript:")
+                        && !href_trim.starts_with('#');
+                    let label = if let Some(rel_close) = find_ascii_ci(&cb[after_open..], b"</a>") {
+                        let inner = &cleaned_html[after_open..after_open + rel_close];
+                        let (_, txt) = extract_html_title_and_text(inner);
+                        clip_str_chars(&collapse_ws(&txt), 80)
+                    } else {
+                        String::new()
+                    };
+                    if safe_href
+                        && !label.is_empty()
+                        && !meta.links.iter().any(|(h, _)| h == href_trim)
+                    {
+                        meta.links
+                            .push((clip_str_chars(href_trim, 512), label));
+                    }
+                }
+                k = after_open;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    meta
+}
+
+fn extract_visible_text_ignoring_svg(html_fragment: &str) -> String {
+    let bytes = html_fragment.as_bytes();
+    let mut out = String::with_capacity(html_fragment.len().min(1024));
+    let mut i = 0usize;
+    let mut skip_until: Option<&'static [u8]> = None;
+    while i < bytes.len() && out.len() < 1024 {
+        if let Some(end_tag) = skip_until {
+            if bytes[i] == b'<' && starts_with_ascii_ci(&bytes[i..], end_tag) {
+                while i < bytes.len() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                skip_until = None;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'<' {
+            let rest = &bytes[i..];
+            if let Some((close, _)) = match_skipped_block_tag(rest) {
+                skip_until = Some(close);
+            } else if starts_with_ascii_ci(rest, b"<svg")
+                && matches!(rest.get(4).copied(), None | Some(b'>' | b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                skip_until = Some(b"</svg");
+            }
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            let next_tag = bytes[i..]
+                .iter()
+                .position(|&b| b == b'<')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            let chunk = String::from_utf8_lossy(&bytes[i..next_tag]);
+            out.push_str(&decode_entities(&chunk));
+            i = next_tag;
+        }
+    }
+    collapse_ws(&out)
+}
+
+fn is_empty_or_spa_shell(cleaned: &str) -> bool {
+    let cleaned_bytes = cleaned.as_bytes();
+    let visible = if let Some(body_pos) = find_ascii_ci(cleaned_bytes, b"<body") {
+        extract_visible_text_ignoring_svg(&cleaned[body_pos..])
+    } else if find_ascii_ci(cleaned_bytes, b"<head").is_some() {
+        if let Some(head_end) = find_ascii_ci(cleaned_bytes, b"</head>") {
+            extract_visible_text_ignoring_svg(&cleaned[head_end + 7..])
+        } else {
+            String::new()
+        }
+    } else {
+        extract_visible_text_ignoring_svg(cleaned)
+    };
+
+    let visible_len = visible.trim().chars().count();
+    if visible_len == 0 {
+        return true;
+    }
+
+    let spa_markers: &[&[u8]] = &[
+        b"<ytd-app",
+        b"id=\"root\"",
+        b"id='root'",
+        b"id=\"app\"",
+        b"id='app'",
+        b"id=\"__next\"",
+        b"id=\"__nuxt\"",
+        b"<app-root",
+    ];
+    let has_spa_marker = spa_markers
+        .iter()
+        .any(|m| find_ascii_ci(cleaned_bytes, m).is_some());
+    has_spa_marker && visible_len < 240
+}
+
+fn build_spa_fallback_card_html(
+    base_url: &str,
+    base_tag: &str,
+    title: &str,
+    reader_text: &str,
+    meta: &HtmlMetadata,
+) -> String {
+    let display_title = if !title.trim().is_empty() {
+        title.trim()
+    } else if !meta.og_title.trim().is_empty() {
+        meta.og_title.trim()
+    } else {
+        base_url
+    };
+    let safe_title = escape_html(&clip_str_chars(display_title, 256));
+    let safe_url = escape_html(&clip_str_chars(base_url, 1024));
+    let desc_block = if !meta.description.is_empty() {
+        format!(
+            "<div class=\"section\"><div class=\"label\">Description</div><p class=\"meta-text\">{}</p></div>",
+            escape_html(&clip_str_chars(&meta.description, 600))
+        )
+    } else {
+        String::new()
+    };
+    let canonical_block = if !meta.canonical.is_empty() && meta.canonical != base_url {
+        let safe_can = escape_html(&clip_str_chars(&meta.canonical, 512));
+        format!(
+            "<div class=\"meta-row\"><span class=\"label\">Canonical</span><a class=\"chip-link\" href=\"{safe_can}\" target=\"_blank\" rel=\"noopener noreferrer\">{safe_can}</a></div>"
+        )
+    } else {
+        String::new()
+    };
+    let links_block = if !meta.links.is_empty() {
+        let mut items = String::new();
+        for (href, label) in &meta.links {
+            items.push_str(&format!(
+                "<a class=\"chip-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+                escape_html(href),
+                escape_html(label)
+            ));
+        }
+        format!("<div class=\"section\"><div class=\"label\">Links</div><div class=\"chips\">{items}</div></div>")
+    } else {
+        String::new()
+    };
+
+    let text_source = if !reader_text.trim().is_empty() {
+        reader_text.trim()
+    } else if !meta.description.is_empty() {
+        meta.description.trim()
+    } else {
+        "No static text was rendered in the initial HTML (this site renders its content dynamically via JavaScript)."
+    };
+
+    let render_card = |clipped_reader: &str| {
+        let safe_reader = escape_html(clipped_reader);
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\">{base_tag}<style>\
+body{{margin:0;padding:20px;font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;line-height:1.5}}\
+.card{{max-width:760px;margin:0 auto;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:20px}}\
+.badge{{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#38bdf8;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);border-radius:999px;padding:2px 10px;margin-bottom:10px}}\
+h1{{margin:0 0 12px;font-size:20px;line-height:1.3;color:#f8fafc;word-break:break-word}}\
+.url-box{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;margin-bottom:14px}}\
+.url-link{{color:#60a5fa;text-decoration:none;font-size:13px;word-break:break-all}}\
+.url-link:hover{{text-decoration:underline}}\
+.section{{margin-top:14px;padding-top:14px;border-top:1px solid #334155}}\
+.label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;margin-bottom:6px}}\
+.meta-row{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}}\
+.meta-text{{margin:0;font-size:14px;color:#cbd5e1}}\
+.reader{{margin:0;white-space:pre-wrap;font-size:13px;color:#e2e8f0;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px;max-height:420px;overflow:auto}}\
+.chips{{display:flex;flex-wrap:wrap;gap:8px}}\
+.chip-link{{display:inline-block;padding:4px 10px;border-radius:6px;background:#0f172a;border:1px solid #475569;color:#93c5fd;font-size:12px;text-decoration:none}}\
+.chip-link:hover{{border-color:#60a5fa;color:#bfdbfe}}\
+</style></head><body><main class=\"card\">\
+<span class=\"badge\">Dynamic App Preview</span>\
+<h1>{safe_title}</h1>\
+<div class=\"url-box\"><span class=\"label\" style=\"margin:0\">URL</span><a class=\"url-link\" href=\"{safe_url}\" target=\"_blank\" rel=\"noopener noreferrer\">{safe_url}</a></div>\
+{canonical_block}{desc_block}\
+<div class=\"section\"><div class=\"label\">Extracted Reader Text</div><pre class=\"reader\">{safe_reader}</pre></div>\
+{links_block}\
+</main></body></html>"
+        )
+    };
+
+    let mut limit = text_source.chars().count().min(MAX_PAGE_TEXT_CHARS);
+    loop {
+        let candidate = render_card(&clip_str_chars(text_source, limit));
+        if candidate.len() <= MAX_PREVIEW_HTML_BYTES || limit == 0 {
+            if candidate.len() <= MAX_PREVIEW_HTML_BYTES {
+                return candidate;
+            }
+            return clip_str_bytes(&candidate, MAX_PREVIEW_HTML_BYTES).to_owned();
+        }
+        let excess = candidate.len() - MAX_PREVIEW_HTML_BYTES;
+        limit = limit.saturating_sub(excess.max(64));
+    }
+}
+
 fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
-    // Strip <script>...</script> and <noscript>...</noscript> blocks so static visual preview
-    // cannot run scripts or bloat PS5 memory with massive inline JSON/JS payloads.
-    let safe_base = clip_str_chars(base_url, 1024)
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    // Strip <script>...</script>, <style>...</style>, and <noscript>...</noscript> blocks
+    // before enforcing MAX_PREVIEW_HTML_BYTES so <head> scripts/styles don't starve <body>.
+    let safe_base = escape_html(&clip_str_chars(base_url, 1024));
     let base_tag = format!("<base href=\"{safe_base}\" target=\"_blank\">");
     let budget = MAX_PREVIEW_HTML_BYTES.saturating_sub(base_tag.len() + 32);
     let mut cleaned = String::with_capacity(raw_html.len().min(budget));
@@ -2323,14 +2790,7 @@ fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
     while i < bytes.len() && cleaned.len() < budget {
         if bytes[i] == b'<' {
             let rest = &bytes[i..];
-            let end_tag: Option<(&'static [u8], usize)> = if starts_with_ascii_ci(rest, b"<script") {
-                Some((b"</script", 7))
-            } else if starts_with_ascii_ci(rest, b"<noscript") {
-                Some((b"</noscript", 9))
-            } else {
-                None
-            };
-            if let Some((closing, skip_len)) = end_tag {
+            if let Some((closing, skip_len)) = match_skipped_block_tag(rest) {
                 let mut j = i + skip_len;
                 while j < bytes.len() {
                     if bytes[j] == b'<' && starts_with_ascii_ci(&bytes[j..], closing) {
@@ -2374,6 +2834,12 @@ fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
         }
     }
 
+    if is_empty_or_spa_shell(&cleaned) {
+        let (title, reader_text) = extract_html_title_and_text(raw_html);
+        let meta = extract_html_metadata(raw_html, &cleaned);
+        return build_spa_fallback_card_html(base_url, &base_tag, &title, &reader_text, &meta);
+    }
+
     let cleaned_bytes = cleaned.as_bytes();
     if let Some(pos) = find_ascii_ci(cleaned_bytes, b"<head>") {
         let mut out = String::with_capacity(cleaned.len() + base_tag.len());
@@ -2399,7 +2865,7 @@ fn build_visual_html_preview(base_url: &str, raw_html: &str) -> String {
 
 fn extract_html_title_and_text(html: &str) -> (String, String) {
     let bytes = html.as_bytes();
-    let title = if let (Some(ts), Some(te)) = (
+    let mut title = if let (Some(ts), Some(te)) = (
         find_ascii_ci(bytes, b"<title"),
         find_ascii_ci(bytes, b"</title>"),
     ) {
@@ -2440,12 +2906,8 @@ fn extract_html_title_and_text(html: &str) -> (String, String) {
 
         if bytes[i] == b'<' {
             let rest = &bytes[i..];
-            if starts_with_ascii_ci(rest, b"<script") {
-                skip_until = Some(b"</script");
-            } else if starts_with_ascii_ci(rest, b"<style") {
-                skip_until = Some(b"</style");
-            } else if starts_with_ascii_ci(rest, b"<noscript") {
-                skip_until = Some(b"</noscript");
+            if let Some((close, _)) = match_skipped_block_tag(rest) {
+                skip_until = Some(close);
             }
             if is_block_tag(rest) && !out.ends_with('\n') && !out.is_empty() {
                 out.push('\n');
@@ -2470,7 +2932,17 @@ fn extract_html_title_and_text(html: &str) -> (String, String) {
         }
     }
 
-    (title, clip_str_chars(&collapse_multiline(&out), MAX_PAGE_TEXT_CHARS))
+    let mut reader = clip_str_chars(&collapse_multiline(&out), MAX_PAGE_TEXT_CHARS);
+    if title.is_empty() || reader.is_empty() {
+        let meta = extract_html_metadata(html, "");
+        if title.is_empty() && !meta.og_title.is_empty() {
+            title = meta.og_title;
+        }
+        if reader.is_empty() && !meta.description.is_empty() {
+            reader = clip_str_chars(&meta.description, MAX_PAGE_TEXT_CHARS);
+        }
+    }
+    (title, reader)
 }
 
 fn starts_with_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
@@ -3487,6 +3959,7 @@ async fn run_rest_tool(
     tool_name: &str,
     args: Value,
     check_pending_approval: bool,
+    allow_human_control: bool,
 ) -> Response {
     let actor = match authorize_computer(s, headers, org, bot_id, true).await {
         Ok(a) => a,
@@ -3513,7 +3986,14 @@ async fn run_rest_tool(
         }
     }
     match s
-        .execute_tool_for_owner(&actor.organization, &actor.id, bot_id, tool_name, args)
+        .execute_tool_for_owner_with_control(
+            &actor.organization,
+            &actor.id,
+            bot_id,
+            tool_name,
+            args,
+            allow_human_control,
+        )
         .await
     {
         Ok(mut val) => {
@@ -3537,7 +4017,7 @@ async fn rest_files_list(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    run_rest_tool(&s, &headers, &org, &bot_id, "computer_list_files", body, false).await
+    run_rest_tool(&s, &headers, &org, &bot_id, "computer_list_files", body, false, false).await
 }
 
 async fn rest_files_read(
@@ -3546,7 +4026,7 @@ async fn rest_files_read(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    run_rest_tool(&s, &headers, &org, &bot_id, "computer_read_file", body, false).await
+    run_rest_tool(&s, &headers, &org, &bot_id, "computer_read_file", body, false, false).await
 }
 
 async fn rest_files_write(
@@ -3555,7 +4035,7 @@ async fn rest_files_write(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    run_rest_tool(&s, &headers, &org, &bot_id, "computer_write_file", body, true).await
+    run_rest_tool(&s, &headers, &org, &bot_id, "computer_write_file", body, true, false).await
 }
 
 async fn rest_exec(
@@ -3564,7 +4044,7 @@ async fn rest_exec(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    run_rest_tool(&s, &headers, &org, &bot_id, "computer_run_command", body, true).await
+    run_rest_tool(&s, &headers, &org, &bot_id, "computer_run_command", body, true, false).await
 }
 
 async fn rest_navigate(
@@ -3573,7 +4053,7 @@ async fn rest_navigate(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    run_rest_tool(&s, &headers, &org, &bot_id, "computer_web_fetch", body, false).await
+    run_rest_tool(&s, &headers, &org, &bot_id, "computer_web_fetch", body, false, true).await
 }
 
 async fn rest_read_page(
@@ -4074,7 +4554,8 @@ async fn get_page_html(
     let body = if snap.page_html.is_empty() {
         format!(
             "<!doctype html><html><body style=\"font-family:sans-serif;padding:24px\"><h3>{}</h3><p>{}</p></body></html>",
-            snap.page_title, snap.page_text
+            escape_html(&snap.page_title),
+            escape_html(&snap.page_text)
         )
     } else {
         snap.page_html
@@ -5158,5 +5639,288 @@ mod tests {
         );
         assert_eq!(tool_out["ok"], true);
         assert_eq!(tool_out["truncated"], true);
+    }
+
+    #[test]
+    fn validate_fetch_url_normalizes_bare_domains_and_keeps_ssrf_guards() {
+        assert_eq!(
+            validate_fetch_url("youtube.com").unwrap().as_str(),
+            "https://youtube.com/"
+        );
+        assert_eq!(
+            validate_fetch_url("  www.youtube.com/watch?v=dQw4w9WgXcQ  ")
+                .unwrap()
+                .as_str(),
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+        assert_eq!(
+            validate_fetch_url("example.com:8443/path?a=b:c")
+                .unwrap()
+                .as_str(),
+            "https://example.com:8443/path?a=b:c"
+        );
+        assert_eq!(
+            validate_fetch_url("http://example.com/test").unwrap().as_str(),
+            "http://example.com/test"
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "//evil.com",
+            "notadomain",
+            "localhost",
+            "localhost:3000/admin",
+            "sub.localhost/test",
+            "printer.local",
+            "file:///etc/passwd",
+            "ftp://example.com/a",
+            "javascript:alert(1)",
+            "data:text/html,hello",
+            "user:pass@example.com",
+            "https://user:pass@example.com/",
+        ] {
+            assert!(
+                validate_fetch_url(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_dns_selection_prioritizes_public_ipv4_and_reports_offending_ips() {
+        let local = vec![Ipv4Addr::new(192, 168, 10, 3)];
+        let mixed = vec![
+            SocketAddr::new("::".parse().unwrap(), 443),
+            SocketAddr::new("fe80::1".parse().unwrap(), 443),
+            SocketAddr::new("fd00::1".parse().unwrap(), 443),
+            SocketAddr::new("2001:4860:4826:400::".parse().unwrap(), 443),
+            SocketAddr::new("142.251.153.4".parse().unwrap(), 443),
+        ];
+        let allowed = select_allowed_socket_addrs("www.youtube.com", mixed, &local).unwrap();
+        assert_eq!(
+            allowed,
+            vec![
+                SocketAddr::new("142.251.153.4".parse().unwrap(), 443),
+                SocketAddr::new("2001:4860:4826:400::".parse().unwrap(), 443),
+            ]
+        );
+
+        let all_bad = vec![
+            SocketAddr::new("127.0.0.1".parse().unwrap(), 443),
+            SocketAddr::new("::1".parse().unwrap(), 443),
+        ];
+        let err = select_allowed_socket_addrs("www.youtube.com", all_bad, &local).unwrap_err();
+        assert!(err.contains("www.youtube.com"), "missing host in {err}");
+        assert!(err.contains("127.0.0.1"), "missing v4 ip in {err}");
+        assert!(err.contains("::1"), "missing v6 ip in {err}");
+        assert!(err.contains("SSRF"), "missing SSRF in {err}");
+
+        let dns_jobs = Arc::new(Semaphore::new(4));
+        let lit_err = web_fetch_ssrf_safe("http://127.0.0.1:8080/", dns_jobs)
+            .await
+            .err()
+            .unwrap();
+        assert!(lit_err.contains("127.0.0.1"), "missing literal ip in {lit_err}");
+        assert!(lit_err.contains("SSRF"), "missing SSRF in {lit_err}");
+    }
+
+    #[test]
+    fn spa_youtube_fallback_preview_and_head_stripping() {
+        // Large <script>, <style>, and <noscript> in <head> must be stripped before
+        // MAX_PREVIEW_HTML_BYTES so <body> is preserved.
+        let huge_script = "var ytInitialData={\"k\":\"v\"};".repeat(1200);
+        let huge_style = ".ytd-masthead{color:#fff;}".repeat(1200);
+        let huge_noscript = "<noscript>Enable JS</noscript>".repeat(300);
+        let html_with_body = format!(
+            "<!doctype html><html><head><title>Article</title><script>{huge_script}</script><style>{huge_style}</style>{huge_noscript}</head><body><main><p>Real visible article body</p></main></body></html>"
+        );
+        let body_preview = build_visual_html_preview("https://example.com/post", &html_with_body);
+        assert!(body_preview.len() <= MAX_PREVIEW_HTML_BYTES);
+        assert!(body_preview.contains("<p>Real visible article body</p>"));
+        assert!(!body_preview.contains("ytInitialData"));
+        assert!(!body_preview.contains(".ytd-masthead"));
+
+        // YouTube Polymer SPA shell with empty/minimal body synthesizes structured fallback card.
+        let yt_shell = r#"<!doctype html><html><head><title>YouTube</title><meta name="description" content="Enjoy the videos and music you love on YouTube."><link rel="canonical" href="https://www.youtube.com/"><script>var ytInitialData={};</script></head><body><ytd-app><ytd-masthead><a href="https://www.youtube.com/feed/trending">Trending</a></ytd-masthead></ytd-app></body></html>"#;
+        let fetched_spa = process_fetched_bytes(
+            "https://www.youtube.com/".to_owned(),
+            "www.youtube.com",
+            200,
+            true,
+            yt_shell.as_bytes(),
+            false,
+        );
+        assert!(fetched_spa.html.len() <= MAX_PREVIEW_HTML_BYTES);
+        assert!(fetched_spa.html.contains("Dynamic App Preview"));
+        assert!(fetched_spa.html.contains("YouTube"));
+        assert!(fetched_spa.html.contains("https://www.youtube.com/"));
+        assert!(fetched_spa.html.contains("Extracted Reader Text"));
+        assert!(fetched_spa.html.contains("Enjoy the videos and music you love on YouTube."));
+        assert!(fetched_spa.html.contains("Trending"));
+
+        // Truncated <head>-only SPA HTML (body never reached) also yields structured fallback card.
+        let head_only = r#"<!doctype html><html><head><title>YouTube Music</title><meta property="og:description" content="A new music service with official albums."><script>var big=1;"#;
+        let head_preview = build_visual_html_preview("https://music.youtube.com/", head_only);
+        assert!(head_preview.len() <= MAX_PREVIEW_HTML_BYTES);
+        assert!(head_preview.contains("YouTube Music"));
+        assert!(head_preview.contains("https://music.youtube.com/"));
+        assert!(head_preview.contains("A new music service with official albums."));
+    }
+
+    #[tokio::test]
+    async fn human_go_navigate_and_page_html_escaping_work_with_human_in_control() {
+        let mut rnd = [0u8; 8];
+        getrandom::getrandom(&mut rnd).unwrap();
+        let db_path = std::env::temp_dir().join(format!("openbot-vc-nav-{:x}.db", u64::from_le_bytes(rnd)));
+        let ws_root = temp_workspace("nav");
+        let db = Arc::new(Storage::open(&db_path).unwrap());
+
+        let origin = "http://127.0.0.1:3010";
+        let host = "127.0.0.1:3010";
+        let auth = AuthState::new(
+            db.clone(),
+            origin,
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let vc = VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let app = local_auth::router(auth).merge(router(vc.clone()));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("origin", origin)
+            .header("host", host)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(setup).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let cookie = resp.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot_nav','default',id,'Bot','','help',0 FROM auth_users LIMIT 1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Take control as Human
+        let req_ctrl = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/computers/bot_nav/control/request")
+            .header("origin", origin)
+            .header("host", host)
+            .header("cookie", &cookie)
+            .header("idempotency-key", "req-nav")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"manual browse","source":"manual"}"#))
+            .unwrap();
+        let ctrl_body: Value = serde_json::from_slice(
+            &to_bytes(app.clone().oneshot(req_ctrl).await.unwrap().into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let req_id = ctrl_body["request"]["id"].as_str().unwrap().to_owned();
+
+        let take_ctrl = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/computers/bot_nav/control/take")
+            .header("origin", origin)
+            .header("host", host)
+            .header("cookie", &cookie)
+            .header("idempotency-key", "take-nav")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"requestId": req_id}).to_string()))
+            .unwrap();
+        let taken: Value = serde_json::from_slice(
+            &to_bytes(app.clone().oneshot(take_ctrl).await.unwrap().into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(taken["holder"], "human");
+
+        // Bot-initiated navigate must still be blocked while Human holds control
+        let bot_err = vc
+            .execute_tool(
+                "bot_nav",
+                "computer_web_fetch",
+                json!({"url": "https://example.com"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(bot_err.contains("driving this computer"));
+
+        // Human-initiated POST .../navigate (modal Go) must NOT be blocked by HUMAN_IN_CONTROL
+        let nav_req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/computers/bot_nav/navigate")
+            .header("origin", origin)
+            .header("host", host)
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"localhost"}"#))
+            .unwrap();
+        let nav_resp = app.clone().oneshot(nav_req).await.unwrap();
+        assert_eq!(nav_resp.status(), StatusCode::OK);
+        let nav_json: Value = serde_json::from_slice(
+            &to_bytes(nav_resp.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nav_json["ok"], false);
+        assert_eq!(nav_json["error"], "local hostnames are forbidden");
+
+        // Non-navigate REST exec remains blocked by HUMAN_IN_CONTROL
+        let exec_req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/computers/bot_nav/exec")
+            .header("origin", origin)
+            .header("host", host)
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"command":"pwd"}"#))
+            .unwrap();
+        let exec_resp = app.clone().oneshot(exec_req).await.unwrap();
+        assert_eq!(exec_resp.status(), StatusCode::CONFLICT);
+
+        // Verify get_page_html escapes HTML entities in title & text when page_html is empty
+        {
+            let handle = vc.bot_handle("bot_nav").unwrap();
+            let mut guard = handle.lock().unwrap();
+            guard.page_html.clear();
+            guard.page_title = "<script>alert(1)</script> & \"Title\"".to_owned();
+            guard.page_text = "5 < 10 & 'raw'".to_owned();
+        }
+        let html_req = Request::builder()
+            .uri("/api/v2/organizations/default/computers/bot_nav/page-html")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let html_resp = app.clone().oneshot(html_req).await.unwrap();
+        assert_eq!(html_resp.status(), StatusCode::OK);
+        let html_body = String::from_utf8(
+            to_bytes(html_resp.into_body(), 8192).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html_body.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;Title&quot;"));
+        assert!(html_body.contains("5 &lt; 10 &amp; &#39;raw&#39;"));
+        assert!(!html_body.contains("<script>alert(1)</script>"));
+
+        drop(db);
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir_all(ws_root);
     }
 }

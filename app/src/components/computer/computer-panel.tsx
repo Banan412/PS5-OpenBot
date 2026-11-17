@@ -1,6 +1,7 @@
 import {
   IconDeviceDesktop,
   IconDeviceDesktopOff,
+  IconFolder,
   IconTerminal2,
 } from "@tabler/icons-react";
 import { useEffect, useState, useSyncExternalStore } from "react";
@@ -18,11 +19,13 @@ import { useNoBotComputers } from "@/lib/deployment/queries";
 import { ActivityLog } from "./activity-log";
 import { ComputerTerminal } from "./computer-terminal";
 import { ComputerView } from "./computer-view";
+import { WorkspaceFiles } from "./workspace-files";
 
 /**
  * The current live computer, separate from screenshots kept in historical tool results.
  *
- * Two views of the one computer: its screen, and its terminal (the Bot's live shell).
+ * Three views of the one computer: its screen, its terminal (the Bot's live shell), and its
+ * workspace files.
  *
  * WHICH ONE IS IN FRONT. The one the Bot last worked in: a command puts the terminal in front, a page
  * the screen, and a Bot that has only used its shell opens on the terminal (panel-view.ts). Once the
@@ -123,6 +126,10 @@ function LiveComputerPanel({
               <IconTerminal2 data-icon="inline-start" />
               Terminal
             </TabsTrigger>
+            <TabsTrigger value="files">
+              <IconFolder data-icon="inline-start" />
+              Files
+            </TabsTrigger>
           </TabsList>
           {youHaveIt ? (
             <span
@@ -138,6 +145,9 @@ function LiveComputerPanel({
         </TabsContent>
         <TabsContent value="terminal">
           <ComputerTerminal computerId={agentId} />
+        </TabsContent>
+        <TabsContent value="files">
+          <WorkspaceFiles computerId={agentId} />
         </TabsContent>
       </Tabs>
       <div className="mt-8">

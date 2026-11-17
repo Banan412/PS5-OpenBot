@@ -8,6 +8,7 @@ type BrowserStep = Extract<VisibleChatItem, { kind: "tool" }>;
 /** The browser steps, named in the words every other line uses for them (`shared/tool-name.ts`). */
 const BROWSER_STEPS: ReadonlySet<string> = new Set([
   "computer_navigate",
+  "computer_web_fetch",
   "computer_read",
   "computer_snapshot",
   "computer_click",
@@ -65,7 +66,9 @@ export function awaitingFreshLook(step: BrowserStep): boolean {
 export function browserStepDetails(step: BrowserStep) {
   const result = objectOf(step.result);
   const args = objectOf(step.toolCall.function.arguments);
-  const navigation = step.toolCall.function.name === "computer_navigate";
+  const navigation =
+    step.toolCall.function.name === "computer_navigate" ||
+    step.toolCall.function.name === "computer_web_fetch";
   const rawUrl = navigation ? (result.url ?? args.url) : undefined;
   let url: URL | undefined;
   try {
@@ -91,6 +94,8 @@ export function browserStepDetails(step: BrowserStep) {
   const failed =
     result.ok === false ||
     result.refused === true ||
+    result.denied === true ||
+    (typeof result.error === "string" && result.ok !== true) ||
     step.result?.startsWith("Error:") === true ||
     sentence?.ok === false;
   return {
@@ -104,9 +109,11 @@ export function browserStepDetails(step: BrowserStep) {
     reason:
       typeof result.reason === "string"
         ? result.reason
-        : sentence?.ok === false && typeof sentence.reason === "string"
-          ? outcomeForPerson(sentence.reason)
-          : undefined,
+        : typeof result.error === "string" && result.ok !== true
+          ? result.error
+          : sentence?.ok === false && typeof sentence.reason === "string"
+            ? outcomeForPerson(sentence.reason)
+            : undefined,
     visited: navigation && result.ok === true,
     pending: step.result === undefined,
   };

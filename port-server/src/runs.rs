@@ -1,6 +1,7 @@
 //! Experimental, opt-in host model runs. Tools and WebSocket delivery are not implemented.
 use crate::{
     approvals_api,
+    context_manager,
     event_journal,
     governance,
     local_auth::{self, AuthState},
@@ -44,6 +45,7 @@ pub struct RunState {
     active: Arc<Mutex<HashMap<String, CancellationToken>>>,
     registration: Arc<tokio::sync::Mutex<()>>,
     virtual_computer: Option<virtual_computer::VirtualComputerState>,
+    context_manager: context_manager::ContextManager,
 }
 impl RunState {
     pub fn new(
@@ -55,6 +57,7 @@ impl RunState {
             return Err("invalid model ID".into());
         }
         let model = ModelClient::new(url, Duration::from_secs(5), Duration::from_secs(600))?;
+        let context_manager = context_manager::ContextManager::new(url)?;
         // Runs interrupted by a process restart have an unknown outcome; never rerun them.
         recover_interrupted(&auth.db)?;
         Ok(Self {
@@ -65,6 +68,7 @@ impl RunState {
             active: Arc::new(Mutex::new(HashMap::new())),
             registration: Arc::new(tokio::sync::Mutex::new(())),
             virtual_computer: None,
+            context_manager,
         })
     }
 
@@ -78,6 +82,15 @@ impl RunState {
 
     pub(crate) fn virtual_computer_state(&self) -> Option<virtual_computer::VirtualComputerState> {
         self.virtual_computer.clone()
+    }
+
+    pub(crate) fn context_manager(&self) -> context_manager::ContextManager {
+        self.context_manager.clone()
+    }
+
+    pub fn with_live_context_probe(mut self) -> Self {
+        self.context_manager = self.context_manager.with_live_probe(true);
+        self
     }
 
     /// Stop only a running job belonging to the authenticated thread scope.
@@ -244,6 +257,131 @@ struct GroupTurnPlan {
     lead_orchestration: bool,
 }
 
+fn extract_explicit_group_bot_mentions(
+    lower: &str,
+    bots: &[String],
+    bot_names: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut candidates: Vec<(&str, String)> = bots
+        .iter()
+        .filter_map(|id| {
+            bot_names
+                .get(id)
+                .map(|n| (id.as_str(), normalize_hws_lower(n).trim().to_owned()))
+        })
+        .filter(|(_, name)| !name.is_empty())
+        .collect();
+    // Longest name first so "Backend Dev" beats "Dev".
+    candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    let mut matched: Vec<String> = Vec::new();
+    let mut push_unique = |id: &str| {
+        if !matched.iter().any(|existing| existing == id) {
+            matched.push(id.to_owned());
+        }
+    };
+
+    // 1. Explicit @mentions anywhere in the message.
+    for (idx, ch) in lower.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+        let before_ok = lower[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if !before_ok {
+            continue;
+        }
+        let after_at = &lower[idx + 1..];
+        for (bot_id, name_lower) in &candidates {
+            if let Some(rest) = after_at.strip_prefix(name_lower.as_str()) {
+                let after_ok = rest.chars().next().is_none_or(|c| !c.is_alphanumeric());
+                if after_ok {
+                    push_unique(bot_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Explicit leading vocative addressing ("Programmer, ...", "Hey Programmer, ...",
+    //    "Programmer and UI Designer please ...").
+    let mut s = lower.trim_start();
+    for greeting in ["hello", "okay", "dear", "hey", "hi", "yo", "ok"] {
+        if let Some(rest) = s.strip_prefix(greeting) {
+            if rest.starts_with(',') || rest.chars().next().is_some_and(char::is_whitespace) {
+                let after = rest.trim_start_matches(',').trim_start();
+                if !after.is_empty() {
+                    s = after;
+                }
+                break;
+            }
+        }
+    }
+
+    fn match_head<'a, 'b>(
+        candidates: &[(&'a str, String)],
+        input: &'b str,
+    ) -> Option<(&'a str, &'b str)> {
+        for (bot_id, name_lower) in candidates {
+            if let Some(rest) = input.strip_prefix(name_lower.as_str()) {
+                if rest.chars().next().is_none_or(|c| !c.is_alphanumeric()) {
+                    return Some((*bot_id, rest));
+                }
+            }
+        }
+        None
+    }
+
+    let mut leading: Vec<&str> = Vec::new();
+    let mut valid_leading = false;
+    let mut cur = s;
+    while let Some((bot_id, rest)) = match_head(&candidates, cur) {
+        leading.push(bot_id);
+        let after_ws = rest.trim_start();
+        let next_after_sep = if let Some(r) = after_ws.strip_prefix(", and ") {
+            Some(r.trim_start())
+        } else if let Some(r) = after_ws.strip_prefix(", & ") {
+            Some(r.trim_start())
+        } else if let Some(r) = after_ws.strip_prefix("and ") {
+            if rest.starts_with(char::is_whitespace) {
+                Some(r.trim_start())
+            } else {
+                None
+            }
+        } else if let Some(r) = after_ws.strip_prefix('&') {
+            Some(r.trim_start())
+        } else if let Some(r) = after_ws.strip_prefix(',') {
+            Some(r.trim_start())
+        } else {
+            None
+        };
+        if let Some(next_s) = next_after_sep {
+            if match_head(&candidates, next_s).is_some() {
+                cur = next_s;
+                continue;
+            }
+        }
+        valid_leading = after_ws.is_empty()
+            || matches!(
+                after_ws.chars().next(),
+                Some(',' | ':' | '!' | '?' | '-' | '\u{2013}' | '\u{2014}')
+            )
+            || after_ws
+                .strip_prefix("please")
+                .is_some_and(|r| r.is_empty() || r.chars().next().is_some_and(|c| !c.is_alphanumeric()));
+        break;
+    }
+    if valid_leading {
+        for id in leading {
+            push_unique(id);
+        }
+    }
+
+    matched
+}
+
 fn plan_group_turn(
     bots: &[String],
     bot_names: &HashMap<String, String>,
@@ -256,7 +394,7 @@ fn plan_group_turn(
             lead_orchestration: false,
         };
     }
-    let lower = text.to_lowercase();
+    let lower = normalize_hws_lower(text);
     if is_group_broadcast(&lower) {
         return GroupTurnPlan {
             bots: bots.to_vec(),
@@ -264,15 +402,7 @@ fn plan_group_turn(
             lead_orchestration: false,
         };
     }
-    let matched: Vec<String> = bots
-        .iter()
-        .filter(|id| {
-            bot_names
-                .get(*id)
-                .is_some_and(|name| contains_phrase_ci(&lower, &name.to_lowercase()))
-        })
-        .cloned()
-        .collect();
+    let matched = extract_explicit_group_bot_mentions(&lower, bots, bot_names);
     if !matched.is_empty() {
         GroupTurnPlan {
             bots: matched,
@@ -497,6 +627,179 @@ fn parse_group_handoff(
     targets
 }
 
+fn summarize_tool_args(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+        for key in ["url", "path", "command"] {
+            if let Some(val) = map.get(key).and_then(Value::as_str) {
+                return format!("{key}=\"{}\"", clip_chars(val, 100));
+            }
+        }
+    }
+    clip_chars(trimmed, 100)
+}
+
+fn summarize_tool_result(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(err) = map.get("error").and_then(Value::as_str) {
+            return format!("ERROR: {}", clip_chars(err, 180));
+        }
+        if map.get("denied").and_then(Value::as_bool) == Some(true) {
+            let reason = map
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("permission denied");
+            return format!("DENIED: {}", clip_chars(reason, 180));
+        }
+        if let (Some(status), Some(url)) = (
+            map.get("status").and_then(Value::as_u64),
+            map.get("url").and_then(Value::as_str),
+        ) {
+            let title = map
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|t| format!(" title=\"{}\"", clip_chars(t, 80)))
+                .unwrap_or_default();
+            return format!("OK: status={status} url={}{title}", clip_chars(url, 100));
+        }
+        map.remove("htmlPreview");
+        map.remove("html");
+        let compact = Value::Object(map).to_string();
+        return format!("OK: {}", clip_chars(&compact, 200));
+    }
+    clip_chars(trimmed, 200)
+}
+
+fn load_tool_summaries_by_message(
+    tx: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+    use std::collections::HashSet;
+
+    let mut run_to_msg: HashMap<String, String> = HashMap::new();
+    {
+        let mut run_st = tx.prepare(
+            "SELECT id, assistant_message_id FROM port_runs WHERE conversation_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = run_st.query_map(params![conversation_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            run_to_msg.insert(row.0, row.1);
+        }
+    }
+    if run_to_msg.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    struct TcCall {
+        msg_id: String,
+        id: String,
+        name: String,
+        args: String,
+    }
+
+    let mut calls: Vec<TcCall> = Vec::new();
+    let mut tc_idx: HashMap<String, usize> = HashMap::new();
+    let mut results: HashMap<String, String> = HashMap::new();
+    let mut interrupted: HashSet<String> = HashSet::new();
+
+    {
+        let mut ev_st = tx.prepare(
+            "SELECT event_json FROM port_run_events WHERE conversation_id=?1 ORDER BY sequence ASC",
+        )?;
+        let mut current_run_id: Option<String> = None;
+        let rows = ev_st.query_map(params![conversation_id], |r| r.get::<_, String>(0))?;
+        for raw in rows.flatten() {
+            let Ok(ev) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            match ev.get("type").and_then(Value::as_str).unwrap_or("") {
+                "RUN_STARTED" => {
+                    current_run_id = ev
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                "TOOL_CALL_START" => {
+                    if let (Some(rid), Some(tc_id), Some(tc_name)) = (
+                        current_run_id.as_deref(),
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("toolCallName").and_then(Value::as_str),
+                    ) {
+                        if let Some(msg_id) = run_to_msg.get(rid) {
+                            let idx = calls.len();
+                            calls.push(TcCall {
+                                msg_id: msg_id.clone(),
+                                id: tc_id.to_owned(),
+                                name: tc_name.to_owned(),
+                                args: String::new(),
+                            });
+                            tc_idx.insert(tc_id.to_owned(), idx);
+                        }
+                    }
+                }
+                "TOOL_CALL_ARGS" => {
+                    if let (Some(tc_id), Some(delta)) = (
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("delta").and_then(Value::as_str),
+                    ) {
+                        if let Some(&idx) = tc_idx.get(tc_id) {
+                            calls[idx].args.push_str(delta);
+                        }
+                    }
+                }
+                "TOOL_CALL_RESULT" => {
+                    if let (Some(tc_id), Some(content)) = (
+                        ev.get("toolCallId").and_then(Value::as_str),
+                        ev.get("content").and_then(Value::as_str),
+                    ) {
+                        results.insert(tc_id.to_owned(), content.to_owned());
+                    }
+                }
+                "RUN_FINISHED" => {
+                    if ev.get("outcome").and_then(|o| o.get("type")).and_then(Value::as_str)
+                        == Some("interrupt")
+                    {
+                        if let Some(arr) = ev
+                            .get("outcome")
+                            .and_then(|o| o.get("interrupts"))
+                            .and_then(Value::as_array)
+                        {
+                            for item in arr {
+                                if let Some(tc_id) = item.get("toolCallId").and_then(Value::as_str)
+                                {
+                                    interrupted.insert(tc_id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for tc in calls {
+        let args_summary = summarize_tool_args(&tc.args);
+        let outcome = if let Some(res_raw) = results.get(&tc.id) {
+            summarize_tool_result(res_raw)
+        } else if interrupted.contains(&tc.id) {
+            "PAUSED (awaiting user approval)".to_owned()
+        } else {
+            "NO_RESULT (did not complete)".to_owned()
+        };
+        let line = format!("[Tool call: {}({}) -> {}]", tc.name, args_summary, outcome);
+        out.entry(tc.msg_id).or_default().push(line);
+    }
+    Ok(out)
+}
+
 fn build_group_transcript(
     tx: &rusqlite::Connection,
     conversation_id: &str,
@@ -506,8 +809,9 @@ fn build_group_transcript(
     att_recent_clip: usize,
     att_old_clip: usize,
 ) -> rusqlite::Result<String> {
+    let tool_summaries = load_tool_summaries_by_message(tx, conversation_id)?;
     let mut st = tx.prepare(
-        "SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR text!='') ORDER BY rowid DESC LIMIT 8",
+        "SELECT id,role,bot_id,text,status FROM port_conversation_messages WHERE conversation_id=?1 AND status IN ('completed','waiting') ORDER BY rowid DESC LIMIT 10",
     )?;
     let mut history = st
         .query_map(params![conversation_id], |r| {
@@ -516,16 +820,22 @@ fn build_group_transcript(
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(st);
     history.reverse();
-    history.retain(|(_, role, _, text)| role == "person" || !is_silent_group_pass(text));
+    history.retain(|(mid, role, _, text, status)| {
+        role == "person"
+            || status == "waiting"
+            || !tool_summaries.get(mid).is_none_or(Vec::is_empty)
+            || !is_silent_group_pass(text)
+    });
     let history_len = history.len();
-    let last_person_idx = history.iter().rposition(|(_, role, _, _)| role == "person");
+    let last_person_idx = history.iter().rposition(|(_, role, _, _, _)| role == "person");
     let mut entries: Vec<(bool, String)> = Vec::with_capacity(history_len);
-    for (idx, (mid, role, bid, text)) in history.into_iter().enumerate() {
+    for (idx, (mid, role, bid, text, status)) in history.into_iter().enumerate() {
         let is_last_person = Some(idx) == last_person_idx;
         let is_recent = idx + 2 >= history_len;
         let spoken = if is_last_person {
@@ -587,7 +897,19 @@ fn build_group_transcript(
                         })
                 })
                 .unwrap_or_else(|| "Teammate".to_owned());
-            entry.push_str(&format!("[{speaker}]: {spoken}\n"));
+            let tools_note = tool_summaries
+                .get(&mid)
+                .map(|lines| lines.join(" "))
+                .unwrap_or_default();
+            if !tools_note.is_empty() && !spoken.trim().is_empty() {
+                entry.push_str(&format!("[{speaker}]: {tools_note}\n{spoken}\n"));
+            } else if !tools_note.is_empty() {
+                entry.push_str(&format!("[{speaker}]: {tools_note}\n"));
+            } else if status == "waiting" && spoken.trim().is_empty() {
+                entry.push_str(&format!("[{speaker}]: [Waiting for user approval]\n"));
+            } else {
+                entry.push_str(&format!("[{speaker}]: {spoken}\n"));
+            }
         }
         entries.push((is_last_person, entry));
     }
@@ -621,8 +943,9 @@ fn build_dm_messages(
     instructions: &str,
     include_attachments: bool,
 ) -> rusqlite::Result<Vec<Value>> {
+    let tool_summaries = load_tool_summaries_by_message(tx, conversation_id)?;
     let mut st = tx.prepare(
-        "SELECT id,role,bot_id,text FROM port_conversation_messages WHERE conversation_id=?1 AND status='completed' AND (role='person' OR (role='bot' AND bot_id=?2 AND text!='')) ORDER BY rowid DESC LIMIT 8",
+        "SELECT id,role,bot_id,text,status FROM port_conversation_messages WHERE conversation_id=?1 AND status IN ('completed','waiting') AND (role='person' OR (role='bot' AND bot_id=?2)) ORDER BY rowid DESC LIMIT 10",
     )?;
     let mut history = st
         .query_map(params![conversation_id, bot_id], |r| {
@@ -631,15 +954,22 @@ fn build_dm_messages(
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(st);
     history.reverse();
+    history.retain(|(mid, role, _, text, status)| {
+        role == "person"
+            || status == "waiting"
+            || !tool_summaries.get(mid).is_none_or(Vec::is_empty)
+            || !text.trim().is_empty()
+    });
     let history_len = history.len();
-    let last_person_idx = history.iter().rposition(|(_, role, _, _)| role == "person");
+    let last_person_idx = history.iter().rposition(|(_, role, _, _, _)| role == "person");
     let mut items: Vec<(bool, Value)> = Vec::with_capacity(history_len);
-    for (idx, (mid, role, _bid, mut msg_text)) in history.into_iter().enumerate() {
+    for (idx, (mid, role, _bid, mut msg_text, status)) in history.into_iter().enumerate() {
         let is_last_person = Some(idx) == last_person_idx;
         let is_recent = idx + 2 >= history_len;
         if !is_last_person {
@@ -676,6 +1006,19 @@ fn build_dm_messages(
                     }
                 }
                 msg_text.push_str(&note);
+            }
+        }
+        if role == "bot" {
+            let tools_note = tool_summaries
+                .get(&mid)
+                .map(|lines| lines.join("\n"))
+                .unwrap_or_default();
+            if !tools_note.is_empty() && !msg_text.trim().is_empty() {
+                msg_text = format!("{tools_note}\n{msg_text}");
+            } else if !tools_note.is_empty() {
+                msg_text = tools_note;
+            } else if status == "waiting" && msg_text.trim().is_empty() {
+                msg_text = "[Waiting for user approval]".to_owned();
             }
         }
         let role_str = if role == "person" { "user" } else { "assistant" };
@@ -796,6 +1139,7 @@ pub(crate) async fn trigger_scheduled_message(
     let auth = s.auth.clone();
     let model = s.model.clone();
     let vc = s.virtual_computer.clone();
+    let ctx_mgr = s.context_manager.clone();
     let active = s.active.clone();
     let request = json!({"model": s.model_id, "messages": messages, "n": 1});
     let org_c = org.to_owned();
@@ -813,6 +1157,7 @@ pub(crate) async fn trigger_scheduled_message(
             auth,
             model,
             vc,
+            ctx_mgr,
             request,
             org_c,
             owner_c,
@@ -1146,8 +1491,10 @@ pub(crate) async fn send_with_run_id(
         let instructions:Option<String>=tx.query_row("SELECT role_description FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",params![bot_id,org_id,owner],|r|r.get(0)).optional()?;
         let Some(instructions)=instructions else{return Ok(json!({"result":"missing"}))};
         match existing(&tx,&owner,&conversation_id,&message_id,&key,&fingerprint)? { Existing::Replay=>return Ok(json!({"result":"replay"})), Existing::Conflict=>return Ok(json!({"result":"conflict"})), Existing::None=>{} }
-        let gap:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM port_metadata WHERE key=?1)",params![format!("conversation_replay_gap:{conversation_id}")],|r|r.get(0))?;
-        if gap{return Ok(json!({"result":"gap"}))}
+        tx.execute(
+            "DELETE FROM port_metadata WHERE key=?1",
+            params![format!("conversation_replay_gap:{conversation_id}")],
+        )?;
         let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM port_runs WHERE conversation_id=?1 AND status='running')",params![conversation_id],|r|r.get(0))?;
         if active{return Ok(json!({"result":"busy"}))}
         let run=match requested_run_id {Some(id)=>{let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM port_runs WHERE id=?1)",params![id],|r|r.get(0))?;if exists{return Ok(json!({"result":"conflict"}))}id},None=>random_id()?};let reply=format!("assistant_{}",random_id()?);let timestamp=now()?;
@@ -1208,17 +1555,19 @@ pub(crate) async fn send_with_run_id(
                        or for multiple specialists:\n  \
                        Passing this to <BotA> and <BotB>.\n  \
                        Only the teammate(s) you name will handle it.\n\
-                     - Only answer directly yourself if it is a general question/task for {self_name} or no specialist fits (in which case no other bots will be called)."
+                     - Only answer directly yourself if it is a general question/task for {self_name} or no specialist fits (in which case no other bots will be called).\n\
+                     Respond as {self_name} following the routing rules above."
                 )
             } else if is_broadcast {
                 format!(
                     "You are {self_name} in a multi-bot group conversation with: {team}.\n{instructions}\n\n\
-                     IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else."
+                     IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else.\n\
+                     Respond as {self_name} if relevant to your role, or reply literally with [PASS]."
                 )
             } else {
                 format!(
                     "You are {self_name} in a group conversation with: {team}.\n{instructions}\n\n\
-                     You were addressed directly for this turn. Answer directly without outputting [PASS]."
+                     You were addressed directly for this turn. Respond directly as {self_name} without outputting [PASS]."
                 )
             };
             let transcript = build_group_transcript(
@@ -1230,13 +1579,7 @@ pub(crate) async fn send_with_run_id(
                 1800,
                 400,
             )?;
-            let user_prompt = if lead_orchestration {
-                format!("{transcript}\nRespond as {self_name} following the routing rules above.")
-            } else if is_broadcast {
-                format!("{transcript}\nRespond as {self_name} if relevant to your role, or reply literally with [PASS].")
-            } else {
-                format!("{transcript}\nRespond directly as {self_name}.")
-            };
+            let user_prompt = transcript.trim_end().to_owned();
             vec![
                 json!({"role":"system","content":sys}),
                 json!({"role":"user","content":user_prompt}),
@@ -1244,6 +1587,17 @@ pub(crate) async fn send_with_run_id(
         } else {
             build_dm_messages(&tx, &conversation_id, &bot_id, &instructions, true)?
         };
+        let mut prequeued_extra: Vec<(String, String)> = Vec::new();
+        if !lead_orchestration && turn_bots.len() > 1 {
+            for extra_bot in &turn_bots[1..] {
+                let qid = format!("assistant_{}", random_id()?);
+                tx.execute(
+                    "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','queued',?5)",
+                    params![qid, conversation_id, owner, extra_bot, timestamp],
+                )?;
+                prequeued_extra.push((extra_bot.clone(), qid));
+            }
+        }
         let stage_bots = if lead_orchestration {
             bots.clone()
         } else {
@@ -1256,7 +1610,7 @@ pub(crate) async fn send_with_run_id(
             "run":run,
             "reply":reply,
             "bot":bot_id,
-            "extraBots":turn_bots[1..],
+            "prequeuedExtra": prequeued_extra,
             "groupBots":bots,
             "botNames":bot_names,
             "leadOrchestration":lead_orchestration,
@@ -1319,9 +1673,18 @@ pub(crate) async fn send_with_run_id(
     let run = data["run"].as_str().unwrap().to_owned();
     let reply = data["reply"].as_str().unwrap().to_owned();
     let bot_run = data["bot"].as_str().unwrap().to_owned();
-    let extra_bots: Vec<String> = data["extraBots"]
+    let prequeued_extra: Vec<(String, String)> = data["prequeuedExtra"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|pair| {
+                    Some((
+                        pair.get(0)?.as_str()?.to_owned(),
+                        pair.get(1)?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let group_bots: Vec<String> = data["groupBots"]
         .as_array()
@@ -1343,6 +1706,7 @@ pub(crate) async fn send_with_run_id(
     let cancellation = CancellationToken::new();
     let active = s.active.clone();
     let vc = s.virtual_computer.clone();
+    let ctx_mgr = s.context_manager.clone();
     active
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1350,10 +1714,21 @@ pub(crate) async fn send_with_run_id(
     drop(registration_guard);
     tokio::spawn(async move {
         let _permit = permit;
-        let outcome = execute(
+        let handoff_ctx = if lead_orchestration {
+            Some(GroupHandoffContext::LeadDelegate {
+                owner_id: owner_run.clone(),
+                group_bots: group_bots.clone(),
+                bot_names: bot_names_map.clone(),
+                lead_bot: bot_run.clone(),
+            })
+        } else {
+            None
+        };
+        let outcome = execute_with_handoff(
             s.auth.clone(),
             model.clone(),
             vc.clone(),
+            ctx_mgr.clone(),
             request,
             org_run.clone(),
             owner_run.clone(),
@@ -1363,6 +1738,7 @@ pub(crate) async fn send_with_run_id(
             run.clone(),
             reply,
             cancellation,
+            handoff_ctx,
         )
         .await;
         active
@@ -1370,120 +1746,84 @@ pub(crate) async fn send_with_run_id(
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run);
         if lead_orchestration {
-            if outcome.completed {
-                let targets =
-                    parse_group_handoff(&outcome.text, &group_bots, &bot_names_map, &bot_run);
-                if targets.len() == 1 {
-                    let _ = execute_followup_group_bot(
-                        &s.auth,
-                        &model,
-                        &model_id,
-                        &vc,
-                        &active,
-                        &org_run,
-                        &owner_run,
-                        &targets[0],
-                        &conversation,
-                        &thread,
-                        GroupFollowupMode::Delegated,
-                    )
-                    .await;
-                } else if targets.len() >= 2 {
-                    let mut all_ok = true;
-                    for next_bot in &targets {
-                        if !execute_followup_group_bot(
-                            &s.auth,
-                            &model,
-                            &model_id,
-                            &vc,
-                            &active,
-                            &org_run,
-                            &owner_run,
-                            next_bot,
-                            &conversation,
-                            &thread,
-                            GroupFollowupMode::Delegated,
-                        )
-                        .await
-                        {
-                            all_ok = false;
-                            break;
-                        }
-                    }
-                    if all_ok {
-                        let _ = execute_followup_group_bot(
-                            &s.auth,
-                            &model,
-                            &model_id,
-                            &vc,
-                            &active,
-                            &org_run,
-                            &owner_run,
-                            &bot_run,
-                            &conversation,
-                            &thread,
-                            GroupFollowupMode::LeadClosing,
-                        )
-                        .await;
-                    }
-                }
-            }
-        } else {
-            let mode = if is_broadcast {
-                GroupFollowupMode::Broadcast
-            } else {
-                GroupFollowupMode::Delegated
-            };
-            for next_bot in extra_bots {
-                if !execute_followup_group_bot(
+            if outcome.completed && !outcome.queued_followups.is_empty() {
+                run_queued_followups(
                     &s.auth,
                     &model,
                     &model_id,
                     &vc,
+                    &ctx_mgr,
                     &active,
                     &org_run,
                     &owner_run,
-                    &next_bot,
                     &conversation,
                     &thread,
-                    mode,
+                    &outcome.queued_followups,
                 )
-                .await
-                {
-                    break;
-                }
+                .await;
+            }
+        } else if !prequeued_extra.is_empty() {
+            if outcome.completed {
+                let mode = if is_broadcast {
+                    GroupFollowupMode::Broadcast
+                } else {
+                    GroupFollowupMode::Delegated
+                };
+                let followups: Vec<QueuedFollowup> = prequeued_extra
+                    .into_iter()
+                    .map(|(bid, mid)| QueuedFollowup {
+                        bot_id: bid,
+                        message_id: mid,
+                        mode,
+                    })
+                    .collect();
+                run_queued_followups(
+                    &s.auth,
+                    &model,
+                    &model_id,
+                    &vc,
+                    &ctx_mgr,
+                    &active,
+                    &org_run,
+                    &owner_run,
+                    &conversation,
+                    &thread,
+                    &followups,
+                )
+                .await;
+            } else {
+                let ids: Vec<String> = prequeued_extra.into_iter().map(|(_, mid)| mid).collect();
+                cleanup_unstarted_queued_messages(&s.auth.db, &conversation, &ids).await;
             }
         }
     });
     accepted(&input.id, true)
 }
-struct RunOutcome {
-    completed: bool,
-    text: String,
+
+const VC_TOOL_GROUNDING_PROMPT: &str = "TOOL USE RULES: You have Virtual Computer tools (computer_web_fetch, computer_read_file, computer_write_file, computer_list_files, computer_run_command). When asked to open, visit, or fetch a URL or website, you MUST invoke computer_web_fetch with a full https:// URL. When asked to read, write, list, or run workspace files or commands, you MUST invoke the corresponding workspace tool. For computer_write_file, keep each file concise or write large files in smaller chunks using append: true so tool arguments do not hit the output/context limit. NEVER claim you opened, fetched, read, wrote, or ran anything without an actual successful tool call in this conversation; if a tool fails or is denied, report the exact error or denial.";
+
+fn append_vc_tool_grounding(request: &mut Value) {
+    if let Some(msgs) = request.get_mut("messages").and_then(Value::as_array_mut) {
+        if let Some(sys) = msgs
+            .first_mut()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            if let Some(prev) = sys.get("content").and_then(Value::as_str) {
+                if !prev.contains("TOOL USE RULES:") {
+                    sys["content"] = Value::String(format!("{prev}\n\n{VC_TOOL_GROUNDING_PROMPT}"));
+                }
+            }
+        }
+    }
 }
 
-async fn execute(
-    auth: AuthState,
-    model: ModelClient,
-    vc: Option<virtual_computer::VirtualComputerState>,
-    request: Value,
-    org: String,
-    owner: String,
-    bot: String,
-    conversation: String,
-    thread: String,
-    run: String,
-    reply: String,
-    external_cancel: CancellationToken,
-) -> RunOutcome {
-    let cancel = external_cancel.child_token();
-    let mut current_request = request;
-    let configured_model = current_request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_owned();
+async fn apply_model_choice(
+    auth: &AuthState,
+    org: &str,
+    owner: &str,
+    conversation: &str,
+    current_request: &mut Value,
+) {
     let choice_db = auth.db.clone();
     let choice_key = format!("model_choice:{org}:{owner}:{conversation}");
     if let Ok(Ok(Some(raw_choice))) = tokio::task::spawn_blocking(move || {
@@ -1514,7 +1854,11 @@ async fn execute(
                 .map(str::trim)
                 .filter(|s| matches!(*s, "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"))
             {
-                current_request["reasoning_effort"] = Value::String(eff.to_owned());
+                let api_eff = if eff == "off" { "none" } else { eff };
+                current_request["reasoning_effort"] = Value::String(api_eff.to_owned());
+                if eff == "off" || eff == "none" {
+                    current_request["chat_template_kwargs"] = json!({"enable_thinking": false});
+                }
                 let hint = if eff == "off" || eff == "none" {
                     "Thinking mode: Off. Answer directly and concisely."
                 } else {
@@ -1525,7 +1869,10 @@ async fn execute(
                     }
                 };
                 if let Some(msgs) = current_request.get_mut("messages").and_then(Value::as_array_mut) {
-                    if let Some(sys) = msgs.first_mut().filter(|m| m.get("role").and_then(Value::as_str) == Some("system")) {
+                    if let Some(sys) = msgs
+                        .first_mut()
+                        .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                    {
                         if let Some(prev) = sys.get("content").and_then(Value::as_str) {
                             sys["content"] = Value::String(format!("{prev}\n{hint}"));
                         }
@@ -1534,6 +1881,219 @@ async fn execute(
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct QueuedFollowup {
+    bot_id: String,
+    message_id: String,
+    mode: GroupFollowupMode,
+}
+
+#[derive(Clone)]
+enum GroupHandoffContext {
+    LeadDelegate {
+        owner_id: String,
+        group_bots: Vec<String>,
+        bot_names: HashMap<String, String>,
+        lead_bot: String,
+    },
+    PreplannedFollowups {
+        owner_id: String,
+        followups: Vec<(String, GroupFollowupMode)>,
+    },
+}
+
+struct RunOutcome {
+    completed: bool,
+    queued_followups: Vec<QueuedFollowup>,
+}
+
+async fn cleanup_unstarted_queued_messages(
+    db: &Arc<Storage>,
+    conversation_id: &str,
+    message_ids: &[String],
+) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let db_c = db.clone();
+    let conv_c = conversation_id.to_owned();
+    let ids = message_ids.to_vec();
+    let _ = tokio::task::spawn_blocking(move || {
+        db_c.try_with_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for mid in ids {
+                tx.execute(
+                    "DELETE FROM port_conversation_messages WHERE conversation_id=?1 AND id=?2 AND status='queued'",
+                    params![conv_c, mid],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    })
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_queued_followups(
+    auth: &AuthState,
+    model: &ModelClient,
+    model_id: &str,
+    vc: &Option<virtual_computer::VirtualComputerState>,
+    context_manager: &context_manager::ContextManager,
+    active: &Arc<Mutex<HashMap<String, CancellationToken>>>,
+    org: &str,
+    owner: &str,
+    conversation: &str,
+    thread: &str,
+    followups: &[QueuedFollowup],
+) {
+    for (idx, item) in followups.iter().enumerate() {
+        let ok = execute_followup_group_bot(
+            auth,
+            model,
+            model_id,
+            vc,
+            context_manager,
+            active,
+            org,
+            owner,
+            &item.bot_id,
+            conversation,
+            thread,
+            item.mode,
+            Some(&item.message_id),
+        )
+        .await;
+        if !ok {
+            let remaining: Vec<String> = followups[idx + 1..]
+                .iter()
+                .map(|f| f.message_id.clone())
+                .collect();
+            cleanup_unstarted_queued_messages(&auth.db, conversation, &remaining).await;
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute(
+    auth: AuthState,
+    model: ModelClient,
+    vc: Option<virtual_computer::VirtualComputerState>,
+    context_manager: context_manager::ContextManager,
+    request: Value,
+    org: String,
+    owner: String,
+    bot: String,
+    conversation: String,
+    thread: String,
+    run: String,
+    reply: String,
+    external_cancel: CancellationToken,
+) -> RunOutcome {
+    execute_with_handoff(
+        auth,
+        model,
+        vc,
+        context_manager,
+        request,
+        org,
+        owner,
+        bot,
+        conversation,
+        thread,
+        run,
+        reply,
+        external_cancel,
+        None,
+    )
+    .await
+}
+
+fn merge_compaction(
+    acc: &mut Option<context_manager::CompactionResult>,
+    next: context_manager::CompactionResult,
+) {
+    if !next.compacted {
+        return;
+    }
+    match acc {
+        Some(existing) => {
+            existing.after_tokens = next.after_tokens;
+            existing.dropped_turns = existing.dropped_turns.saturating_add(next.dropped_turns);
+            existing.summarized_messages = existing
+                .summarized_messages
+                .saturating_add(next.summarized_messages);
+        }
+        None => *acc = Some(next),
+    }
+}
+
+async fn preflight_compact_and_record(
+    context: &context_manager::ContextManager,
+    conversation: &str,
+    request: &mut Value,
+    run_compaction: &mut Option<context_manager::CompactionResult>,
+) {
+    let (compaction, _server) = context.preflight_compact(request).await;
+    merge_compaction(run_compaction, compaction);
+    let breakdown = context_manager::estimate_request_tokens(request);
+    context.record_conversation_state(conversation, breakdown, run_compaction.as_ref());
+}
+
+fn record_oom_compaction(
+    context: &context_manager::ContextManager,
+    conversation: &str,
+    before_tokens: u64,
+    request: &Value,
+    run_compaction: &mut Option<context_manager::CompactionResult>,
+) {
+    let breakdown = context_manager::estimate_request_tokens(request);
+    let oom_compaction = context_manager::CompactionResult {
+        compacted: true,
+        before_tokens,
+        after_tokens: breakdown.total_tokens,
+        threshold_tokens: before_tokens,
+        context_limit: before_tokens,
+        dropped_turns: 1,
+        summarized_messages: 1,
+    };
+    merge_compaction(run_compaction, oom_compaction);
+    context.record_conversation_state(conversation, breakdown, run_compaction.as_ref());
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_handoff(
+    auth: AuthState,
+    model: ModelClient,
+    vc: Option<virtual_computer::VirtualComputerState>,
+    context_manager: context_manager::ContextManager,
+    request: Value,
+    org: String,
+    owner: String,
+    bot: String,
+    conversation: String,
+    thread: String,
+    run: String,
+    reply: String,
+    external_cancel: CancellationToken,
+    handoff_ctx: Option<GroupHandoffContext>,
+) -> RunOutcome {
+    let cancel = external_cancel.child_token();
+    let mut current_request = request;
+    let configured_model = current_request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_owned();
+    if vc.is_some() {
+        append_vc_tool_grounding(&mut current_request);
+    }
+    apply_model_choice(&auth, &org, &owner, &conversation, &mut current_request).await;
     let selected_model = current_request
         .get("model")
         .and_then(Value::as_str)
@@ -1552,6 +2112,7 @@ async fn execute(
                 &external_cancel,
                 None,
                 Some(&reason),
+                handoff_ctx.as_ref(),
             )
             .await;
         }
@@ -1564,6 +2125,14 @@ async fn execute(
         let mut terminal = None;
         let mut emitted_run_started = false;
         let mut emitted_text_start = false;
+        let mut run_compaction: Option<context_manager::CompactionResult> = None;
+        preflight_compact_and_record(
+            &context_manager,
+            &conversation,
+            &mut current_request,
+            &mut run_compaction,
+        )
+        .await;
 
         for attempt in 0..2usize {
             let producer_cancel = cancel.clone();
@@ -1622,7 +2191,16 @@ async fn execute(
                         && !cancel.is_cancelled()
                         && e.is_oom_or_context_error()
                     {
+                        let before_tokens =
+                            context_manager::estimate_request_tokens(&current_request).total_tokens;
                         compact_request_for_oom(&mut current_request);
+                        record_oom_compaction(
+                            &context_manager,
+                            &conversation,
+                            before_tokens,
+                            &current_request,
+                            &mut run_compaction,
+                        );
                         continue;
                     }
                     failed = true;
@@ -1649,6 +2227,7 @@ async fn execute(
             &external_cancel,
             terminal,
             failure_detail.as_deref(),
+            handoff_ctx.as_ref(),
         )
         .await;
     }
@@ -1674,6 +2253,7 @@ async fn execute(
             &auth,
             &model,
             &vc,
+            &context_manager,
             &mut current_request,
             &org,
             &owner,
@@ -1702,6 +2282,7 @@ async fn execute(
         &external_cancel,
         terminal,
         failure_detail.as_deref(),
+        handoff_ctx.as_ref(),
     )
     .await
 }
@@ -1902,6 +2483,7 @@ async fn execute_tool_rounds(
     auth: &AuthState,
     model: &ModelClient,
     vc: &virtual_computer::VirtualComputerState,
+    context_manager: &context_manager::ContextManager,
     current_request: &mut Value,
     org: &str,
     owner: &str,
@@ -1918,8 +2500,9 @@ async fn execute_tool_rounds(
     let mut terminal: Option<Value> = None;
     let mut failure_detail: Option<String> = None;
     let mut oom_retried = false;
+    let mut run_compaction: Option<context_manager::CompactionResult> = None;
     let mut round = start_round;
-    while round < 4usize {
+    while round <= 4usize {
         if cancel.is_cancelled() {
             failed = true;
             break;
@@ -1927,6 +2510,20 @@ async fn execute_tool_rounds(
         if round > 0 {
             trim_older_tool_outputs(current_request);
         }
+        let is_synthesis_round = round == 4usize;
+        if is_synthesis_round {
+            if let Some(obj) = current_request.as_object_mut() {
+                obj.remove("tools");
+                obj.remove("tool_choice");
+            }
+        }
+        preflight_compact_and_record(
+            context_manager,
+            conversation,
+            current_request,
+            &mut run_compaction,
+        )
+        .await;
         let round_msg_id = if round == 0 {
             reply.to_owned()
         } else {
@@ -1980,7 +2577,16 @@ async fn execute_tool_rounds(
                     && e.is_oom_or_context_error()
                 {
                     oom_retried = true;
+                    let before_tokens =
+                        context_manager::estimate_request_tokens(current_request).total_tokens;
                     compact_request_for_oom(current_request);
+                    record_oom_compaction(
+                        context_manager,
+                        conversation,
+                        before_tokens,
+                        current_request,
+                        &mut run_compaction,
+                    );
                     continue;
                 }
                 failed = true;
@@ -1992,7 +2598,40 @@ async fn execute_tool_rounds(
                 break;
             }
         };
-        if turn.tool_calls.is_empty() {
+        if is_synthesis_round || turn.tool_calls.is_empty() {
+            if !turn.truncated_tool_call_ids.is_empty() {
+                let note = "Output reached the model's context/token limit before the tool call could finish. Please try generating it in smaller parts or chunks.";
+                let note_msg_id = format!("{round_msg_id}_trunc");
+                let note_text = if total_answer.is_empty() {
+                    note.to_owned()
+                } else {
+                    format!("\n\n{note}")
+                };
+                if total_answer.len().saturating_add(note_text.len()) <= 1024 * 1024 {
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_START","messageId":note_msg_id,"role":"assistant"}),
+                        cancel,
+                    )
+                    .await;
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_CONTENT","messageId":note_msg_id,"delta":note_text}),
+                        cancel,
+                    )
+                    .await;
+                    let _ = append_event(
+                        auth,
+                        conversation,
+                        json!({"type":"TEXT_MESSAGE_END","messageId":note_msg_id}),
+                        cancel,
+                    )
+                    .await;
+                    total_answer.push_str(&note_text);
+                }
+            }
             terminal = Some(json!({"type":"RUN_FINISHED","threadId":thread,"runId":run}));
             break;
         }
@@ -2202,6 +2841,7 @@ async fn execute_followup_group_bot(
     model: &ModelClient,
     model_id: &str,
     vc: &Option<virtual_computer::VirtualComputerState>,
+    context_manager: &context_manager::ContextManager,
     active: &Arc<Mutex<HashMap<String, CancellationToken>>>,
     org: &str,
     owner: &str,
@@ -2209,12 +2849,14 @@ async fn execute_followup_group_bot(
     conversation: &str,
     thread: &str,
     mode: GroupFollowupMode,
+    queued_message_id: Option<&str>,
 ) -> bool {
     let db = auth.db.clone();
     let org_c = org.to_owned();
     let own_c = owner.to_owned();
     let bot_c = bot_id.to_owned();
     let conv_c = conversation.to_owned();
+    let queued_c = queued_message_id.map(str::to_owned);
     let setup = tokio::task::spawn_blocking(move || {
         db.try_with_connection(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2229,14 +2871,29 @@ async fn execute_followup_group_bot(
                 return Ok(None);
             };
             let run = random_id()?;
-            let reply = format!("assistant_{}", random_id()?);
+            let timestamp = now()?;
+            let reply = if let Some(qid) = queued_c {
+                let updated = tx.execute(
+                    "UPDATE port_conversation_messages SET status='running', created_at=?3 WHERE conversation_id=?1 AND id=?2 AND status='queued'",
+                    params![conv_c, qid, timestamp],
+                )?;
+                if updated == 0 {
+                    tx.execute(
+                        "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','running',?5)",
+                        params![qid, conv_c, own_c, bot_c, timestamp],
+                    )?;
+                }
+                qid
+            } else {
+                let fresh = format!("assistant_{}", random_id()?);
+                tx.execute(
+                    "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','running',?5)",
+                    params![fresh, conv_c, own_c, bot_c, timestamp],
+                )?;
+                fresh
+            };
             let user_msg_id = format!("group_{run}");
             let req_key = format!("group_{run}");
-            let timestamp = now()?;
-            tx.execute(
-                "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','running',?5)",
-                params![reply, conv_c, own_c, bot_c, timestamp],
-            )?;
             tx.execute(
                 "INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',?9)",
                 params![run, conv_c, own_c, bot_c, user_msg_id, reply, req_key, vec![0u8; 32], timestamp],
@@ -2250,35 +2907,24 @@ async fn execute_followup_group_bot(
                 .unwrap_or_else(|_| bot_c.clone());
             let transcript =
                 build_group_transcript(&tx, &conv_c, &org_c, None, 700, 1200, 300)?;
-            let (sys_content, user_content) = match mode {
-                GroupFollowupMode::Broadcast => (
-                    format!(
-                        "You are {bot_name} participating in a multi-bot group conversation.\n{instructions}\n\n\
-                         IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else."
-                    ),
-                    format!(
-                        "{transcript}\nRespond as {bot_name} if relevant to your role, or reply literally with [PASS]."
-                    ),
+            let sys_content = match mode {
+                GroupFollowupMode::Broadcast => format!(
+                    "You are {bot_name} participating in a multi-bot group conversation.\n{instructions}\n\n\
+                     IMPORTANT GROUP RULE: Only reply if your specialty/role genuinely adds value or was requested. If another teammate already answered adequately or this message isn't for you, output literally [PASS] and nothing else.\n\
+                     Respond as {bot_name} if relevant to your role, or reply literally with [PASS]."
                 ),
-                GroupFollowupMode::Delegated => (
-                    format!(
-                        "You are {bot_name} in a multi-bot group conversation.\n{instructions}\n\n\
-                         DELEGATED TASK RULE: You were specifically delegated/requested to handle this request. Answer directly using your specialty without repeating other teammates' work, and do NOT output [PASS]."
-                    ),
-                    format!(
-                        "{transcript}\nThis request was delegated to you. Respond directly as {bot_name} without adding [PASS]."
-                    ),
+                GroupFollowupMode::Delegated => format!(
+                    "You are {bot_name} in a multi-bot group conversation.\n{instructions}\n\n\
+                     DELEGATED TASK RULE: You were specifically delegated/requested to handle this request. Answer directly using your specialty without repeating other teammates' work, and do NOT output [PASS].\n\
+                     This request was delegated to you. Respond directly as {bot_name} without adding [PASS]."
                 ),
-                GroupFollowupMode::LeadClosing => (
-                    format!(
-                        "You are {bot_name}, the team lead in a multi-bot group conversation.\n{instructions}\n\n\
-                         CLOSING RULE: Your delegated teammates have finished their assigned parts. Briefly confirm that all delegated tasks are done in 1-2 short sentences without repeating their outputs. Do NOT output [PASS] and do NOT delegate again."
-                    ),
-                    format!(
-                        "{transcript}\nYour teammates have finished their assigned parts. Briefly confirm all delegated tasks are done as {bot_name} without repeating their outputs."
-                    ),
+                GroupFollowupMode::LeadClosing => format!(
+                    "You are {bot_name}, the team lead in a multi-bot group conversation.\n{instructions}\n\n\
+                     CLOSING RULE: Your delegated teammates have finished their assigned parts. Briefly confirm that all delegated tasks are done in 1-2 short sentences without repeating their outputs. Do NOT output [PASS] and do NOT delegate again.\n\
+                     Your teammates have finished their assigned parts. Briefly confirm all delegated tasks are done as {bot_name} without repeating their outputs."
                 ),
             };
+            let user_content = transcript.trim_end().to_owned();
             let messages = vec![
                 json!({
                     "role": "system",
@@ -2307,6 +2953,7 @@ async fn execute_followup_group_bot(
         auth.clone(),
         model.clone(),
         vc.clone(),
+        context_manager.clone(),
         request,
         org.to_owned(),
         owner.to_owned(),
@@ -2343,20 +2990,20 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
         let act_c = actor.clone();
         let row_res = tokio::task::spawn_blocking(move || {
             db.try_with_connection(|c| {
-                let row: Option<(String, String, String, Option<String>, String, String, String, String, String)> = c
+                let row: Option<(String, String, String, String, Option<String>, String, String, String, String, String)> = c
                     .query_row(
-                        "SELECT bot_id, conversation_id, thread_id, tool_call_id, tool_ref, effect, scope, args_json, status
+                        "SELECT bot_id, conversation_id, thread_id, run_id, tool_call_id, tool_ref, effect, scope, args_json, status
                            FROM port_approvals
                           WHERE id=?1 AND organization_id=?2 AND actor_id=?3",
                         params![app_c, org_c, act_c],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
                     )
                     .optional()?;
                 Ok(row)
             })
         })
         .await;
-        let Ok(Ok(Some((bot_id, conv_id, thread_id, tc_id_opt, tool_ref, effect, scope, args_json, status)))) = row_res else {
+        let Ok(Ok(Some((bot_id, conv_id, thread_id, orig_run_id, tc_id_opt, tool_ref, effect, scope, args_json, status)))) = row_res else {
             return;
         };
         let args: Value = serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
@@ -2419,13 +3066,14 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
         };
 
         let tc_id = tc_id_opt.unwrap_or_else(|| format!("tc_{approval_id}"));
-        let mut prep_out: Option<(String, String, Vec<Value>)> = None;
+        let mut prep_out: Option<(String, String, Vec<Value>, Option<GroupHandoffContext>)> = None;
         for attempt in 0..40 {
             let db_r = s.auth.db.clone();
             let org_c = org.clone();
             let act_c = actor.clone();
             let bot_c = bot_id.clone();
             let conv_c = conv_id.clone();
+            let orig_run_c = orig_run_id.clone();
             let app_c = approval_id.clone();
             let tc_c = tc_id.clone();
             let tool_c = tool_ref.clone();
@@ -2452,6 +3100,31 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                     if active {
                         return Ok(Err(()));
                     }
+                    if let Some(orig_msg_id) = tx
+                        .query_row(
+                            "SELECT assistant_message_id FROM port_runs WHERE id=?1 AND conversation_id=?2",
+                            params![orig_run_c, conv_c],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?
+                    {
+                        tx.execute(
+                            "UPDATE port_conversation_messages SET status='completed' WHERE conversation_id=?1 AND id=?2 AND status='waiting'",
+                            params![conv_c, orig_msg_id],
+                        )?;
+                    }
+                    let bot_json: Option<String> = tx
+                        .query_row(
+                            "SELECT bot_ids_json FROM port_conversations WHERE id=?1 AND organization_id=?2 AND owner_id=?3 AND deleted=0",
+                            params![conv_c, org_c, act_c],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let bots: Vec<String> = bot_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str(raw).ok())
+                        .unwrap_or_default();
+
                     let run = random_id()?;
                     let reply = format!("assistant_{}", random_id()?);
                     let user_msg = format!("approval_{app_c}");
@@ -2465,7 +3138,116 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                         "INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',?9)",
                         params![run, conv_c, act_c, bot_c, user_msg, reply, req_key, vec![0u8; 32], timestamp],
                     )?;
-                    let mut messages = build_dm_messages(&tx, &conv_c, &bot_c, &instructions, false)?;
+
+                    let mut resume_handoff: Option<GroupHandoffContext> = None;
+                    let mut messages = if bots.len() > 1 {
+                        let mut bot_names: HashMap<String, String> = HashMap::new();
+                        for b in &bots {
+                            if let Some(name) = tx
+                                .query_row(
+                                    "SELECT name FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3",
+                                    params![b, org_c, act_c],
+                                    |r| r.get::<_, String>(0),
+                                )
+                                .optional()?
+                            {
+                                bot_names.insert(b.clone(), name);
+                            }
+                        }
+                        let self_name = bot_names.get(&bot_c).map(String::as_str).unwrap_or(&bot_c);
+                        let team = bots
+                            .iter()
+                            .map(|b| bot_names.get(b).map(String::as_str).unwrap_or(b.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sys = format!(
+                            "You are {self_name} in a multi-bot group conversation with: {team}.\n{instructions}\n\n\
+                             You are resuming after a tool permission decision. Use the tool result to continue or finish your response directly as {self_name}. Do NOT output [PASS]."
+                        );
+                        let transcript = build_group_transcript(
+                            &tx,
+                            &conv_c,
+                            &org_c,
+                            Some(&bot_names),
+                            900,
+                            1800,
+                            400,
+                        )?;
+
+                        let last_person: Option<(i64, String)> = tx
+                            .query_row(
+                                "SELECT rowid, text FROM port_conversation_messages WHERE conversation_id=?1 AND role='person' ORDER BY rowid DESC LIMIT 1",
+                                params![conv_c],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()?;
+                        if let Some((person_rowid, person_text)) = last_person {
+                            let lead_bot = select_lead_group_bot(&bots, &bot_names);
+                            let lead_handoff_text: Option<String> = if bot_c != lead_bot {
+                                tx.query_row(
+                                    "SELECT text FROM port_conversation_messages WHERE conversation_id=?1 AND role='bot' AND bot_id=?2 AND rowid>?3 AND status='completed' ORDER BY rowid ASC LIMIT 1",
+                                    params![conv_c, lead_bot, person_rowid],
+                                    |r| r.get(0),
+                                )
+                                .optional()?
+                            } else {
+                                None
+                            };
+                            if let Some(lead_txt) = lead_handoff_text {
+                                let targets = parse_group_handoff(&lead_txt, &bots, &bot_names, &lead_bot);
+                                if let Some(pos) = targets.iter().position(|b| b == &bot_c) {
+                                    let mut followups: Vec<(String, GroupFollowupMode)> = targets[pos + 1..]
+                                        .iter()
+                                        .map(|b| (b.clone(), GroupFollowupMode::Delegated))
+                                        .collect();
+                                    if targets.len() >= 2 {
+                                        followups.push((lead_bot.clone(), GroupFollowupMode::LeadClosing));
+                                    }
+                                    if !followups.is_empty() {
+                                        resume_handoff = Some(GroupHandoffContext::PreplannedFollowups {
+                                            owner_id: act_c.clone(),
+                                            followups,
+                                        });
+                                    }
+                                }
+                            } else {
+                                let plan = plan_group_turn(&bots, &bot_names, &person_text);
+                                if plan.is_broadcast || !plan.lead_orchestration {
+                                    if let Some(pos) = plan.bots.iter().position(|b| b == &bot_c) {
+                                        let mode = if plan.is_broadcast {
+                                            GroupFollowupMode::Broadcast
+                                        } else {
+                                            GroupFollowupMode::Delegated
+                                        };
+                                        let followups: Vec<(String, GroupFollowupMode)> = plan.bots[pos + 1..]
+                                            .iter()
+                                            .map(|b| (b.clone(), mode))
+                                            .collect();
+                                        if !followups.is_empty() {
+                                            resume_handoff = Some(GroupHandoffContext::PreplannedFollowups {
+                                                owner_id: act_c.clone(),
+                                                followups,
+                                            });
+                                        }
+                                    }
+                                } else if bot_c == lead_bot {
+                                    resume_handoff = Some(GroupHandoffContext::LeadDelegate {
+                                        owner_id: act_c.clone(),
+                                        group_bots: bots.clone(),
+                                        bot_names: bot_names.clone(),
+                                        lead_bot,
+                                    });
+                                }
+                            }
+                        }
+
+                        vec![
+                            json!({"role": "system", "content": sys}),
+                            json!({"role": "user", "content": transcript.trim_end()}),
+                        ]
+                    } else {
+                        build_dm_messages(&tx, &conv_c, &bot_c, &instructions, false)?
+                    };
                     messages.push(json!({
                         "role": "assistant",
                         "content": Value::Null,
@@ -2477,7 +3259,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                         "content": clip_chars(&content_c, MAX_TOOL_RESULT_CHARS_FOR_LLM)
                     }));
                     tx.commit()?;
-                    Ok(Ok(Some((run, reply, messages))))
+                    Ok(Ok(Some((run, reply, messages, resume_handoff))))
                 })
             })
             .await;
@@ -2493,7 +3275,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
             }
         }
 
-        let Some((run, reply, messages)) = prep_out else {
+        let Some((run, reply, messages, resume_handoff)) = prep_out else {
             if was_approved {
                 let db_done = s.auth.db.clone();
                 let err_msg = Some("Conversation already had an active run".to_owned());
@@ -2522,8 +3304,17 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
             .unwrap_or_else(|e| e.into_inner())
             .insert(run.clone(), cancel.clone());
         let mut current_request = json!({"model": s.model_id, "messages": messages, "tools": tools_schema(), "n": 1});
+        if s.virtual_computer.is_some() {
+            append_vc_tool_grounding(&mut current_request);
+        }
+        apply_model_choice(&s.auth, &org, &actor, &conv_id, &mut current_request).await;
+        let selected_model = current_request
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
         let mut model_err: Option<String> = None;
-        if s.model_id == "auto" {
+        if s.model_id == "auto" || selected_model.is_empty() || selected_model == "auto" {
             if let Err(reason) = resolve_active_model(&s.model, &mut current_request, &child).await {
                 model_err = Some(reason);
             }
@@ -2552,6 +3343,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
                     &s.auth,
                     &s.model,
                     vc,
+                    &s.context_manager,
                     &mut current_request,
                     &org,
                     &actor,
@@ -2572,6 +3364,8 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
         }
         let db_done = s.auth.db.clone();
         let err_clone = exec_error;
+        let org_followup = org.clone();
+        let actor_followup = actor.clone();
         let _ = tokio::task::spawn_blocking(move || {
             db_done.try_with_connection(|c| {
                 if was_approved {
@@ -2594,7 +3388,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
             })
         })
         .await;
-        finalize_run(
+        let outcome = finalize_run(
             &s.auth,
             &conv_id,
             &thread_id,
@@ -2605,12 +3399,29 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
             &cancel,
             terminal,
             failure_detail.as_deref(),
+            resume_handoff.as_ref(),
         )
         .await;
         s.active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run);
+        if outcome.completed && !outcome.queued_followups.is_empty() {
+            run_queued_followups(
+                &s.auth,
+                &s.model,
+                &s.model_id,
+                &s.virtual_computer,
+                &s.context_manager,
+                &s.active,
+                &org_followup,
+                &actor_followup,
+                &conv_id,
+                &thread_id,
+                &outcome.queued_followups,
+            )
+            .await;
+        }
     });
 }
 
@@ -2626,6 +3437,7 @@ async fn finalize_run(
     external_cancel: &CancellationToken,
     terminal: Option<Value>,
     failure_detail: Option<&str>,
+    handoff_ctx: Option<&GroupHandoffContext>,
 ) -> RunOutcome {
     // Persist the final transcript, run state and terminal event in one transaction.
     // Retry transient in-process lock contention for a bounded period.
@@ -2650,9 +3462,9 @@ async fn finalize_run(
         } else {
             answer.to_owned()
         };
-        let result_body = body.clone();
         let thread_id = thread.to_owned();
         let terminal_ref = terminal.clone();
+        let handoff_owned = handoff_ctx.cloned();
         let event = if external_cancel.is_cancelled() {
             json!({"type":"RUN_ERROR","threadId":thread_id,"runId":run_id,"message":"Run stopped by user","code":"STOPPED"})
         } else if failed {
@@ -2668,7 +3480,9 @@ async fn finalize_run(
                 let next=last.checked_add(1).ok_or(StorageError::InvalidDatabase("event sequence overflow"))?;
                 let mut event=event; event["metadata"]=json!({"cpki_event_id":next.to_string()});
                 let encoded=event.to_string();
-                let fits=count<4096 && encoded.len()<=64*1024 && total.saturating_add(encoded.len() as i64)<=8*1024*1024;
+                let fits = count < event_journal::MAX_EVENTS
+                    && encoded.len() <= event_journal::MAX_EVENT_BYTES
+                    && total.saturating_add(encoded.len() as i64) <= event_journal::MAX_TOTAL_BYTES;
                 let final_status=if failed || !fits {"failed"} else {"completed"};
                 let is_interrupt = terminal_ref
                     .as_ref()
@@ -2676,13 +3490,75 @@ async fn finalize_run(
                     .and_then(|o| o.get("type"))
                     .and_then(Value::as_str)
                     == Some("interrupt");
+                let msg_status = if final_status == "failed" {
+                    "failed"
+                } else if is_interrupt {
+                    "waiting"
+                } else {
+                    "completed"
+                };
                 let silent_pass = final_status == "completed" && !is_interrupt && is_silent_group_pass(&body);
                 if silent_pass {
                     tx.execute("DELETE FROM port_conversation_messages WHERE conversation_id=?1 AND id=?2", params![id, message_id])?;
                 } else {
-                    tx.execute("UPDATE port_conversation_messages SET text=?3,status=?4 WHERE conversation_id=?1 AND id=?2",params![id,message_id,body,final_status])?;
+                    tx.execute("UPDATE port_conversation_messages SET text=?3,status=?4 WHERE conversation_id=?1 AND id=?2",params![id,message_id,body,msg_status])?;
                 }
                 tx.execute("UPDATE port_runs SET status=?2 WHERE id=?1",params![run_id,final_status])?;
+                if final_status == "failed" || is_interrupt {
+                    tx.execute(
+                        "DELETE FROM port_conversation_messages WHERE conversation_id=?1 AND status='queued'",
+                        params![id],
+                    )?;
+                }
+                let mut queued_followups: Vec<QueuedFollowup> = Vec::new();
+                if final_status == "completed" && !is_interrupt {
+                    if let Some(ctx) = handoff_owned {
+                        let ts_q = crate::runs::now().unwrap_or(0);
+                        match ctx {
+                            GroupHandoffContext::LeadDelegate { owner_id, group_bots, bot_names, lead_bot } => {
+                                let targets = parse_group_handoff(&body, &group_bots, &bot_names, &lead_bot);
+                                for target in &targets {
+                                    let qid = format!("assistant_{}", random_id()?);
+                                    tx.execute(
+                                        "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','queued',?5)",
+                                        params![qid, id, owner_id, target, ts_q],
+                                    )?;
+                                    queued_followups.push(QueuedFollowup {
+                                        bot_id: target.clone(),
+                                        message_id: qid,
+                                        mode: GroupFollowupMode::Delegated,
+                                    });
+                                }
+                                if targets.len() >= 2 {
+                                    let qid = format!("assistant_{}", random_id()?);
+                                    tx.execute(
+                                        "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','queued',?5)",
+                                        params![qid, id, owner_id, lead_bot, ts_q],
+                                    )?;
+                                    queued_followups.push(QueuedFollowup {
+                                        bot_id: lead_bot,
+                                        message_id: qid,
+                                        mode: GroupFollowupMode::LeadClosing,
+                                    });
+                                }
+                            }
+                            GroupHandoffContext::PreplannedFollowups { owner_id, followups } => {
+                                for (target, mode) in followups {
+                                    let qid = format!("assistant_{}", random_id()?);
+                                    tx.execute(
+                                        "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES(?1,?2,'bot',?3,?4,'','queued',?5)",
+                                        params![qid, id, owner_id, target, ts_q],
+                                    )?;
+                                    queued_followups.push(QueuedFollowup {
+                                        bot_id: target,
+                                        message_id: qid,
+                                        mode,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 let notify_meta: Option<(String, String, Option<String>, String)> = if final_status == "completed" && !silent_pass && !body.trim().is_empty() {
                     let ts = crate::runs::now().unwrap_or(0);
                     tx.execute("UPDATE port_conversations SET last_message_at=MAX(COALESCE(last_message_at,0),?2) WHERE id=?1", params![id, ts])?;
@@ -2694,14 +3570,17 @@ async fn finalize_run(
                 } else {
                     None
                 };
-                if fits { tx.execute("INSERT INTO port_run_events(conversation_id,sequence,event_json,bytes) VALUES(?1,?2,?3,?4)",params![id,next,encoded,encoded.len() as i64])?; }
+                if fits {
+                    tx.execute("INSERT INTO port_run_events(conversation_id,sequence,event_json,bytes) VALUES(?1,?2,?3,?4)",params![id,next,encoded,encoded.len() as i64])?;
+                    tx.execute("DELETE FROM port_metadata WHERE key=?1", params![format!("conversation_replay_gap:{id}")])?;
+                }
                 else { tx.execute("INSERT INTO port_metadata(key,value) VALUES(?1,'terminal event missing because journal is full') ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![format!("conversation_replay_gap:{id}")])?; }
                 tx.commit()?;
-                Ok((notify_meta, final_status == "completed" && !is_interrupt))
+                Ok((notify_meta, final_status == "completed" && !is_interrupt, queued_followups))
             })
         }).await;
         match result {
-            Ok(Ok((notify_meta, completed_ok))) => {
+            Ok(Ok((notify_meta, completed_ok, queued_followups))) => {
                 crate::event_journal::notify_journal_change();
                 if let Some((org_id, owner_id, bot_id, iso)) = notify_meta {
                     let first_line = answer.lines().next().unwrap_or("").trim().to_owned();
@@ -2720,7 +3599,7 @@ async fn finalize_run(
                 }
                 return RunOutcome {
                     completed: completed_ok && !external_cancel.is_cancelled(),
-                    text: result_body,
+                    queued_followups,
                 };
             }
             Ok(Err(StorageError::Busy)) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -2731,7 +3610,7 @@ async fn finalize_run(
                 );
                 return RunOutcome {
                     completed: false,
-                    text: String::new(),
+                    queued_followups: Vec::new(),
                 };
             }
         }
@@ -2742,7 +3621,7 @@ async fn finalize_run(
     );
     RunOutcome {
         completed: false,
-        text: String::new(),
+        queued_followups: Vec::new(),
     }
 }
 
@@ -4321,5 +5200,937 @@ mod stop_tests {
         drop(db);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[test]
+    fn plan_group_turn_requires_at_mention_or_explicit_addressing() {
+        let bots = vec![
+            "b_cmd".to_owned(),
+            "b_dev".to_owned(),
+            "b_qa".to_owned(),
+            "b_test".to_owned(),
+        ];
+        let mut names = HashMap::new();
+        names.insert("b_cmd".to_owned(), "Commander".to_owned());
+        names.insert("b_dev".to_owned(), "Dev".to_owned());
+        names.insert("b_qa".to_owned(), "QA".to_owned());
+        names.insert("b_test".to_owned(), "Test".to_owned());
+
+        // Plain words in sentence must NOT bypass Commander
+        assert_eq!(select_group_turn_bots(&bots, &names, "Can you test this endpoint?"), vec!["b_cmd"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Write a dev script for me"), vec!["b_cmd"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Check QA status on staging"), vec!["b_cmd"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Test this URL right now"), vec!["b_cmd"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Dev environment is broken"), vec!["b_cmd"]);
+
+        // Explicit @mentions and explicit vocative addressing DO target directly
+        assert_eq!(select_group_turn_bots(&bots, &names, "Ask @Dev to check"), vec!["b_dev"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "@QA and @Test please verify"), vec!["b_qa", "b_test"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Dev, write a script"), vec!["b_dev"]);
+        assert_eq!(select_group_turn_bots(&bots, &names, "Hey QA, check this"), vec!["b_qa"]);
+    }
+
+    #[test]
+    fn history_builders_include_tool_calls_and_empty_text_turns() {
+        let path =
+            std::env::temp_dir().join(format!("openbot-hist-tools-{}.db", random_id().unwrap()));
+        let db = Storage::open(&path).unwrap();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO auth_users(id,email,display_name,password_hash) VALUES('u','a@b','A','x');
+                 INSERT INTO auth_organizations(id,slug,name) VALUES('o','o','O');
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) VALUES('b1','o','u','Commander','','help',0),('b2','o','u','Browser','','browse',0);
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) VALUES('c','o','u','t','[\"b1\",\"b2\"]','G',0);
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES('u1','c','person','u',NULL,'open youtube.com','completed',1);
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES('a1','c','bot','u','b2','','completed',2);
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES('a2','c','bot','u','b2','','waiting',3);
+                 INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES('r1','c','u','b2','u1','a1','k1',x'01','completed',2);
+                 INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES('r2','c','u','b2','u2','a2','k2',x'02','completed',3);",
+            )?;
+            let evs = [
+                json!({"type":"RUN_STARTED","threadId":"t","runId":"r1"}),
+                json!({"type":"TOOL_CALL_START","toolCallId":"tc1","toolCallName":"computer_web_fetch","parentMessageId":"a1"}),
+                json!({"type":"TOOL_CALL_ARGS","toolCallId":"tc1","delta":"{\"url\":\"https://www.youtube.com\"}"}),
+                json!({"type":"TOOL_CALL_END","toolCallId":"tc1"}),
+                json!({"type":"TOOL_CALL_RESULT","messageId":"tool_tc1","toolCallId":"tc1","role":"tool","content":"{\"error\":\"resolved IP address is forbidden by SSRF policy\"}"}),
+                json!({"type":"RUN_FINISHED","threadId":"t","runId":"r1"}),
+                json!({"type":"RUN_STARTED","threadId":"t","runId":"r2"}),
+                json!({"type":"TOOL_CALL_START","toolCallId":"tc2","toolCallName":"computer_web_fetch","parentMessageId":"a2"}),
+                json!({"type":"TOOL_CALL_ARGS","toolCallId":"tc2","delta":"{\"url\":\"https://example.com\"}"}),
+                json!({"type":"TOOL_CALL_END","toolCallId":"tc2"}),
+                json!({"type":"RUN_FINISHED","threadId":"t","runId":"r2","outcome":{"type":"interrupt","interrupts":[{"id":"app1","toolCallId":"tc2"}]}}),
+            ];
+            for (idx, ev) in evs.iter().enumerate() {
+                let s = ev.to_string();
+                c.execute(
+                    "INSERT INTO port_run_events(conversation_id,sequence,event_json,bytes) VALUES('c',?1,?2,?3)",
+                    params![(idx + 1) as i64, s, s.len() as i64],
+                )?;
+            }
+
+            let transcript = build_group_transcript(c, "c", "o", None, 700, 1200, 300)?;
+            assert!(
+                transcript.contains("computer_web_fetch")
+                    && transcript.contains("ERROR: resolved IP address is forbidden by SSRF policy")
+                    && transcript.contains("PAUSED (awaiting user approval)"),
+                "unexpected group transcript: {transcript}"
+            );
+
+            let dm = build_dm_messages(c, "c", "b2", "System", false)?;
+            let joined = dm
+                .iter()
+                .filter_map(|m| m.get("content").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains("computer_web_fetch")
+                    && joined.contains("ERROR: resolved IP address is forbidden by SSRF policy")
+                    && joined.contains("PAUSED (awaiting user approval)"),
+                "unexpected DM history: {joined}"
+            );
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn reasoning_off_and_vc_grounding_and_clean_user_prompts_are_sent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_ref = captured.clone();
+        let mock = tokio::spawn(async move {
+            for reply in [
+                "Fetched example.com",
+                "Passing this to Browser.",
+                "Opened example.com in Browser.",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            for line in String::from_utf8_lossy(&raw[..pos]).lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(h_end) = header_end {
+                        if raw.len() >= h_end + content_len {
+                            let req_json: Value = serde_json::from_slice(&raw[h_end..h_end + content_len]).unwrap();
+                            captured_ref.lock().unwrap().push(req_json);
+                            break;
+                        }
+                    }
+                }
+                let sse = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                    json!(reply)
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-prompts-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-prompts-ws-{}", random_id().unwrap()));
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into())
+            .unwrap()
+            .with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let setup_res = app.clone().oneshot(setup).await.unwrap();
+        let cookie = setup_res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS port_compat_kv (scope TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'b_cmd','default',id,'Commander','','Lead',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'b_brw','default',id,'Browser','','Web browser',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'c_dm','default',id,'t_dm','[\"b_brw\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'c_grp','default',id,'t_grp','[\"b_cmd\",\"b_brw\"]','Grp',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_compat_kv(scope,value,updated_at) SELECT 'model_choice:default:'||id||':c_dm','{\"effort\":\"off\"}',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_compat_kv(scope,value,updated_at) SELECT 'model_choice:default:'||id||':c_grp','{\"effort\":\"off\"}',0 FROM auth_users LIMIT 1;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let send = |conv: &str, id: &str, key: &str, bot: Option<&str>, text: &str| {
+            let mut body = json!({"id": id, "text": text});
+            if let Some(b) = bot {
+                body["botId"] = json!(b);
+            }
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v2/organizations/default/conversations/{conv}/messages"))
+                .header("host", "example.test")
+                .header("origin", "http://example.test")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        assert_eq!(app.clone().oneshot(send("c_dm", "u_dm", "k_dm", Some("b_brw"), "open example.com")).await.unwrap().status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            let done: i64 = db.try_with_connection(|c| Ok(c.query_row("SELECT COUNT(*) FROM port_runs WHERE conversation_id='c_dm' AND status='completed'", [], |r| r.get(0))?)).unwrap();
+            if done == 1 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(app.clone().oneshot(send("c_grp", "u_grp", "k_grp", None, "open example.com")).await.unwrap().status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            let done: i64 = db.try_with_connection(|c| Ok(c.query_row("SELECT COUNT(*) FROM port_runs WHERE conversation_id='c_grp' AND status='completed'", [], |r| r.get(0))?)).unwrap();
+            if done == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        mock.await.unwrap();
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        for req in reqs.iter() {
+            assert_eq!(req["reasoning_effort"], "none");
+            assert_eq!(req["chat_template_kwargs"]["enable_thinking"], false);
+            let sys = req["messages"][0]["content"].as_str().unwrap();
+            assert!(sys.contains("computer_web_fetch"), "missing VC grounding in system: {sys}");
+        }
+        // Group user messages must NOT have trailing "Respond as ..." / "This request was delegated..."
+        let grp_lead_user = reqs[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(!grp_lead_user.contains("Respond as"));
+        assert!(grp_lead_user.ends_with("User: open example.com"));
+        let grp_brw_user = reqs[2]["messages"][1]["content"].as_str().unwrap();
+        assert!(!grp_brw_user.contains("This request was delegated"));
+        assert!(!grp_brw_user.contains("Respond directly"));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_rounds_runs_synthesis_turn_after_four_tool_rounds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_ref = captured.clone();
+        let mock = tokio::spawn(async move {
+            for round in 0..5usize {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            for line in String::from_utf8_lossy(&raw[..pos]).lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(h_end) = header_end {
+                        if raw.len() >= h_end + content_len {
+                            let req_json: Value = serde_json::from_slice(&raw[h_end..h_end + content_len]).unwrap();
+                            captured_ref.lock().unwrap().push(req_json);
+                            break;
+                        }
+                    }
+                }
+                let chunk = if round < 4 {
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("tc_{round}"),"type":"function","function":{"name":"computer_list_files","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"index":0,"delta":{"content":"Synthesized final answer after 4 tool rounds."},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse);
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-4rounds-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-4rounds-ws-{}", random_id().unwrap()));
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap().with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','help',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_approval_rules(id,organization_id,scope_owner_id,bot_id,tool_ref,effect,scope,behaviour,created_by,created_at) SELECT 'r_allow','default',id,'bot','computer_list_files','read','*','allow',id,0 FROM auth_users LIMIT 1;",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/conv/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-4r")
+            .body(Body::from(r#"{"id":"m1","text":"list files repeatedly","botId":"bot"}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut final_status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m1'", [], |r| r.get::<_, String>(0))?)) {
+                final_status = s;
+                if final_status != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(final_status, "completed");
+        mock.await.unwrap();
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 5);
+        assert!(reqs[3].get("tools").is_some());
+        assert!(reqs[4].get("tools").is_none(), "synthesis turn must omit tools");
+        let events = event_journal::replay(&db, "conv", None, 128).unwrap();
+        assert_eq!(events.last().unwrap()["type"], "RUN_FINISHED");
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[tokio::test]
+    async fn group_approval_resume_uses_group_context_transitions_waiting_and_continues_orchestration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_ref = captured.clone();
+        let mock = tokio::spawn(async move {
+            // 1. Lead delegates to Browser and Writer
+            // 2. Browser calls computer_write_file -> HITL interrupt
+            // 3. Browser resumes after approval -> finishes
+            // 4. Writer runs delegated followup -> finishes
+            // 5. Lead closing runs -> finishes
+            for step in 0..5usize {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            for line in String::from_utf8_lossy(&raw[..pos]).lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(h_end) = header_end {
+                        if raw.len() >= h_end + content_len {
+                            let req_json: Value = serde_json::from_slice(&raw[h_end..h_end + content_len]).unwrap();
+                            captured_ref.lock().unwrap().push(req_json);
+                            break;
+                        }
+                    }
+                }
+                let chunk = match step {
+                    0 => json!({"choices":[{"index":0,"delta":{"content":"Passing this to Browser and Writer."},"finish_reason":"stop"}]}),
+                    1 => json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc_grp_1","type":"function","function":{"name":"computer_write_file","arguments":"{\"path\":\"out.txt\",\"contents\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]}),
+                    2 => json!({"choices":[{"index":0,"delta":{"content":"Browser wrote out.txt."},"finish_reason":"stop"}]}),
+                    3 => json!({"choices":[{"index":0,"delta":{"content":"Writer summarized out.txt."},"finish_reason":"stop"}]}),
+                    _ => json!({"choices":[{"index":0,"delta":{"content":"All delegated tasks complete."},"finish_reason":"stop"}]}),
+                };
+                let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse);
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-grp-resume-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-grp-resume-ws-{}", random_id().unwrap()));
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap().with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone())
+            .merge(router(state.clone()))
+            .merge(approvals_api::router_with_runs(auth, Some(state.clone())));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS port_compat_kv (scope TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'b_cmd','default',id,'Commander','','Lead',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'b_brw','default',id,'Browser','','Browser',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'b_wrt','default',id,'Writer','','Writer',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'c_grp','default',id,'t_grp','[\"b_cmd\",\"b_brw\",\"b_wrt\"]','Team',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_approval_rules(id,organization_id,scope_owner_id,bot_id,tool_ref,effect,scope,behaviour,created_by,created_at) SELECT 'r_ask','default',id,'b_brw','computer_write_file','write','*','ask',id,0 FROM auth_users LIMIT 1;",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let send = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/c_grp/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-grp-ask")
+            .body(Body::from(r#"{"id":"m1","text":"write and summarize"}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(send).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut approval_id: Option<String> = None;
+        for _ in 0..100 {
+            if let Ok(events) = event_journal::replay(&db, "c_grp", None, 128) {
+                for ev in &events {
+                    if ev["type"] == "RUN_FINISHED" && ev["outcome"]["type"] == "interrupt" {
+                        approval_id = ev["outcome"]["interrupts"][0]["id"].as_str().map(str::to_owned);
+                    }
+                }
+                if approval_id.is_some() { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let approval_id = approval_id.expect("expected group interrupt approval");
+        // While waiting for approval, Browser's message status must be 'waiting' (not 'completed')
+        // and no orphaned 'queued' messages should remain.
+        let (waiting_count, queued_count): (i64, i64) = db.try_with_connection(|c| {
+            let w: i64 = c.query_row("SELECT COUNT(*) FROM port_conversation_messages WHERE conversation_id='c_grp' AND bot_id='b_brw' AND status='waiting'", [], |r| r.get(0))?;
+            let q: i64 = c.query_row("SELECT COUNT(*) FROM port_conversation_messages WHERE conversation_id='c_grp' AND status='queued'", [], |r| r.get(0))?;
+            Ok((w, q))
+        }).unwrap();
+        assert_eq!(waiting_count, 1);
+        assert_eq!(queued_count, 0);
+
+        let decide = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v2/organizations/default/people/me/approvals/{approval_id}/decide"))
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-grp-dec")
+            .body(Body::from(r#"{"decision":"allow_once"}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(decide).await.unwrap().status(), StatusCode::OK);
+
+        for _ in 0..160 {
+            let (running, total): (i64, i64) = db.try_with_connection(|c| {
+                let r: i64 = c.query_row("SELECT COUNT(*) FROM port_runs WHERE conversation_id='c_grp' AND status='running'", [], |r| r.get(0))?;
+                let t: i64 = c.query_row("SELECT COUNT(*) FROM port_runs WHERE conversation_id='c_grp'", [], |r| r.get(0))?;
+                Ok((r, t))
+            }).unwrap();
+            if running == 0 && total >= 5 { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        mock.await.unwrap();
+
+        let (still_waiting, run_bots): (i64, Vec<String>) = db.try_with_connection(|c| {
+            let sw: i64 = c.query_row("SELECT COUNT(*) FROM port_conversation_messages WHERE conversation_id='c_grp' AND status='waiting'", [], |r| r.get(0))?;
+            let mut st = c.prepare("SELECT bot_id FROM port_runs WHERE conversation_id='c_grp' ORDER BY rowid ASC")?;
+            let bots = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((sw, bots))
+        }).unwrap();
+        assert_eq!(still_waiting, 0, "waiting status should clear after resume");
+        assert_eq!(run_bots, vec!["b_cmd", "b_brw", "b_brw", "b_wrt", "b_cmd"]);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 5);
+        // Browser's resumed request (#2) must include group team context & group transcript
+        let resume_sys = reqs[2]["messages"][0]["content"].as_str().unwrap();
+        assert!(resume_sys.contains("multi-bot group conversation"), "expected group sys prompt: {resume_sys}");
+        let resume_user = reqs[2]["messages"][1]["content"].as_str().unwrap();
+        assert!(resume_user.contains("[Commander]: Passing this to Browser and Writer."), "expected group transcript: {resume_user}");
+
+        drop(app);
+        drop(state);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[tokio::test]
+    async fn finalize_run_inserts_queued_specialists_atomically_on_lead_delegation() {
+        let path = std::env::temp_dir().join(format!("openbot-handoff-race-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO auth_users(id,email,display_name,password_hash) VALUES('u','a@b','A','x');
+                 INSERT INTO auth_organizations(id,slug,name) VALUES('o','o','O');
+                 INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) VALUES('b_cmd','o','u','Commander','','Lead',0),('b_brw','o','u','Browser','','Web',0);
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) VALUES('c','o','u','t','[\"b_cmd\",\"b_brw\"]','G',0);
+                 INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) VALUES('a_lead','c','bot','u','b_cmd','','running',1);
+                 INSERT INTO port_runs(id,conversation_id,owner_id,bot_id,user_message_id,assistant_message_id,request_key,fingerprint,status,created_at) VALUES('r_lead','c','u','b_cmd','u1','a_lead','k1',x'01','running',1);",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let mut names = HashMap::new();
+        names.insert("b_cmd".to_owned(), "Commander".to_owned());
+        names.insert("b_brw".to_owned(), "Browser".to_owned());
+        let ctx = GroupHandoffContext::LeadDelegate {
+            owner_id: "u".to_owned(),
+            group_bots: vec!["b_cmd".to_owned(), "b_brw".to_owned()],
+            bot_names: names,
+            lead_bot: "b_cmd".to_owned(),
+        };
+        let cancel = CancellationToken::new();
+        let outcome = finalize_run(
+            &auth,
+            "c",
+            "t",
+            "r_lead",
+            "a_lead",
+            "Passing this to Browser.",
+            false,
+            &cancel,
+            Some(json!({"type":"RUN_FINISHED","threadId":"t","runId":"r_lead"})),
+            None,
+            Some(&ctx),
+        )
+        .await;
+        assert!(outcome.completed);
+        assert_eq!(outcome.queued_followups.len(), 1);
+        assert_eq!(outcome.queued_followups[0].bot_id, "b_brw");
+
+        let rows: Vec<(String, String, String)> = db.try_with_connection(|c| {
+            let mut st = c.prepare("SELECT id, bot_id, status FROM port_conversation_messages WHERE conversation_id='c' ORDER BY rowid ASC")?;
+            let out = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(out)
+        }).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("a_lead".to_owned(), "b_cmd".to_owned(), "completed".to_owned()));
+        assert_eq!(rows[1].1, "b_brw");
+        assert_eq!(rows[1].2, "queued");
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_on_length_is_dropped_without_broken_execution() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let chunk = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "tc_trunc_write",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_write_file",
+                                "arguments": "{\"path\":\"huge.py\",\"contents\":\"print(1)\\n"
+                            }
+                        }]
+                    },
+                    "finish_reason": "length"
+                }]
+            });
+            let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-trunc-tc-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let ws_root = std::env::temp_dir().join(format!("openbot-trunc-tc-ws-{}", random_id().unwrap()));
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let vc = virtual_computer::VirtualComputerState::new(auth.clone(), ws_root.clone());
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap().with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','help',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_approval_rules(id,organization_id,scope_owner_id,bot_id,tool_ref,effect,scope,behaviour,created_by,created_at) SELECT 'r_allow','default',id,'bot','computer_write_file','write','*','allow',id,0 FROM auth_users LIMIT 1;",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/conv/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-trunc")
+            .body(Body::from(r#"{"id":"m1","text":"write 5000 lines","botId":"bot"}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m1'", [], |r| r.get::<_, String>(0))?)) {
+                status = s;
+                if status != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+        mock.await.unwrap();
+
+        let msg_text: String = db.try_with_connection(|c| {
+            Ok(c.query_row("SELECT text FROM port_conversation_messages WHERE conversation_id='conv' AND role='bot'", [], |r| r.get(0))?)
+        }).unwrap();
+        assert!(msg_text.contains("context/token limit"), "unexpected msg_text: {msg_text}");
+        let events = event_journal::replay(&db, "conv", None, 128).unwrap();
+        assert!(!events.iter().any(|e| e["type"] == "TOOL_CALL_END" && e["toolCallId"] == "tc_trunc_write"));
+        assert!(!events.iter().any(|e| e["type"] == "TOOL_CALL_RESULT" && e["toolCallId"] == "tc_trunc_write"));
+        assert!(!ws_root.join("default").join("bot").join("huge.py").exists());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(ws_root);
+    }
+
+    #[tokio::test]
+    async fn preflight_auto_compaction_triggers_before_sending_and_records_context_snapshot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_c = captured_requests.clone();
+
+        let mock = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                while let Ok(n) = socket.read(&mut tmp).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let headers = String::from_utf8_lossy(&buf[..pos]);
+                            for line in headers.lines() {
+                                if let Some(val) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+                                    content_len = val.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_len {
+                            break;
+                        }
+                    }
+                }
+                let raw = String::from_utf8_lossy(&buf);
+                let first_line = raw.lines().next().unwrap_or("");
+                if first_line.starts_with("GET /props ") {
+                    let body = r#"{"default_generation_settings":{"n_ctx":1024},"model_alias":"mock-8k","is_sleeping":false}"#;
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(resp.as_bytes()).await.unwrap();
+                } else if first_line.starts_with("GET /slots ") {
+                    let body = r#"[{"id":0,"n_ctx":1024,"is_processing":false}]"#;
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(resp.as_bytes()).await.unwrap();
+                } else if first_line.starts_with("POST /v1/chat/completions ") {
+                    if let Some(end) = header_end {
+                        if let Ok(req_json) = serde_json::from_slice::<Value>(&buf[end..end + content_len]) {
+                            captured_c.lock().unwrap().push(req_json);
+                        }
+                    }
+                    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Compacted ok\"},\"finish_reason\":null}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len());
+                    socket.write_all(resp.as_bytes()).await.unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut rand = [0u8; 8];
+        getrandom::getrandom(&mut rand).unwrap();
+        let path = std::env::temp_dir().join(format!("openbot-runs-ctx-{:x}.db", u64::from_le_bytes(rand)));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let run_state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock-8k".into())
+            .unwrap()
+            .with_live_context_probe();
+        let app = crate::local_auth::router(auth.clone())
+            .merge(crate::compat_routes::router_with_context(auth.clone(), run_state.context_manager()))
+            .merge(router(run_state.clone()));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"a long secure password"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let old_turn = "history token ".repeat(40); // ~560 chars each (under per-msg 600 cap)
+        db.try_with_connection(|c| {
+            c.execute(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','You are helpful.',0 FROM auth_users LIMIT 1",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1",
+                [],
+            )?;
+            for idx in 1..=8 {
+                let role = if idx % 2 == 1 { "person" } else { "bot" };
+                let bid = if role == "bot" { Some("bot") } else { None };
+                let mid = format!("old_{idx}");
+                let text = format!("Turn {idx}: {old_turn}");
+                c.execute(
+                    "INSERT INTO port_conversation_messages(id,conversation_id,role,person_id,bot_id,text,status,created_at) SELECT ?1,'conv',?2,id,?3,?4,'completed',?5 FROM auth_users LIMIT 1",
+                    params![mid, role, bid, text, idx],
+                )?;
+            }
+            Ok(())
+        }).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/conv/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-ctx")
+            .body(Body::from(r#"{"id":"m_latest","text":"Reply cleanly","botId":"bot"}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m_latest'", [], |r| r.get::<_, String>(0))?)) {
+                status = s;
+                if status != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+        mock.await.unwrap();
+
+        let sent = captured_requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let sent_msgs = sent[0]["messages"].as_array().unwrap();
+        assert!(sent_msgs.iter().any(|m| {
+            m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("[Compacted conversation context summary]"))
+        }));
+        assert!(sent_msgs.iter().any(|m| m["role"] == "user" && m["content"] == "Reply cleanly"));
+
+        let ctx_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v2/organizations/default/conversations/conv/context")
+                    .header("host", "example.test")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx_res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(ctx_res.into_body(), 64 * 1024).await.unwrap();
+        let snap: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snap["context_limit"], 1024);
+        assert_eq!(snap["compacted"], true);
+        assert!(snap["compacted_before_tokens"].as_u64().unwrap() > 768);
+        assert!(snap["used_tokens"].as_u64().unwrap() <= 768);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_replay_gap_clears_on_fresh_send_and_finalize_uses_max_events() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered after gap\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-gap-clear-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(db.clone(), "http://example.test", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        let state = RunState::new(auth.clone(), &format!("http://{addr}/v1"), "mock".into()).unwrap();
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot','default',id,'Bot','','help',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv','default',id,'t','[\"bot\"]','DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_metadata(key,value) VALUES('conversation_replay_gap:conv','stale gap');",
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/organizations/default/conversations/conv/messages")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-gap-clear")
+            .body(Body::from(r#"{"id":"m1","text":"hello after gap","botId":"bot"}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::ACCEPTED);
+
+        let mut status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| Ok(c.query_row("SELECT status FROM port_runs WHERE user_message_id='m1'", [], |r| r.get::<_, String>(0))?)) {
+                status = s;
+                if status != "running" { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+        mock.await.unwrap();
+
+        let gap_exists: bool = db.try_with_connection(|c| {
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM port_metadata WHERE key='conversation_replay_gap:conv')", [], |r| r.get(0))?)
+        }).unwrap();
+        assert!(!gap_exists);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 }

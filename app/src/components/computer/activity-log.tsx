@@ -53,6 +53,7 @@ const LABELS = {
 
 const BROWSER_ICONS: Record<BrowserStepName, typeof IconWorld> = {
   computer_navigate: IconWorld,
+  computer_web_fetch: IconWorld,
   computer_read: IconFileText,
   computer_snapshot: IconListDetails,
   computer_screenshot: IconCamera,

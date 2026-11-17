@@ -109,6 +109,26 @@ export async function whileObserved<T>(
   }
 }
 
+/**
+ * Parse a tool call's serialized JSON arguments safely.
+ * Interrupted or still-streaming tool calls can leave `arguments` empty,
+ * partial, or malformed; return `{}` rather than throwing and dropping the snapshot.
+ */
+export function parseToolArguments(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 export function frontendApprovalSnapshot(context: HandlerContext) {
   const agent = context.agent;
   const input = agent ? inputs.get(agent) : undefined;
@@ -121,7 +141,7 @@ export function frontendApprovalSnapshot(context: HandlerContext) {
     threadId: agent.threadId,
     toolCallId: context.toolCall.id,
     toolName: context.toolCall.function.name,
-    args: JSON.parse(context.toolCall.function.arguments),
+    args: parseToolArguments(context.toolCall.function.arguments),
     messages: agent.messages,
     state: agent.state,
     context: input.context,

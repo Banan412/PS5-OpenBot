@@ -1,5 +1,3 @@
-import { deleteAttachment } from "@/lib/api/generated/conversations/conversations";
-import { idempotencyKey, organizationId } from "@/lib/api/request";
 import type { Message } from "@ag-ui/core";
 import type { Attachment } from "@copilotkit/react-core/v2";
 import {
@@ -25,7 +23,10 @@ import {
   reduceQueue,
 } from "@/components/channels/composer";
 import { StillWorkingError } from "@/components/channels/composer/queue";
+import { ContextMeter } from "@/components/chat/context-meter";
 import { NotifyPrompt } from "@/components/notifications/notify-prompt";
+import { deleteAttachment } from "@/lib/api/generated/conversations/conversations";
+import { idempotencyKey, organizationId } from "@/lib/api/request";
 import { newId } from "../../lib/new-id";
 
 /** How soon a drain the Bot was still too busy for goes again. Nothing is sent while it waits. */
@@ -547,7 +548,20 @@ export function ConversationView({
           starterSuggestions
         )}
         <Composer
-          modelPicker={modelPicker}
+          modelPicker={
+            modelPicker || channelId ? (
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                {modelPicker}
+                {channelId ? (
+                  <ContextMeter
+                    active={inFlight}
+                    conversationId={channelId}
+                    refreshKey={messages.length}
+                  />
+                ) : null}
+              </div>
+            ) : undefined
+          }
           {...(routine ? { routine } : {})}
           agents={agents}
           autoFocus={autoFocus}

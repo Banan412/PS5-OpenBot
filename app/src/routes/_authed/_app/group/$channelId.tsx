@@ -24,6 +24,7 @@ import { Input } from "@/components/ui/input";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import { updateConversation } from "@/lib/api/generated/conversations/conversations";
 import { idempotencyKey, organizationId } from "@/lib/api/request";
+import { type ApprovalInboxData, approvalInboxOptions } from "@/lib/approvals";
 import { useMarkOpenChannelRead } from "@/lib/channels/mark-read";
 import {
   channelKeys,
@@ -181,9 +182,7 @@ function GroupSettingsDetail({
           />
           <AgentProfile
             agentId={selectedBotId}
-            footer={
-              <ConversationActions channelId={channelId} leave={leave} />
-            }
+            footer={<ConversationActions channelId={channelId} leave={leave} />}
           />
         </section>
       ) : (
@@ -193,6 +192,70 @@ function GroupSettingsDetail({
       )}
     </div>
   );
+}
+
+/** Most recent bot in this group that ran or asked for a tool approval, preferring pending ones. */
+export function latestGroupApprovalBot(
+  inbox: ApprovalInboxData | undefined,
+  threadId: string | undefined,
+  agentIds: readonly string[],
+): { requestId: string; botId: string } | undefined {
+  if (!inbox || !threadId) return undefined;
+  const matching = inbox.requests.filter(
+    (req) =>
+      req.action.threadId === threadId && agentIds.includes(req.action.botId),
+  );
+  if (matching.length === 0) return undefined;
+  const pending = matching.find((req) => req.status === "pending");
+  if (pending) return { requestId: pending.id, botId: pending.action.botId };
+  let latest = matching[0];
+  let latestTime = latest ? Date.parse(latest.createdAt) || 0 : 0;
+  for (const req of matching.slice(1)) {
+    const t = Date.parse(req.createdAt) || 0;
+    if (t > latestTime) {
+      latest = req;
+      latestTime = t;
+    }
+  }
+  return latest
+    ? { requestId: latest.id, botId: latest.action.botId }
+    : undefined;
+}
+
+/**
+ * Pick which bot's Computer the Group Computer sidebar displays:
+ * 1. Explicit `?bot=` selection
+ * 2. Currently running/queued bot
+ * 3. Most recently active/tool-using bot remembered in this channel
+ * 4. Bot from the most recent approval/tool request in this group
+ * 5. Most recent bot that spoke in the group transcript
+ * 6. First bot in the group (`agentIds[0]`)
+ */
+export function selectGroupComputerBot({
+  agentIds,
+  explicitBot,
+  activeRunningBot,
+  rememberedBot,
+  latestApprovalBot,
+  lastMessageBot,
+}: {
+  agentIds: readonly string[];
+  explicitBot?: string;
+  activeRunningBot?: string | null;
+  rememberedBot?: string;
+  latestApprovalBot?: string;
+  lastMessageBot?: string | null;
+}): string | undefined {
+  for (const candidate of [
+    explicitBot,
+    activeRunningBot,
+    rememberedBot,
+    latestApprovalBot,
+    lastMessageBot,
+  ]) {
+    if (candidate && agentIds.includes(candidate)) return candidate;
+  }
+  return agentIds[0];
 }
 
 function RouteComponent() {
@@ -208,6 +271,7 @@ function RouteComponent() {
         .find((candidate) => candidate.id === channelId),
   }).data;
   const group = useQuery(groupQueryOptions(channelId));
+  const inbox = useQuery(approvalInboxOptions());
   const allAgents = useQuery(agentListQueryOptions()).data;
   const noComputers = useNoBotComputers() === true;
   useMarkOpenChannelRead(channelId);
@@ -221,21 +285,50 @@ function RouteComponent() {
       id,
   }));
 
-  // Default to the active running bot in the group, else explicit `?bot=`, else first bot.
+  const [rememberedBot, setRememberedBot] = useState<{
+    channelId: string;
+    botId: string;
+  } | null>(null);
   const activeRunningBot = group.data?.messages
     .slice()
     .reverse()
     .find(
       (m) =>
-        m.agentId !== null &&
-        (m.status === "running" || m.status === "queued"),
+        m.agentId !== null && (m.status === "running" || m.status === "queued"),
     )?.agentId;
-  const selectedBotId =
-    (bot && agentIds.includes(bot) ? bot : undefined) ??
-    (activeRunningBot && agentIds.includes(activeRunningBot)
-      ? activeRunningBot
-      : undefined) ??
-    agentIds[0];
+  const latestApproval = latestGroupApprovalBot(
+    inbox.data,
+    channel.data?.threadId,
+    agentIds,
+  );
+  const lastMessageBot = group.data?.messages
+    .slice()
+    .reverse()
+    .find((m) => m.agentId !== null && agentIds.includes(m.agentId))?.agentId;
+
+  useEffect(() => {
+    if (activeRunningBot && agentIds.includes(activeRunningBot)) {
+      setRememberedBot({ channelId, botId: activeRunningBot });
+    }
+  }, [activeRunningBot, agentIds, channelId]);
+
+  const latestApprovalId = latestApproval?.requestId;
+  const latestApprovalBotId = latestApproval?.botId;
+  useEffect(() => {
+    if (latestApprovalId && latestApprovalBotId) {
+      setRememberedBot({ channelId, botId: latestApprovalBotId });
+    }
+  }, [latestApprovalId, latestApprovalBotId, channelId]);
+
+  const selectedBotId = selectGroupComputerBot({
+    agentIds,
+    explicitBot: bot,
+    activeRunningBot,
+    rememberedBot:
+      rememberedBot?.channelId === channelId ? rememberedBot.botId : undefined,
+    latestApprovalBot: latestApproval?.botId,
+    lastMessageBot,
+  });
   const selectedBotName = groupBots.find((b) => b.id === selectedBotId)?.name;
 
   const isSettingsOpen = settings === true;
@@ -321,7 +414,11 @@ function RouteComponent() {
           <BotPausedBanner agentId={agentId} key={agentId} />
         ))}
         {/* Remounted per channel so one group's transcript never flashes in another. */}
-        <GroupChat channelId={channelId} key={channelId} />
+        <GroupChat
+          channelId={channelId}
+          key={channelId}
+          threadId={channel.data?.threadId}
+        />
       </div>
     </DetailPanel>
   );

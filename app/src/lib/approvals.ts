@@ -111,8 +111,12 @@ export type ApprovalInboxData = {
     createdAt: string;
     /** When the person (or a rule) decided it; null while it waits. */
     decidedAt?: string | null;
+    /** When the approved action finished executing, when recorded. */
+    completedAt?: string | null;
     /** What the person answered; null while it waits. */
     decision?: ApprovalDecision | null;
+    /** What the executed action returned, when recorded. */
+    result?: unknown;
     /**
      * Set when the conversation could not be carried on after this was decided: whether the action
      * was done, the sentence that says so, and the answer the Bot never received.
@@ -308,7 +312,16 @@ export function carryingOnAfterApproval(
   threadId: string,
   now = Date.now(),
 ): boolean {
-  return (inbox?.requests ?? []).some(
+  return activeApprovalsInThread(inbox, threadId, now).length > 0;
+}
+
+/** Requests in this thread that have been decided and are still executing on the server. */
+export function activeApprovalsInThread(
+  inbox: ApprovalInboxData | undefined,
+  threadId: string,
+  now = Date.now(),
+): ApprovalInboxData["requests"] {
+  return (inbox?.requests ?? []).filter(
     (request) =>
       request.action.threadId === threadId &&
       CARRYING_ON.has(request.status) &&

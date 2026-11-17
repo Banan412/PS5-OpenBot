@@ -61,6 +61,7 @@ export function findPendingTool(
         [
           "computer_request_help",
           "computer_navigate",
+          "computer_web_fetch",
           "computer_read",
           "computer_snapshot",
         ].includes(tool.function.name),
