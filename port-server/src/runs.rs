@@ -2909,6 +2909,7 @@ async fn execute_tool_rounds(
                     "content":"System correction: You wrote fake tool-call text instead of calling a tool. Do NOT write '[Tool call: ...]'. Call the real function tool right now using tool_calls."
                 }));
             }
+            total_answer.clear();
             current_request["tool_choice"] = json!("required");
             round += 1;
             continue;
