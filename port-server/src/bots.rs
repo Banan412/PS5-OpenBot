@@ -71,14 +71,38 @@ async fn grants(
         return internal();
     };
     let db = s.db.clone();
-    let found = tokio::task::spawn_blocking(move || { let _permit = permit; db.try_with_connection(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3)", params![bot,actor.organization,actor.id], |r| r.get::<_,bool>(0))?)) }).await;
+    let org_c = actor.organization.clone();
+    let bot_c = bot.clone();
+    let kind_filter = q.kind.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        db.try_with_connection(|c| {
+            let exists: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM port_bots WHERE id=?1 AND organization_id=?2 AND owner_id=?3)",
+                params![bot_c, org_c, actor.id],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            let mut grants = Vec::new();
+            if kind_filter.as_deref().is_none_or(|k| k == "action") {
+                grants.extend(crate::mcp_client::list_bot_action_grants(c, &org_c, &bot_c));
+            }
+            if kind_filter.as_deref().is_none_or(|k| k == "skill") {
+                grants.extend(crate::mcp_client::list_bot_skill_grants(c, &org_c, &bot_c));
+            }
+            Ok(Some(grants))
+        })
+    })
+    .await;
     match found {
-        Ok(Ok(true)) => respond(
+        Ok(Ok(Some(grants))) => respond(
             StatusCode::OK,
-            json!({"grants":[],"nextCursor":null}).to_string(),
+            json!({"grants":grants,"nextCursor":null}).to_string(),
             None,
         ),
-        Ok(Ok(false)) => problem(StatusCode::NOT_FOUND, "BOT_NOT_FOUND", "Bot not found."),
+        Ok(Ok(None)) => problem(StatusCode::NOT_FOUND, "BOT_NOT_FOUND", "Bot not found."),
         _ => internal(),
     }
 }

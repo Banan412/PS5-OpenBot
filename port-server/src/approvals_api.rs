@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Extension, Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -28,8 +28,8 @@ const MAX_BOUNDARY_RULES: usize = 256;
 const MAX_BOUNDARY_EXPR_LEN: usize = 1000;
 const MAX_CEL_DEPTH: usize = 32;
 const MAX_ARGS_BYTES: usize = 65_536;
-const DEFAULT_APPROVAL_TTL_SECS: i64 = 900;
-const MAX_APPROVAL_TTL_SECS: i64 = 86_400;
+const DEFAULT_APPROVAL_TTL_SECS: i64 = 604_800;
+const MAX_APPROVAL_TTL_SECS: i64 = 2_592_000;
 const IDEM_TTL_SECS: i64 = 86_400;
 
 const ACTION_KINDS: [&str; 7] = [
@@ -240,6 +240,10 @@ pub(crate) fn router_with_runs(state: AuthState, runs: Option<runs::RunState>) -
         .route(
             "/api/v2/organizations/{organization}/people/{person}/approvals",
             get(list_approvals),
+        )
+        .route(
+            "/api/v2/organizations/{organization}/people/{person}/approvals/{approvalId}",
+            delete(delete_approval),
         )
         .route(
             "/api/v2/organizations/{organization}/people/{person}/approvals/{approvalId}/decide",
@@ -925,7 +929,8 @@ fn is_auto_mode_safe_action(tool_ref: &str, effect: &str, scope: &str) -> bool {
     ) {
         return !effect.eq_ignore_ascii_case("write");
     }
-    t.starts_with("computer_") && effect.eq_ignore_ascii_case("read")
+    (t.starts_with("computer_") || t.starts_with("mcp/") || t.starts_with("mcp__"))
+        && effect.eq_ignore_ascii_case("read")
 }
 
 // ---------- Mini-CEL Parser & Evaluator for Boundaries ----------
@@ -2731,7 +2736,7 @@ async fn decide_approval(
         if record.status != "pending" {
             return Ok(DecideResult::Refused("This request was already decided."));
         }
-        if now >= record.expires_at {
+        if now >= record.expires_at && decision != "deny" {
             return Ok(DecideResult::Refused("This approval request has expired."));
         }
 
@@ -2896,7 +2901,7 @@ async fn decide_approval(
                 AND organization_id = ?7
                 AND actor_id = ?8
                 AND status = 'pending'
-                AND expires_at > ?3",
+                AND (expires_at > ?3 OR ?2 = 'deny')",
             params![
                 new_status,
                 decision,
@@ -2953,6 +2958,61 @@ async fn decide_approval(
             "This approval could not be found.",
         ),
         Ok(DecideResult::Refused(msg)) => problem(StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg),
+        Err(e) => e,
+    }
+}
+
+async fn delete_approval(
+    State(s): State<AuthState>,
+    Path((org, person, approval_id)): Path<(String, String, String)>,
+    h: HeaderMap,
+) -> Response {
+    let i = match authenticate(&s, &h, &org, true).await {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_self(&i, &person) {
+        return e;
+    }
+    if !valid_id(&approval_id) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "Invalid approval id.",
+        );
+    }
+    let org_id = i.organization.clone();
+    let actor_id = i.id.clone();
+    let res = run_db(&s, move |c| {
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM auth_memberships m
+                JOIN auth_users u ON u.id = m.user_id
+                WHERE m.organization_id = ?1 AND m.user_id = ?2 AND u.revoked = 0
+            )",
+            params![org_id, actor_id],
+            |r| r.get(0),
+        )?;
+        if !active {
+            return Ok(None);
+        }
+        let deleted = tx.execute(
+            "DELETE FROM port_approvals WHERE id = ?1 AND organization_id = ?2 AND actor_id = ?3",
+            params![approval_id, org_id, actor_id],
+        )?;
+        tx.commit()?;
+        Ok(Some(deleted > 0))
+    })
+    .await;
+
+    match res {
+        Ok(Some(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(false)) | Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "APPROVAL_NOT_FOUND",
+            "This approval could not be found.",
+        ),
         Err(e) => e,
     }
 }
@@ -5666,6 +5726,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dec_exp.status(), StatusCode::BAD_REQUEST);
+
+        // Denying an expired pending approval is still allowed so stale cards can be resolved.
+        let deny_exp = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}/decide",
+                    past_pending.id
+                ),
+                &member_cookie,
+                "exp-deny",
+                r#"{"decision":"deny"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deny_exp.status(), StatusCode::OK);
+
+        // Deleting/dismissing an approval works cleanly and removes it.
+        let del_exp = f
+            .app
+            .clone()
+            .oneshot(req(
+                "DELETE",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}",
+                    past_pending.id
+                ),
+                &member_cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_exp.status(), StatusCode::NO_CONTENT);
+
+        let del_again = f
+            .app
+            .clone()
+            .oneshot(req(
+                "DELETE",
+                &format!(
+                    "/api/v2/organizations/default/people/me/approvals/{}",
+                    past_pending.id
+                ),
+                &member_cookie,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(del_again.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

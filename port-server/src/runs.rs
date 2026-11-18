@@ -2048,6 +2048,86 @@ fn append_vc_tool_grounding(request: &mut Value) {
     }
 }
 
+async fn load_bot_mcp_tools_async(
+    auth: &AuthState,
+    org: &str,
+    bot: &str,
+) -> Vec<crate::mcp_client::ResolvedMcpTool> {
+    let db = auth.db.clone();
+    let org_c = org.to_owned();
+    let bot_c = bot.to_owned();
+    tokio::task::spawn_blocking(move || {
+        db.try_with_connection(|c| Ok(crate::mcp_client::load_bot_mcp_tools(c, &org_c, &bot_c)))
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default()
+}
+
+async fn prepare_bot_mcp_and_skills(
+    auth: &AuthState,
+    org: &str,
+    bot: &str,
+    request: &mut Value,
+) -> Vec<crate::mcp_client::ResolvedMcpTool> {
+    let db = auth.db.clone();
+    let org_c = org.to_owned();
+    let bot_c = bot.to_owned();
+    let (mcp_tools, skills) = tokio::task::spawn_blocking(move || {
+        db.try_with_connection(|c| {
+            let tools = crate::mcp_client::load_bot_mcp_tools(c, &org_c, &bot_c);
+            let skills = crate::mcp_client::load_bot_skill_instructions(c, &org_c, &bot_c);
+            Ok((tools, skills))
+        })
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    if !mcp_tools.is_empty() {
+        if !request.get("tools").is_some_and(Value::is_array) {
+            request["tools"] = tools_schema();
+        }
+        if let Some(arr) = request.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in &mcp_tools {
+                arr.push(tool.schema.clone());
+            }
+        }
+    }
+    if (!mcp_tools.is_empty() || !skills.is_empty())
+        && request.get("messages").is_some_and(Value::is_array)
+    {
+        if let Some(sys) = request
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .and_then(|m| m.first_mut())
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            if let Some(prev) = sys.get("content").and_then(Value::as_str).map(str::to_owned) {
+                let mut extra = String::new();
+                if !mcp_tools.is_empty() {
+                    let names: Vec<&str> = mcp_tools.iter().map(|t| t.fn_name.as_str()).collect();
+                    extra.push_str("\n\nCONNECTED MCP TOOLS: You have live MCP tools available: ");
+                    extra.push_str(&names.join(", "));
+                    extra.push_str(". Call these tools directly via function calling when the user asks to perform actions with them.");
+                }
+                if !skills.is_empty() {
+                    extra.push_str("\n\nASSIGNED SKILLS:");
+                    for (slug, title, inst) in skills.iter().take(8) {
+                        extra.push_str(&format!("\n## {title} (`{slug}`)\n{}", clip_chars(inst, 1200)));
+                    }
+                }
+                if !extra.is_empty() && !prev.contains("CONNECTED MCP TOOLS:") {
+                    sys["content"] = Value::String(format!("{prev}{extra}"));
+                }
+            }
+        }
+    }
+    mcp_tools
+}
+
 async fn apply_model_choice(
     auth: &AuthState,
     org: &str,
@@ -2479,6 +2559,7 @@ async fn execute_with_handoff(
         failed = true;
     }
     current_request["tools"] = tools_schema();
+    let _ = prepare_bot_mcp_and_skills(&auth, &org, &bot, &mut current_request).await;
     if !failed {
         (failed, terminal, failure_detail) = execute_tool_rounds(
             &auth,
@@ -2636,8 +2717,19 @@ pub(crate) fn compact_request_for_oom(request: &mut Value) {
         .unwrap_or(OOM_RETRY_MAX_TOKENS);
     request["max_tokens"] = json!(capped_max);
 
-    if request.get("tools").is_some() {
-        request["tools"] = compact_tools_schema();
+    if let Some(existing_tools) = request.get("tools").and_then(Value::as_array).cloned() {
+        let mut compacted_tools = compact_tools_schema().as_array().cloned().unwrap_or_default();
+        for tool in existing_tools {
+            let name = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if name.starts_with("mcp__") {
+                compacted_tools.push(tool);
+            }
+        }
+        request["tools"] = Value::Array(compacted_tools);
     }
 
     let Some(msgs) = request.get_mut("messages").and_then(Value::as_array_mut) else {
@@ -2788,6 +2880,7 @@ async fn execute_tool_rounds(
     start_round: usize,
     initial_executed: &[ExecutedToolSummary],
 ) -> (bool, Option<Value>, Option<String>) {
+    let mcp_tools = load_bot_mcp_tools_async(auth, org, bot).await;
     let mut failed = false;
     let mut terminal: Option<Value> = None;
     let mut failure_detail: Option<String> = None;
@@ -3001,10 +3094,18 @@ async fn execute_tool_rounds(
                 Ok(v) if v.is_object() => v,
                 _ => json!({}),
             };
-            let effect = match tc.name.as_str() {
-                "computer_write_file" | "computer_run_command" | "computer_click"
-                | "computer_type" | "computer_key" => "write",
-                _ => "read",
+            let matched_mcp = crate::mcp_client::resolve_mcp_tool(&mcp_tools, &tc.name);
+            let eval_tool_ref = matched_mcp
+                .map(|m| m.policy_ref.as_str())
+                .unwrap_or(tc.name.as_str());
+            let effect = if let Some(m) = matched_mcp {
+                m.effect.as_str()
+            } else {
+                match tc.name.as_str() {
+                    "computer_write_file" | "computer_run_command" | "computer_click"
+                    | "computer_type" | "computer_key" => "write",
+                    _ => "read",
+                }
             };
             let scope = approvals_api::extract_tool_scope(&args);
             let eval_res = {
@@ -3013,7 +3114,7 @@ async fn execute_tool_rounds(
                 let own_c = owner.to_owned();
                 let bot_c = bot.to_owned();
                 let conv_c = conversation.to_owned();
-                let name_c = tc.name.clone();
+                let name_c = eval_tool_ref.to_owned();
                 let eff_c = effect.to_owned();
                 let scope_c = scope.to_owned();
                 tokio::task::spawn_blocking(move || {
@@ -3046,9 +3147,18 @@ async fn execute_tool_rounds(
             };
             match outcome.decision {
                 approvals_api::EvaluationDecision::Allow => {
-                    let allow_all_web = outcome.source == "turbo_mode";
-                    let exec_res = vc
-                        .execute_tool_for_owner_with_policy(
+                    let exec_res = if let Some(m) = matched_mcp {
+                        crate::mcp_client::execute_mcp_tool_call(
+                            &auth.db,
+                            org,
+                            &m.app_id,
+                            &m.tool_name,
+                            args.clone(),
+                        )
+                        .await
+                    } else {
+                        let allow_all_web = outcome.source == "turbo_mode";
+                        vc.execute_tool_for_owner_with_policy(
                             org,
                             owner,
                             bot,
@@ -3056,7 +3166,8 @@ async fn execute_tool_rounds(
                             args.clone(),
                             allow_all_web,
                         )
-                        .await;
+                        .await
+                    };
                     let (tool_ok, tool_err, content_str) = match exec_res {
                         Ok(val) => {
                             let err_msg = val
@@ -3101,7 +3212,7 @@ async fn execute_tool_rounds(
                     let run_c = run.to_owned();
                     let thread_c = thread.to_owned();
                     let tc_id = tc.id.clone();
-                    let tc_name = tc.name.clone();
+                    let tc_name = eval_tool_ref.to_owned();
                     let eff_c = effect.to_owned();
                     let scope_c = scope.to_owned();
                     let args_c = args.clone();
@@ -3417,7 +3528,30 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
             if !matches!(consumed, Ok(Ok(_))) {
                 return;
             }
-            if let Some(vc) = s.virtual_computer.as_ref() {
+            if tool_ref.starts_with("mcp/") || tool_ref.starts_with("mcp__") {
+                let mcp_tools = load_bot_mcp_tools_async(&s.auth, &org, &bot_id).await;
+                if let Some(m) = crate::mcp_client::resolve_mcp_tool(&mcp_tools, &tool_ref) {
+                    match crate::mcp_client::execute_mcp_tool_call(
+                        &s.auth.db,
+                        &org,
+                        &m.app_id,
+                        &m.tool_name,
+                        args.clone(),
+                    )
+                    .await
+                    {
+                        Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "{}".into()),
+                        Err(err) => {
+                            exec_error = Some(err.clone());
+                            json!({"error": err}).to_string()
+                        }
+                    }
+                } else {
+                    let err = "MCP tool access was revoked before execution.".to_owned();
+                    exec_error = Some(err.clone());
+                    json!({"error": err}).to_string()
+                }
+            } else if let Some(vc) = s.virtual_computer.as_ref() {
                 let db_turbo = s.auth.db.clone();
                 let org_turbo = org.clone();
                 let allow_turbo_web = tokio::task::spawn_blocking(move || {
@@ -3706,6 +3840,7 @@ pub(crate) fn spawn_approval_resume(s: RunState, org: String, actor: String, app
         if s.virtual_computer.is_some() {
             append_vc_tool_grounding(&mut current_request);
         }
+        let _ = prepare_bot_mcp_and_skills(&s.auth, &org, &bot_id, &mut current_request).await;
         apply_model_choice(&s.auth, &org, &actor, &conv_id, &mut current_request).await;
         let selected_model = current_request
             .get("model")
@@ -6777,5 +6912,242 @@ mod stop_tests {
 
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_and_skill_run_executes_against_mock_mcp_server() {
+        use axum::routing::post as axum_post;
+
+        let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mcp_calls_ref = mcp_calls.clone();
+        let mcp_router = Router::new().route(
+            "/mcp",
+            axum_post(move |Json(body): Json<Value>| {
+                let mcp_calls_ref = mcp_calls_ref.clone();
+                async move {
+                    let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+                    let id = body.get("id").cloned().unwrap_or(Value::Null);
+                    match method {
+                        "initialize" => Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": { "tools": {} }
+                            }
+                        }))
+                        .into_response(),
+                        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+                        "tools/call" => {
+                            mcp_calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{"type": "text", "text": r#"{"ok":true,"ffmpeg":true}"#}]
+                                }
+                            }))
+                            .into_response()
+                        }
+                        _ => StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }
+            }),
+        );
+        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = mcp_listener.local_addr().unwrap();
+        let mcp_srv = tokio::spawn(async move {
+            let _ = axum::serve(mcp_listener, mcp_router).await;
+        });
+
+        let saw_mcp_schema = Arc::new(std::sync::Mutex::new(false));
+        let saw_skill = Arc::new(std::sync::Mutex::new(false));
+        let saw_schema_c = saw_mcp_schema.clone();
+        let saw_skill_c = saw_skill.clone();
+        let llm_turn_c = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm_router = Router::new().route(
+            "/v1/chat/completions",
+            axum_post(move |Json(req_json): Json<Value>| {
+                let saw_schema_c = saw_schema_c.clone();
+                let saw_skill_c = saw_skill_c.clone();
+                let llm_turn_c = llm_turn_c.clone();
+                async move {
+                    let turn = llm_turn_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if req_json["tools"]
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().any(|t| t["function"]["name"] == "mcp__montage__preflight"))
+                    {
+                        *saw_schema_c.lock().unwrap() = true;
+                    }
+                    if req_json["messages"][0]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("Montage Director Rule"))
+                    {
+                        *saw_skill_c.lock().unwrap() = true;
+                    }
+                    let sse = if turn == 0 {
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_mcp_1","type":"function","function":{"name":"mcp__montage__preflight","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                        )
+                    } else {
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"index":0,"delta":{"content":"Preflight verified."},"finish_reason":"stop"}]})
+                        )
+                    };
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        sse,
+                    )
+                }
+            }),
+        );
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        let llm_srv = tokio::spawn(async move {
+            let _ = axum::serve(llm_listener, llm_router).await;
+        });
+
+        let path = std::env::temp_dir().join(format!("openbot-mcp-run-{}.db", random_id().unwrap()));
+        let db = Arc::new(Storage::open(&path).unwrap());
+        let auth = AuthState::new(
+            db.clone(),
+            "http://example.test",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let vc_ws = std::env::temp_dir().join(format!("openbot-mcp-ws-{}", random_id().unwrap()));
+        let vc = crate::virtual_computer::VirtualComputerState::new(auth.clone(), vc_ws.clone());
+        let state = RunState::new(
+            auth.clone(),
+            &format!("http://{llm_addr}/v1"),
+            "mock".into(),
+        )
+        .unwrap()
+        .with_virtual_computer(vc);
+        let app = local_auth::router(auth.clone()).merge(router(state));
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/port/auth/setup")
+            .header("host", "example.test")
+            .header("origin", "http://example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"setupToken":"0123456789abcdef0123456789abcdef","email":"owner@example.test","name":"Owner","password":"valid password 123"}"#))
+            .unwrap();
+        let cookie = app.clone().oneshot(setup).await.unwrap().headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO port_bots(id,organization_id,owner_id,name,title,role_description,created_at) SELECT 'bot_m','default',id,'Montage','','Editor',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_conversations(id,organization_id,owner_id,thread_id,bot_ids_json,name,created_at) SELECT 'conv_m','default',id,'tm','[\"bot_m\"]','Montage DM',0 FROM auth_users LIMIT 1;
+                 INSERT INTO port_approval_settings(organization_id,enforce_auto_review,custom_rules_enabled,host_commands_cap,action_kinds_json,execution_mode) VALUES('default',0,1,'ask','{}','auto') ON CONFLICT(organization_id) DO UPDATE SET execution_mode='auto';",
+            )?;
+            crate::mcp_client::save_apps(
+                c,
+                "default",
+                &[crate::mcp_client::StoredMcpApp {
+                    id: "montage".to_owned(),
+                    title: "OpenMontage".to_owned(),
+                    address: format!("http://{mcp_addr}/mcp"),
+                    token: None,
+                    vendor: Some("127.0.0.1".to_owned()),
+                    owner_grants: "any".to_owned(),
+                    owner_grants_chosen: Some("any".to_owned()),
+                    added_by: None,
+                    tools_refreshed_at: None,
+                    last_error: None,
+                    skipped_tools: Vec::new(),
+                    tools: vec![crate::mcp_client::StoredMcpTool {
+                        name: "preflight".to_owned(),
+                        description: "Check OpenMontage readiness".to_owned(),
+                        input_schema: json!({"type":"object","properties":{}}),
+                        effect: "read".to_owned(),
+                        destructive: false,
+                        granted_to: vec!["bot_m".to_owned()],
+                    }],
+                }],
+            )?;
+            crate::compat_extra::save_kv(
+                c,
+                "skills:default",
+                &json!([{
+                    "slug": "openmontage-director",
+                    "title": "OpenMontage Director",
+                    "summary": "Orchestrate pipelines",
+                    "instructions": "Montage Director Rule: run preflight first.",
+                    "tools": ["montage/preflight"],
+                    "botIds": ["bot_m"]
+                }]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let msg_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/organizations/default/conversations/conv_m/messages")
+                    .header("host", "example.test")
+                    .header("origin", "http://example.test")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "k-mcp-1")
+                    .body(Body::from(r#"{"id":"mm1","text":"Run preflight"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg_res.status(), StatusCode::ACCEPTED);
+
+        let mut status = String::new();
+        for _ in 0..120 {
+            if let Ok(s) = db.try_with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT status FROM port_runs WHERE user_message_id='mm1'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)
+            }) {
+                status = s;
+                if status != "running" {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+        assert!(*saw_mcp_schema.lock().unwrap(), "expected MCP tool schema in LLM request");
+        assert!(*saw_skill.lock().unwrap(), "expected skill instruction in system prompt");
+        assert_eq!(mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Also ensure OOM compaction preserves mcp__ tool definitions.
+        let mut req_oom = json!({"model":"mock","messages":[{"role":"system","content":"s"}],"tools":tools_schema()});
+        req_oom["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":"mcp__montage__preflight","description":"d","parameters":{}}}));
+        compact_request_for_oom(&mut req_oom);
+        assert!(
+            req_oom["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "mcp__montage__preflight")
+        );
+
+        mcp_srv.abort();
+        llm_srv.abort();
+        drop(app);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(vc_ws);
     }
 }

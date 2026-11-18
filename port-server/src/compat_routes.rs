@@ -103,7 +103,6 @@ pub fn router_with_context(
             "/api/v2/organizations/{organization}/invitations",
             get(list_org_invitations),
         )
-        .route("/api/v2/organizations/{organization}/apps", get(list_apps))
         .route(
             "/api/v2/organizations/{organization}/app-setup",
             get(get_app_setup),
@@ -1503,27 +1502,6 @@ async fn list_org_invitations(
 // 6. Read-only honest list & setup routes
 // -----------------------------------------------------------------------------
 
-async fn list_apps(
-    State(s): State<AuthState>,
-    Path(org): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
-    h: HeaderMap,
-) -> Response {
-    if let Err(e) = authorize(&s, &h, &org, false).await {
-        return e;
-    }
-    if let Err(e) = parse_empty_list_paging(&q) {
-        return e;
-    }
-    respond_json(
-        StatusCode::OK,
-        json!({
-            "apps": [],
-            "nextCursor": Value::Null
-        }),
-    )
-}
-
 async fn get_app_setup(
     State(s): State<AuthState>,
     Path(org): Path<String>,
@@ -1758,6 +1736,7 @@ mod tests {
         .unwrap();
         let app = crate::local_auth::router(state.clone())
             .merge(crate::bots::router(state.clone()))
+            .merge(crate::mcp_client::router(state.clone()))
             .merge(router(state));
         (app, db, path)
     }
@@ -2491,6 +2470,7 @@ mod tests {
         let app = crate::local_auth::router(state.clone())
             .merge(crate::bots::router(state.clone()))
             .merge(crate::conversations::router(state.clone()))
+            .merge(crate::mcp_client::router(state.clone()))
             .merge(router_with_context(state, ctx_mgr.clone()));
 
         let unauth = app

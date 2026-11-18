@@ -146,6 +146,7 @@ struct BotComputer {
     screen_revision: u64,
     screen_notify: Arc<Notify>,
     active_screen_viewer: u64,
+    cookie_jar: HashMap<(String, String), String>,
 }
 
 #[derive(Clone)]
@@ -190,6 +191,7 @@ impl BotComputer {
             screen_revision: 1,
             screen_notify: Arc::new(Notify::new()),
             active_screen_viewer: 0,
+            cookie_jar: HashMap::new(),
         }
     }
 
@@ -4516,6 +4518,7 @@ fn build_proxy_shim_script(proxy_prefix: &str, base: &reqwest::Url, bot_id: &str
     format!(
         "<script data-openbot-proxy=\"1\">(function(){{\
 var P={p_lit},S={s_lit},H={h_lit},curReal={r_lit},BID={b_lit};\
+try{{if(typeof crypto!==\"undefined\"&&!crypto.randomUUID){{var _ru=function(){{var a=new Uint8Array(16);if(crypto.getRandomValues)crypto.getRandomValues(a);else{{for(var i=0;i<16;i++)a[i]=(Math.random()*256)|0;}}a[6]=(a[6]&15)|64;a[8]=(a[8]&63)|128;var h=\"\";for(var i=0;i<16;i++){{h+=(a[i]<16?\"0\":\"\")+a[i].toString(16);if(i===3||i===5||i===7||i===9)h+=\"-\";}}return h;}};try{{Object.defineProperty(crypto,\"randomUUID\",{{configurable:true,value:_ru}});}}catch(_c1){{try{{Object.defineProperty(Crypto.prototype,\"randomUUID\",{{configurable:true,value:_ru}});}}catch(_c2){{}}}}}}}}catch(_c0){{}}\
 try{{void document.cookie;}}catch(_){{\
 var _ck=Object.create(null);\
 function _getC(){{return Object.keys(_ck).map(function(k){{return k+\"=\"+_ck[k];}}).join(\"; \");}}\
@@ -4546,15 +4549,15 @@ try{{Object.defineProperty(XMLHttpRequest.prototype,\"withCredentials\",{{config
 var ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){{\
 var a=Array.prototype.slice.call(arguments);if(typeof u===\"string\")a[1]=toProxy(u);return ox.apply(this,a);}};\
 if(navigator.sendBeacon){{var ob=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){{return ob(toProxy(u),d);}};}}\
-var oo=window.open;window.open=function(u,tg,ft){{var px=typeof u===\"string\"?toProxy(u):u;if(!tg||tg===\"_top\"||tg===\"_parent\")tg=\"_self\";return oo?oo.call(this,px,tg,ft):null;}};\
-try{{var hp=history.pushState,hr=history.replaceState;\
-history.pushState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return hp.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};\
-history.replaceState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return hr.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};\
-}}catch(_){{}}\
+var oo=window.open;window.open=function(u,tg,ft){{var px=typeof u===\"string\"?toProxy(u):u;if(!tg||tg===\"_top\"||tg===\"_parent\"||tg===\"_blank\")tg=\"_self\";return oo?oo.call(this,px,tg,ft):null;}};\
+try{{function wh(obj){{if(!obj)return;var ohp=obj.pushState,ohr=obj.replaceState;\
+if(typeof ohp===\"function\")obj.pushState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return ohp.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};\
+if(typeof ohr===\"function\")obj.replaceState=function(s,ti,u){{if(typeof u===\"string\")curReal=toReal(u);try{{return ohr.call(this,s,ti,typeof u===\"string\"?toProxy(u):u);}}catch(_){{notify(curReal);}}}};}}\
+if(typeof History!==\"undefined\")wh(History.prototype);wh(window.history);}}catch(_){{}}\
 var osa=Element.prototype.setAttribute;Element.prototype.setAttribute=function(k,v){{\
 var kl=String(k).toLowerCase();\
 if((kl===\"src\"||kl===\"href\"||kl===\"action\"||kl===\"poster\")&&typeof v===\"string\")v=toProxy(v);\
-else if(kl===\"target\"&&(v===\"_top\"||v===\"_parent\"))v=\"_self\";\
+else if(kl===\"target\"&&(v===\"_top\"||v===\"_parent\"||v===\"_blank\"))v=\"_self\";\
 return osa.call(this,k,v);}};\
 function wp(Pr,pr){{try{{var d=Pr&&Object.getOwnPropertyDescriptor(Pr,pr);\
 if(d&&d.set&&d.get){{Object.defineProperty(Pr,pr,{{configurable:true,enumerable:true,get:function(){{return d.get.call(this);}},set:function(v){{return d.set.call(this,typeof v===\"string\"?toProxy(v):v);}}}});}}}}catch(_){{}}}}\
@@ -4571,9 +4574,9 @@ if(cwd&&cwd.get){{Object.defineProperty(HTMLIFrameElement.prototype,\"contentWin
 var cdd=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,\"contentDocument\");\
 if(cdd&&cdd.get){{Object.defineProperty(HTMLIFrameElement.prototype,\"contentDocument\",{{configurable:true,get:function(){{try{{return cdd.get.call(this);}}catch(_){{return null;}}}}}});}}}}catch(_){{}}\
 document.addEventListener(\"click\",function(e){{var a=e.target&&e.target.closest?e.target.closest(\"a[href]\"):null;if(!a)return;\
-var h=a.getAttribute(\"href\");if(h)a.setAttribute(\"href\",h);var t=a.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\")a.setAttribute(\"target\",\"_self\");}},true);\
+var h=a.getAttribute(\"href\");if(h)a.setAttribute(\"href\",h);var t=a.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\"||t===\"_blank\")a.setAttribute(\"target\",\"_self\");}},true);\
 document.addEventListener(\"submit\",function(e){{var f=e.target;if(!f||f.tagName!==\"FORM\")return;\
-var ac=f.getAttribute(\"action\")||curReal;f.setAttribute(\"action\",ac);var t=f.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\")f.setAttribute(\"target\",\"_self\");}},true);\
+var ac=f.getAttribute(\"action\")||curReal;f.setAttribute(\"action\",ac);var t=f.getAttribute(\"target\");if(t===\"_top\"||t===\"_parent\"||t===\"_blank\")f.setAttribute(\"target\",\"_self\");}},true);\
 window.addEventListener(\"DOMContentLoaded\",function(){{notify(curReal);}});\
 window.addEventListener(\"load\",function(){{notify(curReal);}});\
 window.addEventListener(\"popstate\",function(){{notify(location.href);}});\
@@ -4739,7 +4742,7 @@ fn rewrite_html_for_proxy(
         out.push('<');
         out.push_str(&tag_name);
         for (k, v_opt) in attrs {
-            if k == "integrity" || k == "nonce" {
+            if k == "integrity" || k == "nonce" || k == "crossorigin" {
                 continue;
             }
             match v_opt {
@@ -4772,7 +4775,7 @@ fn rewrite_html_for_proxy(
                         rewrite_proxy_url(&v, &base_url, proxy_prefix).unwrap_or(v)
                     } else if k == "srcset" {
                         rewrite_srcset_value(&v, &base_url, proxy_prefix)
-                    } else if k == "target" && matches!(v.trim(), "_top" | "_parent") {
+                    } else if k == "target" && matches!(v.trim(), "_top" | "_parent" | "_blank") {
                         "_self".to_owned()
                     } else {
                         v
@@ -4975,16 +4978,61 @@ async fn handle_proxy_web_inner(
         Ok(m) => m,
         Err(_) => return problem(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED", "Unsupported method."),
     };
-    let incoming_ct = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let incoming_accept = req
-        .headers()
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let (ref_scheme, ref_host, ref_path) =
+        parse_browse_referer(req.headers(), &bot_id, &token)
+            .unwrap_or_else(|| (scheme.clone(), host.clone(), "/".to_owned()));
+    let has_incoming_origin = req.headers().contains_key(header::ORIGIN);
+    let send_origin = has_incoming_origin
+        || matches!(
+            method,
+            reqwest::Method::POST
+                | reqwest::Method::PUT
+                | reqwest::Method::PATCH
+                | reqwest::Method::DELETE
+        );
+
+    let mut forwarded_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> =
+        Vec::new();
+    for (name, val) in req.headers().iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "host"
+                | "cookie"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+                | "accept-encoding"
+                | "origin"
+                | "referer"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "idempotency-key"
+        ) || lower.starts_with("sec-")
+            || lower.starts_with("proxy-")
+            || lower.starts_with("x-forwarded-")
+        {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            forwarded_headers.push((hn, hv));
+        }
+    }
+
+    let cookie_header = {
+        let target_dom = url.host_str().unwrap_or(&host).to_ascii_lowercase();
+        handle
+            .lock()
+            .ok()
+            .and_then(|g| build_proxy_cookie_header(&g.cookie_jar, &target_dom))
+    };
+
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return problem(StatusCode::PAYLOAD_TOO_LARGE, "BODY_TOO_LARGE", "Request body too large."),
@@ -4996,13 +5044,19 @@ async fn handle_proxy_web_inner(
         .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
         .header(
             reqwest::header::REFERER,
-            format!("{scheme}://{host}/"),
+            format!("{ref_scheme}://{ref_host}{ref_path}"),
         );
-    if let Some(ct) = incoming_ct {
-        req_builder = req_builder.header(reqwest::header::CONTENT_TYPE, ct);
+    if send_origin {
+        req_builder = req_builder.header(
+            reqwest::header::ORIGIN,
+            format!("{ref_scheme}://{ref_host}"),
+        );
     }
-    if let Some(acc) = incoming_accept {
-        req_builder = req_builder.header(reqwest::header::ACCEPT, acc);
+    if let Some(ck) = cookie_header {
+        req_builder = req_builder.header(reqwest::header::COOKIE, ck);
+    }
+    for (hn, hv) in forwarded_headers {
+        req_builder = req_builder.header(hn, hv);
     }
     if !body_bytes.is_empty() {
         req_builder = req_builder.body(body_bytes.to_vec());
@@ -5023,6 +5077,13 @@ async fn handle_proxy_web_inner(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
 
+    {
+        let target_dom = url.host_str().unwrap_or(&host).to_ascii_lowercase();
+        if let Ok(mut guard) = handle.lock() {
+            store_proxy_cookies(&mut guard.cookie_jar, &target_dom, &resp_headers);
+        }
+    }
+
     if status.is_redirection() {
         if let Some(loc_val) = resp_headers
             .get(reqwest::header::LOCATION)
@@ -5041,7 +5102,7 @@ async fn handle_proxy_web_inner(
                         r.headers_mut()
                             .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
                         r.headers_mut()
-                            .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+                            .insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
                         r.headers_mut().insert(
                             header::CACHE_CONTROL,
                             HeaderValue::from_static("private, no-store"),
@@ -5151,6 +5212,10 @@ fn apply_proxy_response_headers(
                 | "content-encoding"
                 | "connection"
                 | "keep-alive"
+                | "upgrade"
+                | "alt-svc"
+                | "alt-used"
+                | "strict-transport-security"
                 | "access-control-allow-origin"
                 | "access-control-expose-headers"
         ) {
@@ -5222,12 +5287,111 @@ fn apply_proxy_response_headers(
             .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
     }
     r.headers_mut()
-        .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        .insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     if is_html {
         r.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );
+    }
+}
+
+fn parse_browse_referer(
+    headers: &HeaderMap,
+    expected_bot_id: &str,
+    expected_token: &str,
+) -> Option<(String, String, String)> {
+    let raw_ref = headers.get(header::REFERER)?.to_str().ok()?;
+    let needle = format!("/browse/{expected_bot_id}/{expected_token}/");
+    let pos = raw_ref.find(&needle)?;
+    let rest = &raw_ref[pos + needle.len()..];
+    let mut parts = rest.splitn(3, '/');
+    let scheme = parts.next()?.trim();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parts.next()?.trim();
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+    let tail = parts
+        .next()
+        .map(|p| format!("/{p}"))
+        .unwrap_or_else(|| "/".to_owned());
+    Some((scheme.to_owned(), host.to_owned(), tail))
+}
+
+fn cookie_domain_matches(target_host: &str, cookie_domain: &str) -> bool {
+    target_host == cookie_domain || target_host.ends_with(&format!(".{cookie_domain}"))
+}
+
+fn store_proxy_cookies(
+    jar: &mut HashMap<(String, String), String>,
+    target_host: &str,
+    resp_headers: &reqwest::header::HeaderMap,
+) {
+    for cookie_hdr in resp_headers.get_all(reqwest::header::SET_COOKIE) {
+        let Ok(raw_cookie) = cookie_hdr.to_str() else {
+            continue;
+        };
+        let mut parts = raw_cookie.split(';');
+        let Some(kv) = parts.next() else {
+            continue;
+        };
+        let Some((name_raw, val_raw)) = kv.split_once('=') else {
+            continue;
+        };
+        let name = name_raw.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("openbot_session") {
+            continue;
+        }
+        let mut domain = target_host.to_ascii_lowercase();
+        let mut expired = false;
+        for attr in parts {
+            let trimmed = attr.trim();
+            let low = trimmed.to_ascii_lowercase();
+            if let Some(d) = low.strip_prefix("domain=") {
+                let d_clean = d.trim().trim_start_matches('.');
+                if !d_clean.is_empty()
+                    && d_clean.contains('.')
+                    && cookie_domain_matches(target_host, d_clean)
+                {
+                    domain = d_clean.to_owned();
+                }
+            } else if let Some(ma) = low.strip_prefix("max-age=") {
+                if ma.trim().parse::<i64>().is_ok_and(|n| n <= 0) {
+                    expired = true;
+                }
+            }
+        }
+        let key = (domain, name.to_owned());
+        if expired {
+            jar.remove(&key);
+        } else {
+            if jar.len() >= 256 && !jar.contains_key(&key) {
+                if let Some(oldest_k) = jar.keys().next().cloned() {
+                    jar.remove(&oldest_k);
+                }
+            }
+            jar.insert(key, val_raw.trim().to_owned());
+        }
+    }
+}
+
+fn build_proxy_cookie_header(
+    jar: &HashMap<(String, String), String>,
+    target_host: &str,
+) -> Option<String> {
+    let mut pairs = Vec::new();
+    for ((dom, name), val) in jar {
+        if cookie_domain_matches(target_host, dom) {
+            pairs.push(format!("{name}={val}"));
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.join("; "))
     }
 }
 
@@ -7637,10 +7801,12 @@ mod tests {
                     "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\">",
                     "<link rel=\"compression-dictionary\" href=\"/shared_dict/test.dict\">",
                     "<style>body{background:url(/bg.png)}</style>",
+                    "<link rel=\"modulepreload\" crossorigin=\"use-credentials\" href=\"/assets/m.js\">",
                     "<link rel=\"stylesheet\" href=\"/app.css\" integrity=\"sha256-abc\">",
                     "<script src=\"/app.js\" integrity=\"sha256-xyz\">if(1<2){}</script>",
                     "</head><body>",
                     "<a href=\"/search?q=1\" target=\"_top\">Search</a>",
+                    "<a href=\"/next\" target=\"_blank\">Next</a>",
                     "<form action=\"/submit\" method=\"post\"><input name=\"q\"></form>",
                     "<img src=\"//cdn.test/logo.png\" srcset=\"/a.png 1x, /b.png 2x\">",
                     "</body></html>"
@@ -7680,6 +7846,33 @@ mod tests {
                     HeaderValue::from_static("application/javascript"),
                 );
                 r
+            }),
+        )
+        .route(
+            "/echo-rpc",
+            post(|hdrs: HeaderMap| async move {
+                let api_key = hdrs
+                    .get("x-goog-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let cookie_hdr = hdrs
+                    .get(header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let origin_hdr = hdrs
+                    .get(header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ref_hdr = hdrs
+                    .get(header::REFERER)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                Json(json!({
+                    "apiKey": api_key,
+                    "cookie": cookie_hdr,
+                    "origin": origin_hdr,
+                    "referer": ref_hdr,
+                }))
             }),
         );
         let upstream_srv = tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
@@ -7780,6 +7973,7 @@ mod tests {
         )
         .unwrap();
         assert!(html.contains("data-openbot-proxy=\"1\""));
+        assert!(html.contains("randomUUID"));
         assert!(html.contains("localStorage"));
         assert!(html.contains("withCredentials"));
         assert!(html.contains("contentWindow"));
@@ -7789,6 +7983,9 @@ mod tests {
         assert!(html.contains(&format!("/http/{upstream_addr}/bg.png\"")));
         assert!(html.contains("/http/cdn.test/logo.png\""));
         assert!(html.contains("target=\"_self\""));
+        assert!(!html.contains("target=\"_blank\""));
+        assert!(!html.contains("crossorigin="));
+        assert!(html.contains("History.prototype"));
         assert!(!html.contains("integrity=\"sha256-"));
         assert!(!html.contains("script-src 'none'"));
         assert!(html.contains("if(1<2){}"));
@@ -7834,6 +8031,31 @@ mod tests {
         assert_eq!(big_resp.status(), StatusCode::OK);
         let big_bytes = to_bytes(big_resp.into_body(), 6 * 1024 * 1024).await.unwrap();
         assert_eq!(big_bytes.len(), 5 * 1024 * 1024);
+
+        // Verify custom request headers, mapped Origin/Referer, and server-side cookie jar replay.
+        let rpc_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&format!("{browse_prefix}/echo-rpc"))
+                    .header("x-goog-api-key", "test-key-123")
+                    .header("origin", origin)
+                    .header("referer", format!("{origin}{proxy_url}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rpc_resp.status(), StatusCode::OK);
+        let echo_json: Value = serde_json::from_slice(
+            &to_bytes(rpc_resp.into_body(), 16 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(echo_json["apiKey"], "test-key-123");
+        assert!(echo_json["cookie"].as_str().unwrap().contains("pref=dark"));
+        assert_eq!(echo_json["origin"], format!("http://{upstream_addr}"));
+        assert_eq!(echo_json["referer"], format!("http://{upstream_addr}/home"));
 
         upstream_srv.abort();
         drop(db);

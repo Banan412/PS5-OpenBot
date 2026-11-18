@@ -15,6 +15,7 @@ mod event_journal;
 #[allow(dead_code)]
 mod governance;
 mod local_auth;
+mod mcp_client;
 #[allow(dead_code)]
 mod model;
 mod notifications;
@@ -37,7 +38,7 @@ mod embedded_assets {
 
 use axum::{
     extract::{Request, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -98,6 +99,7 @@ fn app(
                 .merge(preferences::router(state.clone()))
                 .merge(notifications::router(state.clone()))
                 .merge(compat_routes::router_with_context(state.clone(), context_mgr))
+                .merge(mcp_client::router(state.clone()))
                 .merge(routines::router(state.clone(), runs.clone()))
                 .merge(approvals_api::router_with_runs(state.clone(), runs.clone()))
                 .merge(virtual_computer::router(vc_state.clone()))
@@ -120,25 +122,65 @@ fn app(
     }
 }
 
+fn proxy_browse_redirect_from_referer(
+    headers: &HeaderMap,
+    path: &str,
+    query: Option<&str>,
+) -> Option<Response> {
+    if path.starts_with("/browse/")
+        || path.starts_with("/api/v2/")
+        || path.starts_with("/api/port/")
+        || path.starts_with("/api/copilotkit")
+        || path == "/healthz"
+    {
+        return None;
+    }
+    let raw_ref = headers.get(header::REFERER)?.to_str().ok()?;
+    let idx = raw_ref.find("/browse/")?;
+    let after = &raw_ref[idx + "/browse/".len()..];
+    let mut parts = after.split('/');
+    let bot_id = parts.next()?.trim();
+    let token = parts.next()?.trim();
+    let scheme = parts.next()?.trim();
+    let host = parts.next()?.trim();
+    if bot_id.is_empty()
+        || token.is_empty()
+        || (scheme != "http" && scheme != "https")
+        || host.is_empty()
+        || host.contains(char::is_whitespace)
+        || host.contains('\\')
+        || !bot_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        || !token.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let clean_path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let q = query.map(|v| format!("?{v}")).unwrap_or_default();
+    let location = format!("/browse/{bot_id}/{token}/{scheme}/{host}{clean_path}{q}");
+    let hv = HeaderValue::from_str(&location).ok()?;
+    let mut resp = StatusCode::TEMPORARY_REDIRECT.into_response();
+    resp.headers_mut().insert(header::LOCATION, hv);
+    resp.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    Some(resp)
+}
+
 async fn static_handler(State(state): State<AppState>, request: Request) -> Response {
     let path = request.uri().path();
-    if request.method() != Method::GET && request.method() != Method::HEAD {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
-    }
+    let query = request.uri().query().map(str::to_owned);
     if request.headers().contains_key(header::UPGRADE) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let decoded = match percent_decode_str(path).decode_utf8() {
-        Ok(value) => value,
+        Ok(value) => value.into_owned(),
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if decoded == "/api" || decoded.starts_with("/api/") {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "OpenBot API is not implemented",
-        )
-            .into_response();
-    }
     if decoded.contains('\\') || decoded.contains(':') || decoded.contains('\0') {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -151,10 +193,31 @@ async fn static_handler(State(state): State<AppState>, request: Request) -> Resp
     }
     let is_head = request.method() == Method::HEAD;
     let accepts_gzip = www_assets::accepts_gzip(request.headers());
-    if !relative.as_os_str().is_empty() {
-        if let Some(response) = serve_file(&state.root, relative, is_head, accepts_gzip).await {
-            return response;
+    if request.method() == Method::GET || is_head {
+        if !relative.as_os_str().is_empty() {
+            if let Some(response) = serve_file(&state.root, relative, is_head, accepts_gzip).await {
+                return response;
+            }
         }
+        if let Some(proxy_redir) =
+            proxy_browse_redirect_from_referer(request.headers(), path, query.as_deref())
+        {
+            return proxy_redir;
+        }
+        if decoded == "/api" || decoded.starts_with("/api/") {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "OpenBot API is not implemented",
+            )
+                .into_response();
+        }
+    } else {
+        if let Some(proxy_redir) =
+            proxy_browse_redirect_from_referer(request.headers(), path, query.as_deref())
+        {
+            return proxy_redir;
+        }
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let accepts_html = request
         .headers()
@@ -397,13 +460,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = ps5_rt::set_process_name("ps5-openbot.elf");
         ps5_rt::ignore_daemon_signals();
+        std::panic::set_hook(Box::new(|info| {
+            let msg = format!("PANIC: {info}");
+            safe_log(&msg);
+            append_startup_error(Path::new("/data/openbot"), &msg);
+        }));
     }
 
     #[cfg(target_vendor = "sie")]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(4)
-        .thread_stack_size(1024 * 1024)
+        .thread_stack_size(2 * 1024 * 1024)
         .enable_all()
         .build()?;
     #[cfg(not(target_vendor = "sie"))]

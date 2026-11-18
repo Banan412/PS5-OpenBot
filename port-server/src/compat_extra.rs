@@ -3049,13 +3049,24 @@ async fn list_bot_apps(
     Query(q): Query<HashMap<String, String>>,
     h: HeaderMap,
 ) -> Response {
-    if let Err(e) = verify_bot_for_actor(&s, &h, &org, &bot_id, false).await {
-        return e;
-    }
+    let actor = match verify_bot_for_actor(&s, &h, &org, &bot_id, false).await {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     if let Err(e) = parse_empty_list_paging(&q) {
         return e;
     }
-    respond_json(StatusCode::OK, json!({ "apps": [], "nextCursor": Value::Null }))
+    let org_c = actor.organization.clone();
+    let actor_id = actor.id.clone();
+    let bot_c = bot_id.clone();
+    let Ok(apps) = run_db(&s, move |c| {
+        Ok(crate::mcp_client::build_bot_apps_json(c, &org_c, &bot_c, &actor_id))
+    })
+    .await
+    else {
+        return internal();
+    };
+    respond_json(StatusCode::OK, json!({ "apps": apps, "nextCursor": Value::Null }))
 }
 
 async fn list_bot_memory_source_tools(
